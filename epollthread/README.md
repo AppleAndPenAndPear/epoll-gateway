@@ -1,34 +1,39 @@
 # epollthread
-基于 C++17 实现的高性能多线程网络服务器框架，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合动态线程池和异步日志，支持海量并发连接。项目以经典 Echo 服务为示例，展示了从底层 Socket 封装到多线程 Reactor 事件循环的完整实现
+基于 C++17 实现的高性能多线程网络服务器框架，采用 SO_REUSEPORT + epoll + One Loop Per Thread 架构，配合动态线程池和异步日志，支持海量并发连接。项目已从最初的 Echo 演示进化为一个完整的轻量级 HTTP 静态文件服务器，支持 HTTP/1.1 协议、Keep-Alive 长连接、零拷贝文件传输，并具备生产级的日志记录与状态码处理。
 
 ## 特性
-- **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，监听独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡。
-- **非阻塞 I/O + 边缘触发**：所有 socket 使用非阻塞模式，结合 `EPOLLET` 和 `EPOLLONESHOT`，高效处理读写事件。
-- **动态线程池**：支持根据任务负载自动扩缩容，可配置最小/最大线程数及扩缩容阈值。
-- **异步日志系统**：基于 `spdlog` 的异步全局线程池，支持控制台彩色输出与文件滚动存储，性能开销低。
-- **RAII 资源管理**：Socket、Epoll 等资源封装为 RAII 类，支持移动语义，防止描述符泄漏。
-- **优雅关闭**：利用 `SIGINT`/`SIGTERM` 信号安全停止所有 Worker 线程，确保日志完整、资源正确回收。
-- **客户端状态机**：配套非阻塞客户端实现，通过状态机管理连接、发送、接收全流程，支持请求半关闭。
+多线程 Reactor 模型：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（SO_REUSEPORT），实现内核级负载均衡，无锁竞争。
+HTTP/1.1 协议支持：内置状态机 HTTP 解析器，支持 GET 请求、请求头解析、方法合法性校验。
+静态文件服务：根据 URL 路径映射本地文件，使用 sendfile 系统调用实现零拷贝传输，性能高效；自动设置 Content-Type（支持 HTML、CSS、JS、图片等常见格式）。
+连接复用与管线化：正确处理 Connection: keep-alive，支持在同一条 TCP 连接上串行处理多个请求（HTTP Pipelining），保证响应顺序。
+错误处理与状态码：支持 200、400、403、404、405、500 等状态码，返回友好 HTML 错误页面，并防御路径穿越攻击。
+非阻塞 I/O + 边缘触发：所有套接字使用非阻塞模式，结合 EPOLLET 和 EPOLLONESHOT，精细控制事件通知，避免惊群和重复触发。
+动态线程池：可配置最小/最大线程数，依据任务负载自动扩缩容（目前预留接口，用于未来异步业务处理）。
+异步日志系统：基于 spdlog 的全局线程池，支持控制台彩色输出与文件滚动存储，可分别控制各级别日志输出，性能开销低。
+请求/响应日志：记录每个请求的方法、路径、状态码、User-Agent 及响应大小，便于监控与分析。
+RAII 资源管理：Socket、Epoll 等资源封装为 RAII 类，支持移动语义，杜绝描述符泄漏。
+优雅关闭：捕获 SIGINT/SIGTERM 信号，安全通知所有 Worker 线程退出，保证日志完整、资源正确回收。
+配套非阻塞客户端：独立的状态机客户端，支持连接、发送、接收全流程，展示 epoll 在客户端的使用方法（保留 Echo 示例）。
 
 ## 架构概览
-Master Thread
-|
-┌─────────────┼─────────────┐
-│ │ │
-TcpWorker 1 TcpWorker 2 ... TcpWorker N
-(epoll loop) (epoll loop) (epoll loop)
-│ │ │
-listen fd 1 listen fd 2 listen fd N (SO_REUSEPORT)
-└─────────────┴─────────────┘
-客户端连接
-│
-EchoHandler (业务处理)
-│
-DynamicThreadPool (可选异步任务)
+               Master Thread
+                    |
+      ┌─────────────┼─────────────┐
+      │             │             │
+  TcpWorker 1   TcpWorker 2  ... TcpWorker N
+  (epoll loop)  (epoll loop)     (epoll loop)
+      │             │             │
+ listen fd 1   listen fd 2   listen fd N  (SO_REUSEPORT)
+      └─────────────┴─────────────┘
+               客户端连接
+                    │
+            HttpHandler (HTTP 解析 + 静态文件服务)
+                    │
+         DynamicThreadPool (可选异步任务)
 
 - **Tcpserver**：负责创建 N 个 listen socket，启动对应数量的 `TcpWorker` 线程。
 - **TcpWorker**：每个 Worker 持有独立的 epoll 实例、连接表、Handler，全权处理归属连接的所有 I/O 事件，无锁竞争。
-- **EchoHandler**：示例业务处理器，将收到的数据原样返回。
+- HttpHandler：HTTP/1.1 协议实现，包含请求解析、Keep-Alive 管理、文件服务、错误响应等。
 - **DynamicThreadPool**：可选的共享线程池，用于将耗时任务从 I/O 线程卸载到工作线程。
 - **Logger**：全局异步日志器，通过 spdlog 全局线程池实现高性能日志记录。
 
@@ -49,6 +54,10 @@ cd epollthread
 # 安装 spdlog（如果已安装可跳过）
 sudo apt install libspdlog-dev   # Ubuntu/Debian
 
+# 准备静态文件目录（可选）
+mkdir www
+echo "<h1>It works!</h1>" > www/index.html
+
 # 构建
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -60,19 +69,13 @@ cmake --build . -j$(nproc)
 # 启动客户端（新终端）
 ./client
 
-预期输出
-服务端：
-[2026-05-07 19:21:52.076] [info] Starting epoll server...
-[2026-05-07 19:21:52.077] [info] Starting 2 worker threads with SO_REUSEPORT
-[2026-05-07 19:21:52.077] [info] TcpWorker created with listen fd 4 by move
-...
-
-客户端：
-[2026-05-07 19:21:58.123] [info] Client connection to 192.168.1.100:5005
-[2026-05-07 19:21:58.124] [debug] send to fd 4, n = 14
-[2026-05-07 19:21:58.125] [info] Client done, received: Hello, server!
-
-按下 Ctrl+C 时，服务端和客户端均可优雅退出，日志完整写入 logs/ 目录
+访问服务
+浏览器打开 http://localhost:5005 查看默认页面。
+访问 http://localhost:5005/index.html 或其他静态文件。
+使用 curl -v http://localhost:5005/ 查看详细请求/响应头。
+测试 Keep-Alive：
+echo -ne "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\nGET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n" | nc localhost 5005
+按下 Ctrl+C 优雅关闭服务器，日志完整保存在 logs/epollserver.log
 
 技术栈
 技术	说明
@@ -81,6 +84,7 @@ epoll	Linux I/O 多路复用，边缘触发（ET）+ ONESHOT
 SO_REUSEPORT	多 Worker 负载均衡
 spdlog	高性能异步日志库
 CMake	跨平台构建系统
+sendfile	零拷贝文件传输
 
 项目结构
 .
@@ -92,7 +96,9 @@ CMake	跨平台构建系统
 │   │   └── error_utils.h
 │   ├── server.h
 │   ├── tcpworker.h
-│   ├── echohandler.h
+│   ├── http_handler.h        # HTTP 请求处理
+│   ├── http_parser.h         # HTTP 解析器
+│   ├── content_type.h        # MIME 类型映射
 │   ├── pool.h
 │   ├── client.h
 │   └── clienthandler.h
@@ -106,48 +112,66 @@ CMake	跨平台构建系统
 │   │   ├── main.cpp
 │   │   ├── server.cpp
 │   │   ├── tcpworker.cpp
-│   │   ├── echohandler.cpp
+│   │   ├── http_handler.cpp
+│   │   ├── http_parser.cpp
+│   │   ├── content_type.cpp
 │   │   └── pool.cpp
-│   └── client/               # 客户端
+│   └── client/               # 客户端（Echo 测试）
 │       ├── main.cpp
 │       ├── client.cpp
 │       └── clienthandler.cpp
-├── CMakeLists.txt            # 顶层 CMake 配置
+├── www/                      # 静态文件根目录（可选）
+├── CMakeLists.txt
+└── README.md
 
 核心设计细节
-1. 非阻塞 accept 与连接管理
-Listen socket 使用 SOCK_NONBLOCK | SOCK_CLOEXEC 创建，accept4 原子设置客户端 socket 为非阻塞。
+1. HTTP 协议解析与管线化
+使用状态机解析请求行和头部，支持分片接收，无需完整报文。
+正确处理 Connection: keep-alive 和 Connection: close。
+管线化（Pipelining）：按顺序依次处理同一连接上的多个请求，响应顺序与请求严格一致。
 
-客户端 fd 统一注册 EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT，确保事件仅触发一次，处理完后需手动重新注册。
+2. 零拷贝文件发送
+对于静态文件，使用 open + fstat 获取文件大小，直接通过 sendfile 将数据从内核文件缓存发送到 socket，避免用户态内存拷贝。
+发送大文件时，若 socket 缓冲区满，会保存偏移量并重新注册写事件，实现异步断点续传。
 
-2. 零拷贝的发送队列优化
-服务端 EchoHandler 采用 std::deque<std::vector<char>> 作为发送缓冲区，避免 std::string 频繁头部删除导致的 O(n) 内存移动。
+3. 发送队列与 EPOLLONESHOT 协作
+发送队列采用 std::deque<std::vector<char>> 减少头删开销。
+每次事件处理完成后，根据队列状态重新设置 EPOLLIN 或 EPOLLOUT，并重新应用 EPOLLET | EPOLLONESHOT，确保同一时间只有一个线程处理该 fd。
 
-3. 线程池集成（预留）
-TcpWorker 持有 DynamicThreadPool 指针，未来可将耗时操作（如解析、加密）提交到线程池，通过 eventfd 通知 I/O 线程写回结果，目前 Echo 示例未启用。
+4. 错误处理与路径安全
+拦截包含 .. 的请求，返回 403。
+不支持的 HTTP 方法返回 405。
+文件不存在返回 404，内部错误返回 500。
+错误响应自动设置 Content-Length 和 Content-Type，并关闭连接。
 
-4. 信号处理与优雅关闭
-全局 std::atomic<bool> 标志，结合 SIGINT/SIGTERM 处理器，让所有 Worker 在空闲时检测并退出事件循环。
+5. 日志与监控
+请求日志包含方法、路径、HTTP 版本、User-Agent。
+响应日志包含状态码和发送字节数，便于后续接入 ELK/Prometheus 等监控系统。
+超时、调试日志可配置为 trace 级别，日常运行不会刷屏。
 
+6. 信号处理与优雅关闭
+全局 std::atomic<bool> 标志，SIGINT/SIGTERM 处理器置位。
+Worker 在每次超时返回时检查标志，主动退出事件循环。
+析构顺序保证日志最后关闭，所有日志可靠刷盘。
 析构顺序保证：Tcpserver → DynamicThreadPool → Logger::Guard，确保日志在最后关闭。
 
-性能指标（Echo 服务）
-并发连接数：可轻松应对 10,000+ 并发连接（受系统文件描述符限制）。
-
-吞吐量：在 4 核虚拟机上，双 Worker 模式下，短连接 Echo 吞吐可达数万 QPS。
-
-延迟：单线程处理无锁，事件延迟在微秒级
+性能指标
+并发连接数：轻松应对 10,000+ 并发连接（受系统 fd 限制）。
+吞吐量：静态小文件（如 index.html）在使用 sendfile 后，单 Worker 可达到数万 QPS。
+延迟：请求处理在微秒级，零拷贝极低 CPU 占用。
+具体压测数据请参见后续压测报告。
 
 后续计划
-集成 HTTP 协议解析，转变为轻量级 Web 服务器
-
-增加定时器功能，管理空闲连接
-
+支持 HEAD 方法完整实现
+增加缓存机制（内存缓存、文件描述符缓存）
+集成定时器管理空闲连接
 完善线程池与 I/O 线程的 eventfd 通知机制
-
-支持跨平台 kqueue（macOS）兼容层
-
-加入压测工具与性能调优文档
+支持 CGI/FastCGI 动态内容
+支持 HTTPS（集成 OpenSSL）
+跨平台 kqueue（macOS）兼容
+单元测试与压力测试套件
+配置文件（如 JSON）解析
+Docker 容器化部署
 
 许可
 本项目采用 MIT License
