@@ -38,8 +38,10 @@ target_compile_options(common PRIVATE
 set(SERVER_SOURCES
     src/server/main.cpp
     src/server/server.cpp
-    src/server/echohandler.cpp
+    src/server/http_parser.cpp
+    src/server/http_handler.cpp
     src/server/pool.cpp
+    src/server/content_type.cpp
 )
 #创建服务端的可执行文件
 add_executable(server ${SERVER_SOURCES})

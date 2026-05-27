@@ -4,7 +4,8 @@
 #include "mysocket.h"
 #include "myepoll.h"
 #include <memory>
-#include "echohandler.h"
+//#include "echohandler.h"    //只做回显
+#include "http_handler.h"
 #include "mylogger.h"
 #include "error_utils.h"
 #include <atomic>
@@ -22,7 +23,7 @@ private:
   std::atomic<bool> closed_;
   Epoll epoll_;
   std::unordered_map<int, std::shared_ptr<Socket>> conns_;
-  EchoHandler handler_;
+  HttpHandler handler_;
 public:
   TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool);
 

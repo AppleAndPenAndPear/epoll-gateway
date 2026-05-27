@@ -1,0 +1,63 @@
+[2026-05-19 17:42:27.058] [info] [3419] Starting epoll server...
+[2026-05-19 17:42:27.058] [info] [3419] Initializing Tcpserver on port 5005
+[2026-05-19 17:42:27.058] [info] [3419] Initializing thread pool: min threads = 2, max threads = 10, scaling up/down = 2/1
+[2026-05-19 17:42:27.058] [info] [3421] creating thread,id = 9347601454882204320
+[2026-05-19 17:42:27.058] [info] [3422] creating thread,id = 13488068330103711116
+[2026-05-19 17:42:27.058] [info] [3419] epoll server is working, port = 5005
+[2026-05-19 17:42:27.058] [info] [3419] Starting 2 worker threads with SO_REUSEPORT
+[2026-05-19 17:42:27.058] [info] [3419] Socket fd 4 listening with backlog 1024
+[2026-05-19 17:42:27.058] [info] [3419] TcpWorker created with listen fd 4 by move
+[2026-05-19 17:42:27.058] [info] [3419] Socket fd 6 listening with backlog 1024
+[2026-05-19 17:42:27.058] [info] [3419] TcpWorker created with listen fd 6 by move
+[2026-05-19 17:42:30.614] [info] [3423] Worker accepted client fd 8
+[2026-05-19 17:42:30.629] [info] [3424] Worker accepted client fd 9
+[2026-05-19 17:42:30.851] [info] [3423] Worker accepted client fd 10
+[2026-05-19 17:44:40.701] [info] [3423] TcpWorker on fd 4 exiting
+[2026-05-19 17:44:40.737] [info] [3424] TcpWorker on fd 6 exiting
+[2026-05-19 17:44:40.738] [info] [3422] pool stop && task queue is empty, thread exists,id = 13488068330103711116
+[2026-05-19 17:44:40.738] [info] [3421] pool stop && task queue is empty, thread exists,id = 9347601454882204320
+[2026-05-19 17:44:40.738] [info] [3419] DynamicThreadPool destroyed, total threads joined
+[2026-05-19 17:44:40.738] [info] [3419] Server stopped.
+[2026-05-21 08:48:58.439] [info] [2227] Starting epoll server...
+[2026-05-21 08:48:58.439] [info] [2227] Initializing Tcpserver on port 5005
+[2026-05-21 08:48:58.439] [info] [2227] Initializing thread pool: min threads = 2, max threads = 10, scaling up/down = 2/1
+[2026-05-21 08:48:58.440] [info] [2229] creating thread,id = 1095629643707463664
+[2026-05-21 08:48:58.440] [info] [2227] epoll server is working, port = 5005
+[2026-05-21 08:48:58.440] [info] [2227] Starting 2 worker threads with SO_REUSEPORT
+[2026-05-21 08:48:58.440] [info] [2227] Socket fd 4 listening with backlog 1024
+[2026-05-21 08:48:58.440] [info] [2227] TcpWorker created with listen fd 4 by move
+[2026-05-21 08:48:58.440] [info] [2227] Socket fd 6 listening with backlog 1024
+[2026-05-21 08:48:58.440] [info] [2227] TcpWorker created with listen fd 6 by move
+[2026-05-21 08:48:58.440] [info] [2230] creating thread,id = 4089177972512507824
+[2026-05-21 08:49:04.435] [info] [2231] Worker accepted client fd 8
+[2026-05-21 08:49:04.435] [info] [2231] Request: GET /index.html HTTP/1.1 - UA: -
+[2026-05-21 08:49:04.436] [info] [2231] Request: GET /test.html HTTP/1.1 - UA: -
+[2026-05-21 08:49:04.437] [info] [2231] HTTP response: status=404 size=117 (fd 8)
+[2026-05-21 08:50:28.638] [info] [2231] HttpHandler: connection closed on fd -1
+[2026-05-21 08:50:32.559] [info] [2232] TcpWorker on fd 6 exiting
+[2026-05-21 08:50:32.643] [info] [2231] TcpWorker on fd 4 exiting
+[2026-05-21 08:50:32.644] [info] [2229] pool stop && task queue is empty, thread exists,id = 1095629643707463664
+[2026-05-21 08:50:32.644] [info] [2230] pool stop && task queue is empty, thread exists,id = 4089177972512507824
+[2026-05-21 08:50:32.644] [info] [2227] DynamicThreadPool destroyed, total threads joined
+[2026-05-21 08:50:32.644] [info] [2227] Server stopped.
+[2026-05-21 10:24:48.981] [info] [3836] Starting epoll server...
+[2026-05-21 10:24:48.981] [info] [3836] Initializing Tcpserver on port 5005
+[2026-05-21 10:24:48.981] [info] [3836] Initializing thread pool: min threads = 2, max threads = 10, scaling up/down = 2/1
+[2026-05-21 10:24:48.981] [info] [3838] creating thread,id = 13935189911897813250
+[2026-05-21 10:24:48.981] [info] [3836] epoll server is working, port = 5005
+[2026-05-21 10:24:48.981] [info] [3836] Starting 2 worker threads with SO_REUSEPORT
+[2026-05-21 10:24:48.981] [info] [3836] Socket fd 4 listening with backlog 1024
+[2026-05-21 10:24:48.981] [info] [3836] TcpWorker created with listen fd 4 by move
+[2026-05-21 10:24:48.981] [info] [3836] Socket fd 6 listening with backlog 1024
+[2026-05-21 10:24:48.981] [info] [3836] TcpWorker created with listen fd 6 by move
+[2026-05-21 10:24:48.981] [info] [3839] creating thread,id = 16628904716516318466
+[2026-05-21 10:24:55.099] [info] [3840] Worker accepted client fd 8
+[2026-05-21 10:24:55.099] [info] [3840] Request: GET /index.html HTTP/1.1 - UA: -
+[2026-05-21 10:24:55.099] [info] [3840] HTTP response: status=200 size=315 (fd 8)
+[2026-05-21 10:25:52.844] [info] [3840] HttpHandler: connection closed on fd -1
+[2026-05-21 10:25:57.073] [info] [3841] TcpWorker on fd 6 exiting
+[2026-05-21 10:25:57.851] [info] [3840] TcpWorker on fd 4 exiting
+[2026-05-21 10:25:57.851] [info] [3839] pool stop && task queue is empty, thread exists,id = 16628904716516318466
+[2026-05-21 10:25:57.851] [info] [3838] pool stop && task queue is empty, thread exists,id = 13935189911897813250
+[2026-05-21 10:25:57.851] [info] [3836] DynamicThreadPool destroyed, total threads joined
+[2026-05-21 10:25:57.851] [info] [3836] Server stopped.

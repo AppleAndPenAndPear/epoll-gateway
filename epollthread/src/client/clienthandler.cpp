@@ -34,7 +34,7 @@ void ClientHandler::handle_event(Socket& sock, Epoll& epoll, uint32_t events){
                     // n == -1 且非 EAGAIN 的情况被封装直接抛出异常，不会走到这里
                 }
             }
-                // ★ 发送完毕，半关闭写端
+            // ★ 发送完毕，半关闭写端
             if (::shutdown(sock.getFd(), SHUT_WR) == -1) {
                 Logger::get()->error("shutdown SHUT_WR failed: {}", strerror(errno));
                 state_ = ERROR; done_ = true; return;

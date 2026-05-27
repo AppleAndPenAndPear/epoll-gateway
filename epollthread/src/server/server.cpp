@@ -8,7 +8,6 @@
 #include <atomic>
 
 
-
 TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool):epoll_(),listen_sock_(std::move(listen_sock)),pool_(pool),closed_(false),handler_(epoll_){
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
   Logger::get()->info("TcpWorker created with listen fd {} by move", listen_sock_.getFd());
