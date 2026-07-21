@@ -10,8 +10,92 @@
 #include <cctype>              // std::tolower 需要
 #include <stdexcept>           // std::runtime_error 需要
 #include "mylogger.h"
+#include <iomanip>      // std::hex 需要
+#include <nlohmann/json.hpp>
+#include "route_utils.h"
+#include "gzip_utils.h"
+#include <string>
+using json = nlohmann::json;
 
-HttpHandler::HttpHandler(Epoll& epoll) : epoll_(epoll) {
+static std::string to_hex(size_t n) {
+    std::ostringstream oss;
+    oss << std::hex << n;
+    return oss.str();
+}
+
+HttpHandler::HttpHandler(Epoll& epoll,const std::string& www_root,size_t cache_max,size_t cache_max_file_size_mb) : epoll_(epoll), www_root_(www_root), cache_(cache_max, cache_max_file_size_mb) {
+    // 注册示例路由
+    addRoute("GET", "/api/hello", [](const HttpRequest& req, HttpResponse& resp,const RouteParams& params) {
+        nlohmann::json j;
+        j["message"] = "Hello, World!";
+        std::string body = j.dump();
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "application/json";
+        resp.body = body;
+        resp.headers["Content-Length"] = std::to_string(body.size());
+    });
+
+    addRoute("POST", "/api/echo", [](const HttpRequest& req, HttpResponse& resp,const RouteParams& params) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            nlohmann::json resp_json;
+            resp_json["echo"] = j;
+            std::string body = resp_json.dump();
+            resp.status_code = 200;
+            resp.status_message = "OK";
+            resp.headers["Content-Type"] = "application/json";
+            resp.body = body;
+            resp.headers["Content-Length"] = std::to_string(body.size());
+        } catch (...) {
+            resp.status_code = 400;
+            resp.status_message = "Bad Request";
+            resp.body = "{\"error\":\"Invalid JSON\"}";
+            resp.headers["Content-Type"] = "application/json";
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        }
+    });
+
+    addRoute("PUT", "/api/echo", [](const HttpRequest& req, HttpResponse& resp,const RouteParams& params) {
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "text/plain";
+        resp.body = "PUT received: " + req.body;
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+    });
+
+    addRoute("DELETE", "/api/resource", [](const HttpRequest& req, HttpResponse& resp,const RouteParams& params) {
+        json j;
+        j["status"] = "deleted";
+        j["message"] = "Resource deleted successfully";
+        resp.body = j.dump();
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "application/json";
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+    });
+
+    addRoute("GET", "/users/{id}", [](const HttpRequest& req, HttpResponse& resp, const RouteParams& params) {
+        std::string user_id = params.at("id");
+        json j;
+        j["id"] = user_id;
+        j["name"] = "User_" + user_id;  // 模拟数据
+        resp.body = j.dump();
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "application/json";
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+    });
+
+    addRoute("GET", "/chunked", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
+        std::string payload = "This is a chunked response.\n";
+        payload += "Each line could be generated separately.\n";
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "text/plain";
+        resp.chunked = true;      // 关键：设置 chunked 标志
+        resp.body = payload;
+    });
 }
 
 void HttpHandler::on_connect(Socket* sock){
@@ -22,9 +106,11 @@ void HttpHandler::on_connect(Socket* sock){
     keep_alive_[sock] = true;  // 默认 keep-alive
 }
 
-void HttpHandler::handle_read(std::shared_ptr<Socket> sock){
-    int fd = sock->getFd();
+void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip){
     Socket* sock_ptr = sock.get();
+    client_ip_map_[sock_ptr] = client_ip;
+    request_start_time_[sock_ptr] = std::chrono::steady_clock::now();
+    int fd = sock->getFd();
     try {
         char buf[4096];
         while (true) {
@@ -44,20 +130,20 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock){
                         auto& req = requests_[sock_ptr];
 
                         // ─── 新增：方法合法性检查 ───
-                        if (req.method != "GET" && req.method != "HEAD") {
+                        if (req.method != "GET" && req.method != "HEAD" && req.method != "POST" && req.method != "PUT" && req.method != "DELETE") {
                             Logger::get()->warn("HTTP method not allowed: {} on fd {}", req.method, fd);
                             send_error_response(sock_ptr, 405, "Method Not Allowed");
                             parsers_[sock_ptr].reset();
                             continue;  // 错误响应已放入发送队列，继续解析下一个请求（如果有）
                         }
                         
-                        //记录User-Agent
-                        auto ua_it = req.headers.find("User-Agent");
+                        //记录user-agent（key 已统一小写）
+                        auto ua_it = req.headers.find("user-agent");
                         std::string user_agent = (ua_it != req.headers.end()) ? ua_it->second : "-";
                         Logger::get()->info("Request: {} {} {} - UA: {}", req.method, req.path, req.version, user_agent);
 
-                        // 检查 Connection 头，决定 keep-alive
-                        auto it = req.headers.find("Connection");
+                        // 检查 connection 头，决定 keep-alive（key 已统一小写）
+                        auto it = req.headers.find("connection");
                         if (it != req.headers.end()) {
                             std::string conn = it->second;
                             std::transform(conn.begin(), conn.end(), conn.begin(), ::tolower);
@@ -74,6 +160,17 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock){
 
                         // ★ 关键：跳出内层循环，等待发送完成再处理下一个请求
                         break;
+                    }
+                    // ─── 检查 body 是否超出大小限制 ───
+                    if (parsers_[sock_ptr].is_body_too_large()) {
+                        Logger::get()->warn("Request body too large (>{}) on fd {}",
+                            HttpParser::MAX_BODY_SIZE, fd);
+                        send_error_response(sock_ptr, 413, "Payload Too Large");
+                        // 清除部分已消费的数据
+                        if (consumed > 0) read_buf.erase(0, consumed);
+                        parsers_[sock_ptr].reset();
+                        requests_[sock_ptr].clear();
+                        continue;  // 继续检查缓冲区中是否还有后续请求
                     }
                     else {
                         Logger::get()->trace("Parser waiting for more data, buffer size: {}", read_buf.size());
@@ -105,8 +202,8 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock){
 
 void HttpHandler::process_request(Socket* sock_ptr){
     HttpRequest& req = requests_[sock_ptr];
-    // 检查 Connection 头
-    auto it = req.headers.find("Connection");
+    // 检查 connection 头（key 已统一小写）
+    auto it = req.headers.find("connection");
     if (it != req.headers.end()) {
         std::string conn = it->second;
         std::transform(conn.begin(), conn.end(), conn.begin(), ::tolower);
@@ -120,58 +217,179 @@ void HttpHandler::process_request(Socket* sock_ptr){
 }
 
 void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
+    last_requests_[sock] = req;
     HttpResponse resp;
     std::string path = req.path;
 
     // 默认首页
     if (path.empty() || path == "/") path = "/index.html"; // 默认首页
-    
-    //防止目录遍历攻击，简单处理：不允许 ".."
-    if (path.find("..") != std::string::npos) {
-        // 返回 403 Forbidden
-        resp.status_code = 403;
-        resp.status_message = "Forbidden";
-        resp.body = "<h1>403 Forbidden</h1>";       //<h1>:html标题标签，显示为大号字体
-        resp.headers["Content-Length"] = std::to_string(resp.body.size());
-        resp.headers["Content-Type"] = "text/html";
-    }
-    else{
-        std::string file_path = "./www" + path;     //目前目录限制在www文件夹下，硬编码
-        Logger::get()->debug("Attempting to serve file: {}", file_path);
-        // 尝试打开文件
-        int file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (file_fd >= 0) {
-            // 获取文件大小
-            struct stat st;
-            if (fstat(file_fd, &st) == 0) {
-                resp.status_code = 200;
-                resp.status_message = "OK";
-                resp.headers["Content-Type"] = get_content_type(path);
-                resp.headers["Content-Length"] = std::to_string(st.st_size);
-                // 保存文件信息，由 handle_write 用 sendfile 发送
-                file_fds_[sock] = file_fd;
-                file_offsets_[sock] = 0;
-                file_sizes_[sock] = st.st_size;
-                // body 留空，不占用内存
-                resp.body.clear();
-            }
-            else {
-                close(file_fd);
-                resp.status_code = 500;
-                resp.status_message = "Internal Server Error";
-                resp.body = "<h1>500 Internal Server Error</h1>";
-                resp.headers["Content-Type"] = "text/html";
-            }
-        }
-        else {
-            resp.status_code = 404;
-            resp.status_message = "Not Found";
-            resp.body = "<h1>404 Not Found</h1>";
-            resp.headers["Content-Type"] = "text/html";
-            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+
+    bool path_handled = false;
+
+    std::string req_path = req.path;
+    std::string req_method = req.method;
+
+    // 遍历已注册的路由，尝试匹配
+    for (const auto& route : routes_) {
+        if (route.method != req_method) continue;
+
+        RouteParams params;
+        if (matchRoute(route.pattern, req_path, params)) {
+            route.handler(req, resp, params);
+            path_handled = true;
+            break;
         }
     }
 
+    bool already_compressed = false;  // ★ 提前声明
+    
+    if (!path_handled) {
+        //防止目录遍历攻击，简单处理：不允许 ".."
+        if (path.find("..") != std::string::npos) {
+            // 返回 403 Forbidden
+            resp.status_code = 403;
+            resp.status_message = "Forbidden";
+            resp.body = "<h1>403 Forbidden</h1>";       //<h1>:html标题标签，显示为大号字体
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+            resp.headers["Content-Type"] = "text/html";
+            resp.chunked = false;
+        }
+        else{
+            std::string file_path = www_root_ + path;
+            Logger::get()->debug("Attempting to serve file: {}", file_path);
+            // 尝试打开文件
+            int file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (file_fd >= 0) {
+                // 获取文件大小
+                struct stat st;
+                if (fstat(file_fd, &st) == 0) {
+                    constexpr size_t MAX_INLINE = 1024 * 1024; // 1MB
+
+                    // 判断客户端是否支持 gzip
+                    bool client_wants_gzip = false;
+                    auto it = req.headers.find("accept-encoding");
+                    if (it != req.headers.end() && it->second.find("gzip") != std::string::npos) {
+                        client_wants_gzip = true;
+                    }
+
+                    if (client_wants_gzip && st.st_size <= MAX_INLINE) {
+                        // 尝试获取压缩缓存
+                        std::string gzip_key = path + "#gzip";
+                        const std::string* compressed_cached = cache_.get(gzip_key, st.st_mtime);
+                        if (compressed_cached) {
+                            // 命中压缩缓存
+                            resp.body = *compressed_cached;
+                            resp.headers["Content-Encoding"] = "gzip";
+                            already_compressed = true;
+                            Logger::get()->debug("Cache hit (gzip): {}", path);
+                        } else {
+                            // 未命中，获取原始内容，压缩，并缓存压缩结果
+                            const std::string* raw = cache_.get(path, st.st_mtime);
+                            if (!raw) {
+                                // 原始也没缓存，读文件并存入原始缓存
+                                std::string file_content(st.st_size, '\0');
+                                ssize_t n = ::read(file_fd, &file_content[0], st.st_size);
+                                if (n == static_cast<ssize_t>(st.st_size)) {
+                                    cache_.put(path, file_content, st.st_size, st.st_mtime);
+                                    resp.body = std::move(file_content);
+                                    raw = &resp.body;  // ★ 修复：指向 resp.body 供后续压缩使用
+                                }
+                                else{
+                                    close(file_fd);
+                                    resp.status_code = 500;
+                                    resp.status_message = "Internal Server Error";
+                                    resp.body = "<h1>500 Internal Server Error</h1>";
+                                    resp.headers["Content-Type"] = "text/html";
+                                    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+
+                                    resp.chunked = false;
+                                    goto after_file;  // 跳出文件处理
+                                }
+                            }
+                            std::string compressed;
+                            if (gzip_compress(*raw, compressed)) {
+                                cache_.put(gzip_key, compressed, compressed.size(), st.st_mtime);
+                                resp.body = std::move(compressed);
+                                resp.headers["Content-Encoding"] = "gzip";
+                                already_compressed = true;
+                            } else if (raw != &resp.body) {
+                                // 压缩失败，回退到原始内容（避免 self-copy）
+                                resp.body = *raw;
+                            }
+                            Logger::get()->debug("Gzip cache miss, compressed: {}", already_compressed);
+                        }
+                        // 无论是否命中，小文件都已读入内存，可以关闭文件
+                        close(file_fd);
+                        file_fd = -1;  // 标记已关闭
+                        resp.status_code = 200;
+                        resp.status_message = "OK";
+                        resp.headers["Content-Type"] = get_content_type(path);
+                        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                    }else{
+                        // ---------- 不支持 gzip 或大文件：走原有逻辑 ----------
+                        if (st.st_size <= MAX_INLINE) {
+                            // 小文件但不压缩：直接内存缓存（原来的缓存逻辑）
+                            const std::string* cached = cache_.get(path, st.st_mtime);
+                            if (cached) {
+                                resp.body = *cached;
+                                Logger::get()->debug("Cache hit (raw): {}", path);
+                            } else {
+                                std::string file_content(st.st_size, '\0');
+                                ssize_t n = ::read(file_fd, &file_content[0], st.st_size);
+                                if (n == static_cast<ssize_t>(st.st_size)) {
+                                    cache_.put(path, file_content, st.st_size, st.st_mtime);
+                                    resp.body = std::move(file_content);
+                                    Logger::get()->debug("Cache miss, stored (raw): {}", path);
+                                } else {
+                                    close(file_fd);
+                                    resp.status_code = 500;
+                                    resp.status_message = "Internal Server Error";
+                                    resp.body = "<h1>500 Internal Server Error</h1>";
+                                    resp.headers["Content-Type"] = "text/html";
+                                    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                                    resp.chunked = false;
+                                    goto after_file;
+                                }
+                            }
+                            close(file_fd);
+                            file_fd = -1;
+                            resp.status_code = 200;
+                            resp.status_message = "OK";
+                            resp.headers["Content-Type"] = get_content_type(path);
+                            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                        } else {
+                            // 大文件：sendfile 零拷贝
+                            resp.status_code = 200;
+                            resp.status_message = "OK";
+                            resp.headers["Content-Type"] = get_content_type(path);
+                            resp.headers["Content-Length"] = std::to_string(st.st_size);
+                            file_fds_[sock] = file_fd;
+                            file_offsets_[sock] = 0;
+                            file_sizes_[sock] = st.st_size;
+                            resp.body.clear();
+                            Logger::get()->debug("Large file via sendfile: {}", path);
+                        }
+                    }
+                }else {
+                    close(file_fd);
+                    resp.status_code = 500;
+                    resp.status_message = "Internal Server Error";
+                    resp.body = "<h1>500 Internal Server Error</h1>";
+                    resp.headers["Content-Type"] = "text/html";
+                    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                    resp.chunked = false;
+                }
+            }else {
+                resp.status_code = 404;
+                resp.status_message = "Not Found";
+                resp.body = "<h1>404 Not Found</h1>";
+                resp.headers["Content-Type"] = "text/html";
+                resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                resp.chunked = false;
+            }
+        }
+    } // if (!path_handled)
+after_file:
     if (keep_alive_[sock]) {
         resp.headers["Connection"] = "keep-alive";
     } 
@@ -179,16 +397,56 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
         resp.headers["Connection"] = "close";
     }
 
+    // ★ 统一添加 Server 头
+    resp.headers["Server"] = "EpollHTTP/0.2";
+
+    if (req.method != "HEAD" && !already_compressed && should_compress(req, resp)) {
+        std::string compressed;
+        if (gzip_compress(resp.body, compressed)) {
+            resp.body = std::move(compressed);
+            resp.headers["Content-Encoding"] = "gzip";
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        }
+    }
+
+    if (resp.chunked) {
+        resp.headers.erase("Content-Length");               // 不能同时存在
+        resp.headers["Transfer-Encoding"] = "chunked";
+        // 将原始 body 编码为 chunked 格式
+        std::string chunked_body;
+        if (!resp.body.empty()) {
+            chunked_body += to_hex(resp.body.size()) + "\r\n";
+            chunked_body += resp.body + "\r\n";
+        }
+        chunked_body += "0\r\n\r\n";   // 结束块
+        resp.body = chunked_body;
+    }
+
     // 计算总发送字节数
     size_t total_bytes = 0;
     // 将响应头序列化并放入发送队列
     std::string header_str = headers_to_string(resp);
     total_bytes += header_str.size();
-    if (!resp.body.empty()) {
-        total_bytes += resp.body.size();
-    } else if (resp.status_code == 200) {
-        // 文件响应：头部大小 + 文件大小
-        total_bytes += file_sizes_[sock];   // 此时文件大小已存入
+
+    bool is_head = (req.method == "HEAD");
+    if (!is_head) {   // 非 HEAD 请求，才可能包含 body 或文件
+        if (!resp.body.empty()) {
+            total_bytes += resp.body.size();
+        } else if (resp.status_code == 200) {
+            // 文件响应：头部大小 + 文件大小
+            total_bytes += file_sizes_[sock];   // 此时文件大小已存入
+        }
+    }
+    else{
+        // HEAD 请求不允许有 body，清理可能已设置的文件发送
+        auto file_it = file_fds_.find(sock);
+        if (file_it != file_fds_.end()) {
+            close(file_it->second);
+            file_fds_.erase(sock);
+            file_offsets_.erase(sock);
+            file_sizes_.erase(sock);
+        }
+        resp.body.clear();   // 确保内联 body 清空
     }
 
     // 存储状态码和总大小
@@ -244,6 +502,8 @@ std::string HttpHandler::headers_to_string(const HttpResponse& resp) {
 
 void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
     Socket* sock_ptr = sock.get();
+    int fd = sock->getFd();
+    epoll_.del(fd);               // 显式从 epoll 移除，避免 fd 复用竞态
     sock->closefd();
     read_bufs_.erase(sock_ptr);
     send_queues_.erase(sock_ptr);
@@ -254,10 +514,18 @@ void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
 
     resp_status_.erase(sock_ptr);
     resp_size_.erase(sock_ptr);
-    file_fds_.erase(sock_ptr);        // 若未清理过
+    // 关闭可能残留的发送文件 fd
+    auto fit = file_fds_.find(sock_ptr);
+    if (fit != file_fds_.end()) {
+        close(fit->second);
+        file_fds_.erase(fit);
+    }
     file_offsets_.erase(sock_ptr);
     file_sizes_.erase(sock_ptr);
-    Logger::get()->info("HttpHandler: connection closed on fd {}", sock->getFd());
+    client_ip_map_.erase(sock_ptr);
+    request_start_time_.erase(sock_ptr);
+    last_requests_.erase(sock_ptr);
+    Logger::get()->info("HttpHandler: connection closed on fd {}", fd);
 }
 
 void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
@@ -284,7 +552,12 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                 } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                     break;
-                } else {
+                } else if(n == -1 && errno == EPIPE){
+                    // 客户端已断开，这是正常现象，清理连接即可
+                    Logger::get()->debug("Client disconnected (EPIPE) on fd {}", fd);
+                    cleanup(sock);
+                    return;
+                }else {
                     throw_system_error("send");
                 }
             }
@@ -328,8 +601,48 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     file_sizes_.erase(sock_ptr);
                 }
 
-                // 记录响应日志（所有数据已发送）
-                Logger::get()->info("HTTP response: status={} size={} (fd {})",resp_status_[sock_ptr], resp_size_[sock_ptr], fd);
+                // ★ 新增：记录 CLF 格式的访问日志
+                {
+                    auto ip_it = client_ip_map_.find(sock_ptr);
+                    std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "-";
+
+                    // 安全获取请求耗时（防止 map 已被 cleanup 清空导致迭代器失效）
+                    int64_t duration_us = 0;
+                    auto start_it = request_start_time_.find(sock_ptr);
+                    if (start_it != request_start_time_.end()) {
+                        duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - start_it->second).count();
+                    }
+
+                    std::string method, path, version, user_agent;
+                    auto req_it = last_requests_.find(sock_ptr);
+                    if (req_it != last_requests_.end()) {
+                        method = req_it->second.method;
+                        path = req_it->second.path;
+                        version = req_it->second.version;
+                        auto ua = req_it->second.headers.find("user-agent");
+                        user_agent = (ua != req_it->second.headers.end()) ? ua->second : "-";
+                        last_requests_.erase(sock_ptr);
+                    }
+
+                    char time_buf[64];
+                    time_t now = time(nullptr);
+                    strftime(time_buf, sizeof(time_buf), "%d/%b/%Y:%H:%M:%S %z", localtime(&now));
+
+                    // 安全获取状态码和响应大小
+                    int status_code = 0;
+                    size_t response_size = 0;
+                    auto status_it = resp_status_.find(sock_ptr);
+                    if (status_it != resp_status_.end()) status_code = status_it->second;
+                    auto size_it = resp_size_.find(sock_ptr);
+                    if (size_it != resp_size_.end()) response_size = size_it->second;
+
+                    Logger::get()->info("{} - - [{}] \"{} {} {}\" {} {} \"-\" \"{}\" {}us",
+                        client_ip, time_buf, method, path, version,
+                        status_code, response_size,
+                        user_agent, duration_us);
+                }
+
                 // 清理本次响应的临时记录
                 resp_status_.erase(sock_ptr);
                 resp_size_.erase(sock_ptr);
@@ -342,8 +655,8 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
 
                 // 检查读缓冲区中是否已有待处理的请求
                 if (!read_bufs_[sock_ptr].empty()) {
-                    // 解析并生成下一个响应（会填充 send_queues_）
-                    handle_read(sock);
+                    std::string ip = client_ip_map_[sock_ptr]; // 复用 IP
+                    handle_read(sock, ip);
                     // 继续循环，尝试发送刚生成的数据
                     continue;
                 }
@@ -352,8 +665,9 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                 epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);
                 break;
             } else {
-                // 发送队列中仍有数据，保持 EPOLLOUT 监听
+                // 发送队列中仍有数据（EAGAIN 或部分发送），等待下次 EPOLLOUT
                 epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                return;
             }
         }
     }
@@ -368,4 +682,18 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
 
 void HttpHandler::close_connection(std::shared_ptr<Socket> sock){
     cleanup(sock);
+}
+
+void HttpHandler::addRoute(const std::string& method, const std::string& pattern, RouteHandler handler) {
+    routes_.push_back({method, pattern, handler});
+}
+
+std::vector<std::string> split(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter)) {
+        if (!token.empty()) tokens.push_back(token);
+    }
+    return tokens;
 }

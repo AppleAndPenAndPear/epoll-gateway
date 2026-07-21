@@ -14,23 +14,25 @@ void Logger::init(const string& log_file_path){
     std::call_once(init_flag, [&]() {
         try {
             auto console_sink = make_shared<spdlog::sinks::stdout_color_sink_mt>();
-            console_sink->set_level(spdlog::level::trace);
+            console_sink->set_level(spdlog::level::warn);
 
+            // 生产环境：文件只记录 warn 及以上，减少磁盘 I/O
             auto file_sink = make_shared<spdlog::sinks::rotating_file_sink_mt>(
-                log_file_path, 1024 * 1024 * 5, 3);
+                log_file_path, 1024 * 1024 * 50, 5);  // 50MB, 5个文件
             file_sink->set_level(spdlog::level::info);
             
             vector<spdlog::sink_ptr> sinks {console_sink, file_sink};
 
-            // 2. 初始化全局线程池（8192 队列大小，1 个后台线程）
-            spdlog::init_thread_pool(8192, 1);
+            // 队列加大，线程加到2，减少争用
+            spdlog::init_thread_pool(32768, 2);
             
             // 3. 创建异步 logger，使用全局线程池
             auto logger = std::make_shared<spdlog::async_logger>(
                 "server", sinks.begin(), sinks.end(),
-                spdlog::thread_pool(),   // ★ 关键：获取全局线程池
+                spdlog::thread_pool(),
                 spdlog::async_overflow_policy::overrun_oldest);
-
+            
+            //生产环境：日志级别设置为 debug，方便调试
             logger->set_level(spdlog::level::debug);
             logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 

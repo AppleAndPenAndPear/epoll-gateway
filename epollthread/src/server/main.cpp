@@ -3,6 +3,7 @@
 #include "mylogger.h"
 #include "spdlog/spdlog.h"
 #include <csignal>
+#include "config.h"
 
 std::atomic<bool> stop_server_flag{false};
 void signal_handler(int signal) {
@@ -15,16 +16,24 @@ int main(){
     Logger::Guard g("logs/epollserver.log");
     auto logger = Logger::get();
 
+    // 加载配置文件（如果不存在则使用默认值）
+    Config config = Config::from_file("config.json");
+
     // 注册信号
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
     logger->info("Starting epoll server...");
 
     try {
-        Tcpserver t(5005,1024,2,10,2,1);
-        logger->info("epoll server is working, port = 5005");
-        t.start();
+        Tcpserver t(config.port, config.backlog,
+                    config.thread_pool.min_threads,
+                    config.thread_pool.max_threads,
+                    config.thread_pool.scale_up_threshold,
+                    config.thread_pool.scale_down_threshold);
+        logger->info("Starting epoll server on port {}", config.port);
+        t.start(config.num_workers,config.www_root,config.cache_max_entries,config.cache_max_file_size_mb,config.keepalive_timeout);
     } catch (const system_error& e) {
         logger->critical("Server startup failed: {}", e.what());
         std::cerr << "系统错误: " << e.what() << " [code: " << e.code() << "]\n";

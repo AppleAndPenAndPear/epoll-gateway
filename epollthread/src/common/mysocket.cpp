@@ -134,7 +134,7 @@ ssize_t Socket::recv(char* data, int size, int flags) {
 ssize_t Socket::send(char* data,int size,int flags){
   ssize_t n = ::send(fd_,data,size,flags);
   if (n == -1) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EPIPE) {
       Logger::get()->trace("send() would block on fd {}", fd_);
       return -1;
     }

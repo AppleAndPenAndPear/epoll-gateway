@@ -33,3 +33,38 @@ TEST(FileCacheTest, EvictionWhenFull) {
     EXPECT_NE(cache.get("/b", 0), nullptr);
     EXPECT_NE(cache.get("/c", 0), nullptr);
 }
+
+// 测试超过 max_file_size 的文件不会被缓存
+TEST(FileCacheTest, RejectOversizedFile) {
+    // 设置最大文件大小为 10 字节
+    FileCache cache(10, 10);
+    std::string path = "/large.txt";
+    std::string content = "This is more than 10 bytes";
+    ASSERT_GT(content.size(), cache.max_file_size());  // 确认内容确实超过限制
+
+    cache.put(path, content, content.size(), 100);
+    EXPECT_EQ(cache.size(), 0);  // 缓存应该为空
+    EXPECT_EQ(cache.get(path, 0), nullptr);  // 获取也应该失败
+}
+
+// 测试正好等于 max_file_size 的文件可以被缓存
+TEST(FileCacheTest, AcceptExactSizedFile) {
+    FileCache cache(10, 10);
+    std::string path = "/exact.txt";
+    std::string content = "1234567890";  // 正好 10 字节
+    cache.put(path, content, content.size(), 200);
+    EXPECT_EQ(cache.size(), 1);
+    EXPECT_NE(cache.get(path, 0), nullptr);
+}
+
+// 测试多次插入同一个 path 会更新内容，而不是创建多个条目
+TEST(FileCacheTest, UpdateExistingPath) {
+    FileCache cache(10);
+    std::string path = "/update.txt";
+    cache.put(path, "old", 3, 100);
+    cache.put(path, "newer", 5, 200);
+    EXPECT_EQ(cache.size(), 1);  // 仍然只有一个条目
+    auto* cached = cache.get(path, 0);
+    ASSERT_NE(cached, nullptr);
+    EXPECT_EQ(*cached, "newer");
+}

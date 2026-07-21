@@ -1,0 +1,32 @@
+AddressSanitizer exit stats:
+Stats: 22M malloced (7M for red zones) by 221951 calls
+Stats: 0M realloced by 0 calls
+Stats: 22M freed by 221938 calls
+Stats: 0M really freed by 0 calls
+Stats: 38M (38M-0M) mmaped; 562 maps, 0 unmaps
+  mallocs by size class: 2:17; 3:101881; 4:103; 6:327; 7:50777; 8:33873; 11:17012; 12:2; 14:5; 17:136; 18:7; 19:5; 21:909; 22:16886; 23:4; 25:2; 33:3; 49:1; 
+Stats: malloc large: 1
+Stats: StackDepot: 299 ids; 9M allocated
+Stats: SizeClassAllocator64: 33M mapped (32M rss) in 226095 allocations; remains 223539
+  02 (    32): mapped:     64K allocs:     256 frees:     127 inuse:    129 num_freed_chunks    1919 avail:   2048 rss:      8K releases:      0 last released:      0K region: 0x502000000000
+  03 (    48): mapped:   4864K allocs:  102528 frees:     556 inuse: 101972 num_freed_chunks    1793 avail: 103765 rss:   4796K releases:      1 last released:     56K region: 0x503000000000
+  04 (    64): mapped:     64K allocs:     384 frees:     155 inuse:    229 num_freed_chunks     795 avail:   1024 rss:     12K releases:      2 last released:     44K region: 0x504000000000
+  06 (    96): mapped:     64K allocs:     640 frees:     210 inuse:    430 num_freed_chunks     252 avail:    682 rss:     36K releases:      1 last released:      8K region: 0x506000000000
+  07 (   112): mapped:   5632K allocs:   50944 frees:      41 inuse:  50903 num_freed_chunks     589 avail:  51492 rss:   5568K releases:      2 last released:     52K region: 0x507000000000
+  08 (   128): mapped:   4288K allocs:   33920 frees:      47 inuse:  33873 num_freed_chunks     431 avail:  34304 rss:   4240K releases:      1 last released:     48K region: 0x508000000000
+  11 (   176): mapped:   3008K allocs:   17280 frees:     141 inuse:  17139 num_freed_chunks     362 avail:  17501 rss:   2940K releases:      2 last released:     44K region: 0x50b000000000
+  12 (   192): mapped:     64K allocs:     128 frees:       0 inuse:    128 num_freed_chunks     213 avail:    341 rss:      4K releases:      0 last released:      0K region: 0x50c000000000
+  14 (   224): mapped:    192K allocs:     640 frees:     635 inuse:      5 num_freed_chunks     872 avail:    877 rss:     32K releases:      3 last released:     64K region: 0x50e000000000
+  17 (   320): mapped:    128K allocs:     384 frees:     131 inuse:    253 num_freed_chunks     156 avail:    409 rss:     56K releases:      1 last released:     20K region: 0x511000000000
+  18 (   384): mapped:    128K allocs:     256 frees:     127 inuse:    129 num_freed_chunks     212 avail:    341 rss:     12K releases:      2 last released:     68K region: 0x512000000000
+  19 (   448): mapped:     64K allocs:     128 frees:       0 inuse:    128 num_freed_chunks      18 avail:    146 rss:      4K releases:      0 last released:      0K region: 0x513000000000
+  21 (   640): mapped:    768K allocs:    1224 frees:     215 inuse:   1009 num_freed_chunks     219 avail:   1228 rss:    592K releases:      1 last released:     52K region: 0x515000000000
+  22 (   768): mapped:  12736K allocs:   16915 frees:      29 inuse:  16886 num_freed_chunks      95 avail:  16981 rss:  12720K releases:      1 last released:     12K region: 0x516000000000
+  23 (   896): mapped:     64K allocs:      73 frees:       0 inuse:     73 num_freed_chunks       0 avail:     73 rss:      4K releases:      0 last released:      0K region: 0x517000000000
+  25 (  1280): mapped:    128K allocs:     102 frees:     100 inuse:      2 num_freed_chunks     100 avail:    102 rss:     12K releases:      1 last released:     56K region: 0x519000000000
+  33 (  5120): mapped:     64K allocs:      12 frees:       9 inuse:      3 num_freed_chunks       9 avail:     12 rss:     16K releases:      1 last released:     44K region: 0x521000000000
+  36 (  8192): mapped:   2240K allocs:     280 frees:      33 inuse:    247 num_freed_chunks      33 avail:    280 rss:   1820K releases:      1 last released:     40K region: 0x524000000000
+  49 ( 81920): mapped:    128K allocs:       1 frees:       0 inuse:      1 num_freed_chunks       0 avail:      1 rss:      8K releases:      0 last released:      0K region: 0x531000000000
+Stats: LargeMmapAllocator: allocated 1 times, remains 1 (3276 K) max 3 M; by size logs: 21:1; 
+Quarantine limits: global: 256Mb; thread local: 1024Kb
+Global quarantine stats: batches: 240; bytes: 25924997 (user: 23958917); chunks: 221912 (capacity: 245040); 90% chunks used; 8% memory overhead

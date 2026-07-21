@@ -1,0 +1,15 @@
+{
+    "port": 5005,
+    "backlog": 1024,
+    "num_workers": 2,
+    "www_root": "./www",
+    "thread_pool": {
+        "min": 2,
+        "max": 10,
+        "scale_up": 2,
+        "scale_down": 1
+    },
+    "cache_max_entries": 1024,
+    "cache_max_file_size_mb": 1,
+    "keepalive_timeout": 5
+}

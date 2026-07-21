@@ -4,34 +4,16 @@
 #include "mysocket.h"
 #include "myepoll.h"
 #include <memory>
-//#include "echohandler.h"    //只做回显
+//#include "echohandler.h"    //只做回显,现在使用httphandler
 #include "http_handler.h"
 #include "mylogger.h"
 #include "error_utils.h"
 #include <atomic>
 #include <vector>
-
+#include "tcpworker.h"
 
 using namespace std;
 
-extern std::atomic<bool> stop_server_flag;
-
-class TcpWorker {
-private:
-  Socket listen_sock_;
-  DynamicThreadPool* pool_;
-  std::atomic<bool> closed_;
-  Epoll epoll_;
-  std::unordered_map<int, std::shared_ptr<Socket>> conns_;
-  HttpHandler handler_;
-public:
-  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool);
-
-  void run();
-  void handle_accept();
-  void handle_client(int fd, uint32_t events);
-  void close();
-};
 
 // TCP通讯的服务端类。
 class Tcpserver
@@ -49,7 +31,7 @@ public:
   Tcpserver(unsigned short port,int backlog,size_t min_threads, size_t max_threads,size_t scale_up_factor , size_t scale_down_factor);
   ~Tcpserver();
 
-  void start(unsigned int num_workers = 0);
+  void start(unsigned int num_workers = 0,const std::string& www_root = "./www",size_t cache_max_entries = 1024,size_t cache_max_file_size_mb = 1, int keepalive_timeout = 60);
 
   void stop();
 };

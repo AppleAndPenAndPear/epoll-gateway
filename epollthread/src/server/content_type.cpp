@@ -1,8 +1,10 @@
 #include "content_type.h"
 #include <unordered_map>
+#include <string_view>
 
 std::string get_content_type(const std::string& path) {
-    static const std::unordered_map<std::string, std::string> mime_map = {
+    // 使用 string_view 避免 substr 的内存分配
+    static const std::unordered_map<std::string_view, std::string_view> mime_map = {
         {".html", "text/html"},
         {".htm", "text/html"},
         {".css", "text/css"},
@@ -24,9 +26,9 @@ std::string get_content_type(const std::string& path) {
 
     auto ext_pos = path.rfind('.');
     if (ext_pos != std::string::npos) {
-        std::string ext = path.substr(ext_pos);
+        std::string_view ext(path.data() + ext_pos, path.size() - ext_pos);
         auto it = mime_map.find(ext);
-        if (it != mime_map.end()) return it->second;
+        if (it != mime_map.end()) return std::string(it->second);
     }
     return "application/octet-stream"; // 默认二进制流
 }

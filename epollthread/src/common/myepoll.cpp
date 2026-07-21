@@ -66,8 +66,8 @@ void Epoll::mod(int fd, uint32_t events) {
 void Epoll::del(int fd) {
   if (setepoll_ctl(EPOLL_CTL_DEL, fd, nullptr) == -1) {
     if (errno == ENOENT || errno == EBADF) {
-        // fd 已经不在 epoll 中，忽略
-        return;
+      // fd 已经不在 epoll 中，忽略
+      return;
     }
     throw_system_error("epoll_ctl() DEL failed");
   }
