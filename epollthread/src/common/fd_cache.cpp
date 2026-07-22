@@ -1,8 +1,8 @@
 #include "fd_cache.h"
+#include <time.h>
 
-FdCache::FdCache(size_t max_entries): max_entries_(max_entries) {
-
-}
+FdCache::FdCache(size_t max_entries, int ttl_sec)
+    : max_entries_(max_entries), ttl_sec_(ttl_sec) {}
 
 FdCache::~FdCache(){
     clear();
@@ -20,7 +20,21 @@ size_t FdCache::size() const {
     return list_.size(); 
 }
 
-int FdCache::get(const std::string& path, time_t mtime) {
+int FdCache::try_get(const std::string& path, time_t now, off_t* file_size, time_t* mtime) {
+    auto it = map_.find(path);
+    if (it == map_.end()) return -1;
+
+    // TTL 未过期 → 直接返回，零系统调用
+    if (now - it->second.validated_at < ttl_sec_) {
+        list_.splice(list_.begin(), list_, it->second.lru_it);
+        if (file_size) *file_size = it->second.file_size;
+        if (mtime) *mtime = it->second.mtime;
+        return it->second.fd;
+    }
+    return -1;  // 已过期，调用方需 stat + validate
+}
+
+int FdCache::validate(const std::string& path, time_t mtime) {
     auto it = map_.find(path);
     if (it == map_.end()) return -1;
 
@@ -32,12 +46,13 @@ int FdCache::get(const std::string& path, time_t mtime) {
         return -1;
     }
 
-    // 移动到 LRU 头部
+    // 验证通过，更新时间戳
+    it->second.validated_at = time(nullptr);
     list_.splice(list_.begin(), list_, it->second.lru_it);
     return it->second.fd;
 }
 
-void FdCache::put(const std::string& path, int fd, time_t mtime){
+void FdCache::put(const std::string& path, int fd, time_t mtime, off_t file_size){
     // 如果已存在，先移除旧的
     auto it = map_.find(path);
     if (it != map_.end()) {
@@ -59,5 +74,5 @@ void FdCache::put(const std::string& path, int fd, time_t mtime){
 
     // 插入新条目
     list_.push_front(path);
-    map_[path] = {fd, mtime, list_.begin()};    
+    map_[path] = {fd, file_size, mtime, time(nullptr), list_.begin()};
 }

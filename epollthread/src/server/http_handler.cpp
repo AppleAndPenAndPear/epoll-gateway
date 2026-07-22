@@ -255,60 +255,70 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
             resp.chunked = false;
         }
         else{
-            std::string file_path = www_root_ + path;
-            Logger::get()->debug("Attempting to serve file: {}", file_path);
+            Logger::get()->debug("Attempting to serve file: {}", path);
 
             // 大文件：sendfile 零拷贝 + fd 缓存优化
             int file_fd = -1;
 
-            // 先 stat 获取 mtime，用于 fd 缓存查询
+            // 快速路径：TTL 内直接返回，零系统调用
             struct stat st;
-            if (::stat(file_path.c_str(), &st) != 0) {
-                resp.status_code = 404;
-                resp.status_message = "Not Found";
-                resp.body = "<h1>404 Not Found</h1>";
-                resp.headers["Content-Length"] = std::to_string(resp.body.size());
-                resp.headers["Content-Type"] = "text/html";
-                resp.chunked = false;
-                goto after_file;
-            }
-
-            // 第一步：先尝试从 fd 缓存获取（省掉 open 系统调用）
-            file_fd = fd_cache_.get(path, st.st_mtime);
+            off_t cached_size = 0;
+            time_t cached_mtime = 0;
+            time_t now = time(nullptr);
+            file_fd = fd_cache_.try_get(path, now, &cached_size, &cached_mtime);
             if (file_fd != -1) {
-                // 缓存命中！直接使用，无需 open
-                Logger::get()->debug("FdCache hit: {}", path);
+                // 缓存命中！直接使用，无 stat/open/fstat
+                st.st_size = cached_size;
+                st.st_mtime = cached_mtime;
+                Logger::get()->debug("FdCache fast hit: {}", path);
             }
             else {
-                // 缓存未命中，必须执行 open
-                file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
-                if (file_fd >= 0) {
-                    // 将新打开的 fd 加入缓存，供后续请求使用
-                    fd_cache_.put(path, file_fd, st.st_mtime);
-                    Logger::get()->debug("FdCache miss, stored: {}", path);
-                }
-                else {
-                    resp.status_code = 500;
-                    resp.status_message = "Internal Server Error";
-                    resp.body = "<h1>500 Internal Server Error</h1>";
+                // TTL 过期或未缓存 → 需要 stat() 验证
+                std::string file_path = www_root_ + path;
+                if (::stat(file_path.c_str(), &st) != 0) {
+                    resp.status_code = 404;
+                    resp.status_message = "Not Found";
+                    resp.body = "<h1>404 Not Found</h1>";
                     resp.headers["Content-Length"] = std::to_string(resp.body.size());
                     resp.headers["Content-Type"] = "text/html";
                     resp.chunked = false;
                     goto after_file;
                 }
+
+                // 尝试验证已有缓存条目
+                file_fd = fd_cache_.validate(path, st.st_mtime);
+                if (file_fd != -1) {
+                    Logger::get()->debug("FdCache validated: {}", path);
+                }
+                else {
+                    // 缓存中无此条目，执行 open
+                    file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (file_fd >= 0) {
+                        fd_cache_.put(path, file_fd, st.st_mtime, st.st_size);
+                        Logger::get()->debug("FdCache miss, stored: {}", path);
+                    }
+                    else {
+                        resp.status_code = 500;
+                        resp.status_message = "Internal Server Error";
+                        resp.body = "<h1>500 Internal Server Error</h1>";
+                        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                        resp.headers["Content-Type"] = "text/html";
+                        resp.chunked = false;
+                        goto after_file;
+                    }
+                }
             }
             
             if (file_fd >= 0) {
-                // 获取文件大小
-                if (fstat(file_fd, &st) == 0) {
-                    constexpr size_t MAX_INLINE = 1024 * 1024; // 1MB
+                // st 已由 stat() 填充，无需 fstat
+                constexpr size_t MAX_INLINE = 1024 * 1024; // 1MB
 
-                    // 判断客户端是否支持 gzip
-                    bool client_wants_gzip = false;
-                    auto it = req.headers.find("accept-encoding");
-                    if (it != req.headers.end() && it->second.find("gzip") != std::string::npos) {
-                        client_wants_gzip = true;
-                    }
+                // 判断客户端是否支持 gzip
+                bool client_wants_gzip = false;
+                auto it = req.headers.find("accept-encoding");
+                if (it != req.headers.end() && it->second.find("gzip") != std::string::npos) {
+                    client_wants_gzip = true;
+                }
 
                     if (client_wants_gzip && st.st_size <= MAX_INLINE) {
                         // 尝试获取压缩缓存
@@ -407,15 +417,6 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                             Logger::get()->debug("Large file via sendfile: {}", path);
                         }
                     }
-                }else {
-                    // fstat 失败，fd 已缓存，由 FdCache 管理生命周期，不关闭
-                    resp.status_code = 500;
-                    resp.status_message = "Internal Server Error";
-                    resp.body = "<h1>500 Internal Server Error</h1>";
-                    resp.headers["Content-Type"] = "text/html";
-                    resp.headers["Content-Length"] = std::to_string(resp.body.size());
-                    resp.chunked = false;
-                }
             }else {
                 resp.status_code = 404;
                 resp.status_message = "Not Found";
@@ -475,10 +476,9 @@ after_file:
         }
     }
     else{
-        // HEAD 请求不允许有 body，清理可能已设置的文件发送
+        // HEAD 请求不允许有 body，fd 由 FdCache 管理，仅清理映射
         auto file_it = file_fds_.find(sock);
         if (file_it != file_fds_.end()) {
-            close(file_it->second);
             file_fds_.erase(sock);
             file_offsets_.erase(sock);
             file_sizes_.erase(sock);
@@ -551,10 +551,9 @@ void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
 
     resp_status_.erase(sock_ptr);
     resp_size_.erase(sock_ptr);
-    // 关闭可能残留的发送文件 fd
+    // fd 由 FdCache 统一管理生命周期，这里只清理映射，不关闭
     auto fit = file_fds_.find(sock_ptr);
     if (fit != file_fds_.end()) {
-        close(fit->second);
         file_fds_.erase(fit);
     }
     file_offsets_.erase(sock_ptr);

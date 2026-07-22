@@ -28,7 +28,7 @@ set(COMMON_SOURCES
     src/common/mylogger.cpp
     src/common/fd_cache.cpp
     src/common/file_cache.cpp
-    src/server/http_parser.cpp
+    src/common/http_parser.cpp
 )
 add_library(common STATIC ${COMMON_SOURCES})
 target_include_directories(common PUBLIC include)
