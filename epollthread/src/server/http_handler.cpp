@@ -257,11 +257,49 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
         else{
             std::string file_path = www_root_ + path;
             Logger::get()->debug("Attempting to serve file: {}", file_path);
-            // 尝试打开文件
-            int file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
+
+            // 大文件：sendfile 零拷贝 + fd 缓存优化
+            int file_fd = -1;
+
+            // 先 stat 获取 mtime，用于 fd 缓存查询
+            struct stat st;
+            if (::stat(file_path.c_str(), &st) != 0) {
+                resp.status_code = 404;
+                resp.status_message = "Not Found";
+                resp.body = "<h1>404 Not Found</h1>";
+                resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                resp.headers["Content-Type"] = "text/html";
+                resp.chunked = false;
+                goto after_file;
+            }
+
+            // 第一步：先尝试从 fd 缓存获取（省掉 open 系统调用）
+            file_fd = fd_cache_.get(path, st.st_mtime);
+            if (file_fd != -1) {
+                // 缓存命中！直接使用，无需 open
+                Logger::get()->debug("FdCache hit: {}", path);
+            }
+            else {
+                // 缓存未命中，必须执行 open
+                file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (file_fd >= 0) {
+                    // 将新打开的 fd 加入缓存，供后续请求使用
+                    fd_cache_.put(path, file_fd, st.st_mtime);
+                    Logger::get()->debug("FdCache miss, stored: {}", path);
+                }
+                else {
+                    resp.status_code = 500;
+                    resp.status_message = "Internal Server Error";
+                    resp.body = "<h1>500 Internal Server Error</h1>";
+                    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                    resp.headers["Content-Type"] = "text/html";
+                    resp.chunked = false;
+                    goto after_file;
+                }
+            }
+            
             if (file_fd >= 0) {
                 // 获取文件大小
-                struct stat st;
                 if (fstat(file_fd, &st) == 0) {
                     constexpr size_t MAX_INLINE = 1024 * 1024; // 1MB
 
@@ -295,7 +333,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                                     raw = &resp.body;  // ★ 修复：指向 resp.body 供后续压缩使用
                                 }
                                 else{
-                                    close(file_fd);
+                                    //close(file_fd);
                                     resp.status_code = 500;
                                     resp.status_message = "Internal Server Error";
                                     resp.body = "<h1>500 Internal Server Error</h1>";
@@ -319,8 +357,8 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                             Logger::get()->debug("Gzip cache miss, compressed: {}", already_compressed);
                         }
                         // 无论是否命中，小文件都已读入内存，可以关闭文件
-                        close(file_fd);
-                        file_fd = -1;  // 标记已关闭
+                        // close(file_fd);
+                        // file_fd = -1;  // 标记已关闭
                         resp.status_code = 200;
                         resp.status_message = "OK";
                         resp.headers["Content-Type"] = get_content_type(path);
@@ -341,7 +379,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                                     resp.body = std::move(file_content);
                                     Logger::get()->debug("Cache miss, stored (raw): {}", path);
                                 } else {
-                                    close(file_fd);
+                                    // fd 已缓存，由 FdCache 管理生命周期，不关闭
                                     resp.status_code = 500;
                                     resp.status_message = "Internal Server Error";
                                     resp.body = "<h1>500 Internal Server Error</h1>";
@@ -351,8 +389,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                                     goto after_file;
                                 }
                             }
-                            close(file_fd);
-                            file_fd = -1;
+                            // fd 已缓存，由 FdCache 管理生命周期，不关闭
                             resp.status_code = 200;
                             resp.status_message = "OK";
                             resp.headers["Content-Type"] = get_content_type(path);
@@ -371,7 +408,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                         }
                     }
                 }else {
-                    close(file_fd);
+                    // fstat 失败，fd 已缓存，由 FdCache 管理生命周期，不关闭
                     resp.status_code = 500;
                     resp.status_message = "Internal Server Error";
                     resp.body = "<h1>500 Internal Server Error</h1>";
@@ -582,9 +619,8 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                                 epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                                 return;
                             } else {
-                                // 其他错误：记录日志，关闭文件，清理资源
+                                // 其他错误：记录日志，fd 由 FdCache 管理，仅清理映射
                                 Logger::get()->error("sendfile failed: {}", strerror(errno));
-                                close(file_fd);
                                 file_fds_.erase(sock_ptr);
                                 file_offsets_.erase(sock_ptr);
                                 file_sizes_.erase(sock_ptr);
@@ -595,7 +631,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     }
 
                     // 文件发送完毕，清理文件描述符与映射
-                    close(file_fd);
+                    //close(file_fd);
                     file_fds_.erase(sock_ptr);
                     file_offsets_.erase(sock_ptr);
                     file_sizes_.erase(sock_ptr);

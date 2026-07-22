@@ -3,9 +3,6 @@ add_executable(runTests
     test_file_cache.cpp
     test_http_response.cpp
     test_route_utils.cpp
-    ${PROJECT_SOURCE_DIR}/src/server/http_parser.cpp
-    ${PROJECT_SOURCE_DIR}/src/server/file_cache.cpp
-
 )
 
 # 链接你的公共库和 gtest

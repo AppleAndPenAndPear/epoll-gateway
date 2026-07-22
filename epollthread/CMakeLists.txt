@@ -26,6 +26,9 @@ set(COMMON_SOURCES
     src/common/myepoll.cpp
     src/common/error_utils.cpp
     src/common/mylogger.cpp
+    src/common/fd_cache.cpp
+    src/common/file_cache.cpp
+    src/server/http_parser.cpp
 )
 add_library(common STATIC ${COMMON_SOURCES})
 target_include_directories(common PUBLIC include)
@@ -43,11 +46,9 @@ target_compile_options(common PRIVATE
 set(SERVER_SOURCES
     src/server/main.cpp
     src/server/server.cpp
-    src/server/http_parser.cpp
     src/server/http_handler.cpp
     src/server/pool.cpp
     src/server/content_type.cpp
-    src/server/file_cache.cpp
     src/server/tcpworker.cpp
     src/server/gzip_utils.cpp
 )
