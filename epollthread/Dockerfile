@@ -8,7 +8,8 @@ RUN apt-get update && \
         cmake \
         make \
         nlohmann-json3-dev \
-        libspdlog-dev && \
+        libspdlog-dev \
+        zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
@@ -36,7 +37,8 @@ FROM ubuntu:22.04
 # 安装 spdlog 运行时库（仅需 libspdlog1）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libspdlog1 && \
+        libspdlog1 \
+        zlib1g && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

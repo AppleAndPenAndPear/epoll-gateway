@@ -26,6 +26,8 @@
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
 - **单元测试**：基于 Google Test，覆盖 HTTP 解析器、LRU 缓存、响应序列化、路由匹配等核心模块。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
+- **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、文件缓存命中率、FD 缓存命中率、Gzip 压缩缓存命中率等。
+- **Grafana 可视化监控**：集成 Grafana + Prometheus 监控栈，通过 `docker-compose` 一键部署，开箱即用的指标采集与仪表盘展示。
 
 ## 架构概览
 
@@ -51,11 +53,20 @@
          └───────────────┴───────────────┘
                          │
               DynamicThreadPool (共享线程池)
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+         Prometheus              Grafana
+    (每5s刮取 /metrics)    (可视化仪表盘 @ :3000)
+         @ :9090
 ```
 
 - **Tcpserver**：负责创建 N 个 listen socket，启动对应数量的 `TcpWorker` 线程。
 - **TcpWorker**：每个 Worker 持有独立的 epoll 实例、连接表、`HttpHandler`，全权处理归属连接的所有 I/O 事件，并负责超时连接清理。
-- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、路由匹配、Keep-Alive 管理、文件服务、错误响应、内存缓存等。
+- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、路由匹配、Keep-Alive 管理、文件服务、错误响应、内存缓存等。同时将请求指标上报给 `Metrics` 单例。
+- **Metrics**：线程安全的指标收集器（单例），记录请求总数、状态码分布、延迟直方图、多级缓存命中率，通过 `/metrics` 端点以 Prometheus 文本格式暴露。
+- **Prometheus**：定期从 `server:5005/metrics` 刮取指标数据，存储时序数据。
+- **Grafana**：连接 Prometheus 作为数据源，提供实时可视化仪表盘。
 - **DynamicThreadPool**：可选的共享线程池，用于将耗时任务从 I/O 线程卸载到工作线程（预留扩展）。
 - **Logger**：全局异步日志器，通过 spdlog 全局线程池实现高性能日志记录。
 
@@ -68,6 +79,7 @@ epollthread/
 │   ├── tcpworker.h           # TcpWorker 工作线程
 │   ├── http_handler.h        # HTTP 请求处理与路由
 │   ├── http_parser.h         # HTTP/1.1 协议解析器（状态机）
+│   ├── metrics.h             # Prometheus 指标收集器（单例，线程安全）
 │   ├── pool.h                # DynamicThreadPool 动态线程池
 │   ├── mysocket.h            # Socket RAII 封装
 │   ├── myepoll.h             # Epoll RAII 封装
@@ -87,6 +99,7 @@ epollthread/
 │   │   ├── server.cpp        # Tcpserver 实现
 │   │   ├── tcpworker.cpp     # TcpWorker 实现
 │   │   ├── http_handler.cpp  # HttpHandler 实现（含路由注册）
+│   │   ├── metrics.cpp       # Metrics 指标收集实现
 │   │   ├── pool.cpp          # 动态线程池实现
 │   │   ├── content_type.cpp  # Content-Type 实现
 │   │   └── gzip_utils.cpp    # Gzip 压缩实现
@@ -119,6 +132,8 @@ epollthread/
 ├── config.json               # 服务器配置文件
 ├── vcpkg.json                # vcpkg 依赖清单
 ├── Dockerfile                # Docker 多阶段构建
+├── docker-compose.yml        # Docker Compose 编排（server + Prometheus + Grafana）
+├── prometheus.yml            # Prometheus 抓取配置
 └── README.md
 ```
 
@@ -208,6 +223,30 @@ cmake --build . -j$(nproc)
 
 ## Docker 构建与运行
 
+### 方式一：Docker Compose 一键部署（推荐，含监控栈）
+
+```bash
+# 启动所有服务（server + Prometheus + Grafana）
+sudo docker-compose up -d
+
+# 查看服务状态
+sudo docker ps -a
+
+# 查看日志
+sudo docker-compose logs -f
+
+# 停止所有服务
+sudo docker-compose down
+```
+
+访问地址：
+- 服务主页：http://localhost:5005
+- 服务指标：http://localhost:5005/metrics
+- Prometheus：http://localhost:9090
+- Grafana：http://localhost:3000（默认用户名/密码：`admin`/`admin`）
+
+### 方式二：单独构建镜像
+
 ```bash
 # 构建镜像
 docker build -t epoll-server .
@@ -234,7 +273,65 @@ docker stop my-server && docker rm my-server
 | `DELETE` | `/api/resource` | 返回 `{"status": "deleted", ...}` |
 | `GET` | `/users/{id}` | 动态路由，返回模拟用户数据 |
 | `GET` | `/chunked` | Chunked 分块传输演示 |
+| `GET` | `/metrics` | Prometheus 指标端点（文本格式） |
 | `GET` | `/<path>` | 静态文件服务（默认行为） |
+
+## Prometheus + Grafana 监控
+
+项目内置了 Prometheus 指标端点 `/metrics`，通过 `docker-compose` 一键集成完整监控栈。
+
+### 架构
+
+```
+server:5005/metrics
+       │
+       ▼ (每 5s scrape)
+ Prometheus :9090 ─────▶ Grafana :3000
+ (时序数据库)           (可视化仪表盘)
+```
+
+### 暴露的指标
+
+| 指标名 | 类型 | 说明 |
+|---|---|---|
+| `epoll_server_requests_total` | Counter | 请求总数 |
+| `epoll_server_requests_2xx` | Counter | 2xx 成功请求数 |
+| `epoll_server_requests_3xx` | Counter | 3xx 重定向请求数 |
+| `epoll_server_requests_4xx` | Counter | 4xx 客户端错误数 |
+| `epoll_server_requests_5xx` | Counter | 5xx 服务端错误数 |
+| `epoll_server_request_duration_seconds` | Histogram | 请求延迟分布（11 个桶） |
+| `epoll_server_cache_hits` | Counter | 文件缓存命中数 |
+| `epoll_server_cache_misses` | Counter | 文件缓存未命中数 |
+| `epoll_server_fd_cache_hits` | Counter | FD 缓存命中数 |
+| `epoll_server_fd_cache_misses` | Counter | FD 缓存未命中数 |
+| `epoll_server_gzip_cache_hits` | Counter | Gzip 压缩缓存命中数 |
+| `epoll_server_gzip_cache_misses` | Counter | Gzip 压缩缓存未命中数 |
+
+### 在 Grafana 中添加数据源
+
+1. 浏览器打开 http://localhost:3000，使用 `admin`/`admin` 登录
+2. 左侧菜单 → **Connections** → **Data sources** → **Add data source**
+3. 选择 **Prometheus**
+4. 在 **Prometheus server URL** 填入 `http://prometheus:9090`（容器间通过 Docker 网络通信）
+5. 点击 **Save & test**，确认显示 "Successfully queried the Prometheus API"
+
+### 常用 PromQL 查询
+
+```promql
+# QPS（每秒请求数）
+rate(epoll_server_requests_total[1m])
+
+# 错误率
+sum(rate(epoll_server_requests_4xx[1m]) + rate(epoll_server_requests_5xx[1m])) /
+sum(rate(epoll_server_requests_total[1m]))
+
+# P99 延迟
+histogram_quantile(0.99, rate(epoll_server_request_duration_seconds_bucket[1m]))
+
+# 文件缓存命中率
+sum(rate(epoll_server_cache_hits[1m])) /
+sum(rate(epoll_server_cache_hits[1m]) + rate(epoll_server_cache_misses[1m]))
+```
 
 ## 客户端
 
@@ -304,6 +401,10 @@ sendfile	零拷贝文件传输
 nlohmann/json	JSON 解析（单头文件）
 Google Test	单元测试框架
 Docker	容器化部署
+Docker Compose	多容器服务编排
+Prometheus	指标采集与时序数据库
+Grafana	指标可视化仪表盘
+zlib	Gzip 压缩
 
 项目结构
 .

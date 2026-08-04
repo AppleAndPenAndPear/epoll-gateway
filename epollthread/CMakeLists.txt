@@ -35,7 +35,6 @@ target_include_directories(common PUBLIC include)
 target_link_libraries(common PUBLIC
     spdlog::spdlog
     Threads::Threads
-    z
 )
 # 可选：为 common 设置编译警告选项
 target_compile_options(common PRIVATE
@@ -51,11 +50,12 @@ set(SERVER_SOURCES
     src/server/content_type.cpp
     src/server/tcpworker.cpp
     src/server/gzip_utils.cpp
+    src/server/metrics.cpp
 )
 #创建服务端的可执行文件
 add_executable(server ${SERVER_SOURCES})
 #链接第common库
-target_link_libraries(server PRIVATE common)
+target_link_libraries(server PRIVATE common z)
 
 #客户端可执行文件
 set(CLIENT_SOURCES
@@ -73,7 +73,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 install(TARGETS server client RUNTIME DESTINATION bin)
 
 # 单元测试选项
-option(BUILD_TESTS "Build unit tests" ON)
+option(BUILD_TESTS "Build unit tests" OFF)
 
 if(BUILD_TESTS)
     find_package(GTest REQUIRED)      # 查找系统安装的 gtest

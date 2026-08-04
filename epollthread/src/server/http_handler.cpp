@@ -15,6 +15,7 @@
 #include "route_utils.h"
 #include "gzip_utils.h"
 #include <string>
+#include "metrics.h"
 using json = nlohmann::json;
 
 static std::string to_hex(size_t n) {
@@ -25,6 +26,15 @@ static std::string to_hex(size_t n) {
 
 HttpHandler::HttpHandler(Epoll& epoll,const std::string& www_root,size_t cache_max,size_t cache_max_file_size_mb) : epoll_(epoll), www_root_(www_root), cache_(cache_max, cache_max_file_size_mb) {
     // 注册示例路由
+    addRoute("GET", "/metrics", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
+        std::string body = Metrics::instance().to_string();
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "text/plain; version=0.0.4";
+        resp.body = body;
+        resp.headers["Content-Length"] = std::to_string(body.size());
+    });
+
     addRoute("GET", "/api/hello", [](const HttpRequest& req, HttpResponse& resp,const RouteParams& params) {
         nlohmann::json j;
         j["message"] = "Hello, World!";
@@ -123,7 +133,9 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                 while (true) {
                     size_t consumed = 0;
                     if (parsers_[sock_ptr].parse(read_buf.data(), read_buf.size(),requests_[sock_ptr], consumed)) {
-                        // 成功解析一个请求，从缓冲区移除已消费的数据
+                        // 成功解析一个完整请求，记录总请求数
+                        Metrics::instance().record_total_request();
+                        // 从缓冲区移除已消费的数据
                         read_buf.erase(0, consumed);
 
                         // 获取已解析好的请求引用
@@ -268,6 +280,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
             file_fd = fd_cache_.try_get(path, now, &cached_size, &cached_mtime);
             if (file_fd != -1) {
                 // 缓存命中！直接使用，无 stat/open/fstat
+                Metrics::instance().record_fd_cache_hit();  // 记录缓存命中
                 st.st_size = cached_size;
                 st.st_mtime = cached_mtime;
                 Logger::get()->debug("FdCache fast hit: {}", path);
@@ -288,10 +301,12 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                 // 尝试验证已有缓存条目
                 file_fd = fd_cache_.validate(path, st.st_mtime);
                 if (file_fd != -1) {
+                    Metrics::instance().record_fd_cache_hit();  // 记录缓存命中
                     Logger::get()->debug("FdCache validated: {}", path);
                 }
                 else {
                     // 缓存中无此条目，执行 open
+                    Metrics::instance().record_fd_cache_miss();
                     file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
                     if (file_fd >= 0) {
                         fd_cache_.put(path, file_fd, st.st_mtime, st.st_size);
@@ -326,6 +341,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                         const std::string* compressed_cached = cache_.get(gzip_key, st.st_mtime);
                         if (compressed_cached) {
                             // 命中压缩缓存
+                            Metrics::instance().record_gzip_cache_hit();   // ★ 使用 gzip 专用计数器
                             resp.body = *compressed_cached;
                             resp.headers["Content-Encoding"] = "gzip";
                             already_compressed = true;
@@ -335,6 +351,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                             const std::string* raw = cache_.get(path, st.st_mtime);
                             if (!raw) {
                                 // 原始也没缓存，读文件并存入原始缓存
+                                Metrics::instance().record_cache_miss();
                                 std::string file_content(st.st_size, '\0');
                                 ssize_t n = ::read(file_fd, &file_content[0], st.st_size);
                                 if (n == static_cast<ssize_t>(st.st_size)) {
@@ -360,6 +377,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                                 resp.body = std::move(compressed);
                                 resp.headers["Content-Encoding"] = "gzip";
                                 already_compressed = true;
+                                Metrics::instance().record_gzip_cache_miss();  // ★ 使用 gzip 专用计数器
                             } else if (raw != &resp.body) {
                                 // 压缩失败，回退到原始内容（避免 self-copy）
                                 resp.body = *raw;
@@ -381,12 +399,14 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
                             if (cached) {
                                 resp.body = *cached;
                                 Logger::get()->debug("Cache hit (raw): {}", path);
+                                Metrics::instance().record_cache_hit();
                             } else {
                                 std::string file_content(st.st_size, '\0');
                                 ssize_t n = ::read(file_fd, &file_content[0], st.st_size);
                                 if (n == static_cast<ssize_t>(st.st_size)) {
                                     cache_.put(path, file_content, st.st_size, st.st_mtime);
                                     resp.body = std::move(file_content);
+                                    Metrics::instance().record_cache_miss();
                                     Logger::get()->debug("Cache miss, stored (raw): {}", path);
                                 } else {
                                     // fd 已缓存，由 FdCache 管理生命周期，不关闭
@@ -634,6 +654,15 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     file_fds_.erase(sock_ptr);
                     file_offsets_.erase(sock_ptr);
                     file_sizes_.erase(sock_ptr);
+                }
+
+                auto status_it = resp_status_.find(sock_ptr);
+                auto start_it = request_start_time_.find(sock_ptr);
+                if (status_it != resp_status_.end() && start_it != request_start_time_.end()) {
+                    double duration = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - start_it->second).count();
+                    Metrics::instance().record_request(status_it->second, duration);
+                    // 注意：这里我们不删除 start_time，因为后面 CLF 日志可能还要用，或者我们可以在记录完 CLF 后再删除
                 }
 
                 // ★ 新增：记录 CLF 格式的访问日志
