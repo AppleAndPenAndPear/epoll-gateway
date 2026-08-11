@@ -19,7 +19,7 @@ void Logger::init(const string& log_file_path){
             // 生产环境：文件只记录 warn 及以上，减少磁盘 I/O
             auto file_sink = make_shared<spdlog::sinks::rotating_file_sink_mt>(
                 log_file_path, 1024 * 1024 * 50, 5);  // 50MB, 5个文件
-            file_sink->set_level(spdlog::level::warn);
+            file_sink->set_level(spdlog::level::info);
             
             vector<spdlog::sink_ptr> sinks {console_sink, file_sink};
 

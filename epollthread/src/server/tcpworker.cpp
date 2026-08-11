@@ -8,6 +8,13 @@
 TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool,const std::string& www_root,size_t cache_max,size_t cache_max_file_size_mb, int keepalive_timeout):epoll_(),listen_sock_(std::move(listen_sock)),
   pool_(pool),closed_(false),handler_(epoll_, www_root, cache_max, cache_max_file_size_mb),keepalive_timeout_(keepalive_timeout){
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
+
+  SSL_library_init();
+  OpenSSL_add_all_algorithms();
+  ssl_ctx_ = SSL_CTX_new(TLS_server_method());
+  SSL_CTX_use_certificate_file(ssl_ctx_, "certs/server.crt", SSL_FILETYPE_PEM);
+  SSL_CTX_use_PrivateKey_file(ssl_ctx_, "certs/server.key", SSL_FILETYPE_PEM);
+
   Logger::get()->info("TcpWorker created with listen fd {} by move", listen_sock_.getFd());
 }
 
@@ -31,7 +38,7 @@ void TcpWorker::check_timeout() {
             Logger::get()->info("Idle timeout on fd {} (last active {}s ago), closing ...",fd, now - it->second);
             auto conn_it = conns_.find(fd);
             if (conn_it != conns_.end()) {
-                handler_.cleanup(conn_it->second);
+                handler_.cleanup(conn_it->second.sock);
                 conns_.erase(conn_it);
             }
             it = last_active_.erase(it);   // 移除定时器记录
@@ -77,8 +84,8 @@ void TcpWorker::run(){
   }
 
   // 退出前清理所有残留连接
-  for (auto& [fd, sock] : conns_) {
-    handler_.cleanup(sock);
+  for (auto& [fd, conn] : conns_) {
+    handler_.cleanup(conn.sock);
   }
   conns_.clear();
   last_active_.clear();
@@ -105,8 +112,15 @@ void TcpWorker::handle_accept() {
     auto client_sock = make_shared<Socket>(clientsock);
     client_sock->setnonblocking();   // 设为非阻塞
     client_sock->setcloexec();
-    epoll_.add(clientsock, EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT);
-    conns_[clientsock] = client_sock;
+
+    // 启用 SSL
+    if (!client_sock->initSSL(ssl_ctx_)) {
+      Logger::get()->error("SSL init failed for fd {}", clientsock);
+      continue;
+    }
+
+    epoll_.add(clientsock, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT);
+    conns_[clientsock] = {client_sock, SSLState::HANDSHAKING};
     handler_.on_connect(client_sock.get());   // 初始化队列
     Logger::get()->info("Worker accepted client fd {}", clientsock);
   }
@@ -115,7 +129,20 @@ void TcpWorker::handle_accept() {
 void TcpWorker::handle_client(int fd, uint32_t events) {
   auto it = conns_.find(fd);
   if (it == conns_.end()) return;
-  auto sock = it->second;
+  auto& conn = it->second;
+
+  if (conn.ssl_state == SSLState::HANDSHAKING) {
+    if (conn.sock->sslAccept()) {
+      conn.ssl_state = SSLState::READY;
+      epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);  // 只关注读
+      Logger::get()->info("SSL handshake done on fd {}", fd);
+    } else {
+      // 握手未完成，需要重新注册事件（包含 EPOLLOUT，因为 SSL 握手可能需要写数据）
+      // EPOLLONESHOT 要求每次事件后必须重新注册
+      epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
+    }
+    return;
+  }
 
   // 1. 只要有事件到达，就刷新活跃时间（在事件处理之前）
   update_active(fd);
@@ -123,7 +150,7 @@ void TcpWorker::handle_client(int fd, uint32_t events) {
   if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
     // 错误或挂断事件，直接清理
     Logger::get()->info("Worker: EPOLLERR/EPOLLHUP on fd {}", fd);
-    handler_.cleanup(sock);   // 清理 EchoHandler 内部状态和 epoll
+    handler_.cleanup(conn.sock);   // 清理 EchoHandler 内部状态和 epoll
     conns_.erase(fd);         // 从自已的连接表移除
     // sock 的 shared_ptr 引用计数递减，最后自动析构 Socket
     last_active_.erase(fd);          // ★ 显式擦除
@@ -132,12 +159,12 @@ void TcpWorker::handle_client(int fd, uint32_t events) {
   }
 
   if (events & EPOLLIN) {
-    handler_.handle_read(sock, client_ips_[fd]);  // 传入客户端 IP
+    handler_.handle_read(conn.sock, client_ips_[fd]);  // 传入客户端 IP
   } else if (events & EPOLLOUT) {
-    handler_.handle_write(sock);
+    handler_.handle_write(conn.sock);
   } else {
     Logger::get()->warn("Unexpected event on fd {}: {}", fd, events);
-    handler_.cleanup(sock);
+    handler_.cleanup(conn.sock);
     conns_.erase(fd);
     last_active_.erase(fd);          // ★ 显式擦除
     client_ips_.erase(fd); // 移除客户端 IP 记录

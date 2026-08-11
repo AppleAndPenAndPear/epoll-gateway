@@ -124,7 +124,8 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
     try {
         char buf[4096];
         while (true) {
-            int n = sock->recv(buf, sizeof(buf), 0);
+            bool is_ssl = sock_ptr->get_is_ssl_();
+            int n = is_ssl ? sock_ptr->sslRead(buf, sizeof(buf)) : sock_ptr->recv(buf, sizeof(buf), 0);
             if (n > 0) {
                 auto& read_buf = read_bufs_[sock_ptr];
                 read_buf.append(buf, n);
@@ -561,6 +562,7 @@ void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
     Socket* sock_ptr = sock.get();
     int fd = sock->getFd();
     epoll_.del(fd);               // 显式从 epoll 移除，避免 fd 复用竞态
+    sock->closeSSL();             // SSL 优雅关闭（必须在 closefd 之前）
     sock->closefd();
     read_bufs_.erase(sock_ptr);
     send_queues_.erase(sock_ptr);
@@ -595,7 +597,9 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
             // ==================== 阶段1：发送用户态队列中的数据 ====================
             while (!queue.empty()) {
                 auto& front = queue.front();
-                int n = sock->send(front.data(), front.size(), 0);
+                bool is_ssl = sock_ptr->get_is_ssl_();
+                int n = is_ssl ? sock->sslWrite(front.data(), front.size())
+                               : sock->send(front.data(), front.size(), 0);
                 if (n > 0) {
                     if (n == front.size()) {
                         queue.pop_front();
@@ -627,24 +631,65 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     off_t offset = file_offsets_[sock_ptr];
                     off_t remaining = file_sizes_[sock_ptr] - offset;
 
-                    while (remaining > 0) {
-                        ssize_t n = sendfile(fd, file_fd, &offset, remaining);
-                        if (n > 0) {
-                            remaining -= n;
-                        } else if (n == -1) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                // 保存当前偏移，等待下次可写
+                    bool is_ssl = sock_ptr->get_is_ssl_();
+
+                    if (is_ssl) {
+                        // SSL 连接不能使用 sendfile（sendfile 绕过 OpenSSL 加密层）
+                        // 需要将文件内容读入用户态缓冲区，再通过 SSL_write 发送
+                        constexpr size_t SSL_SENDFILE_BUF = 65536;  // 64KB 缓冲区
+                        std::vector<char> filebuf(std::min(static_cast<off_t>(SSL_SENDFILE_BUF), remaining));
+                        ssize_t read_n = ::pread(file_fd, filebuf.data(), filebuf.size(), offset);
+                        if (read_n > 0) {
+                            int write_n = sock->sslWrite(filebuf.data(), read_n);
+                            if (write_n > 0) {
+                                offset += write_n;
+                                remaining -= write_n;
+                                // 如果只写了部分，等待下次 EPOLLOUT
+                                if (write_n < read_n) {
+                                    file_offsets_[sock_ptr] = offset;
+                                    epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                                    return;
+                                }
+                            } else if (write_n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                                 file_offsets_[sock_ptr] = offset;
                                 epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                                 return;
                             } else {
-                                // 其他错误：记录日志，fd 由 FdCache 管理，仅清理映射
-                                Logger::get()->error("sendfile failed: {}", strerror(errno));
+                                Logger::get()->error("SSL_write for file failed on fd {}", fd);
                                 file_fds_.erase(sock_ptr);
                                 file_offsets_.erase(sock_ptr);
                                 file_sizes_.erase(sock_ptr);
                                 cleanup(sock);
                                 return;
+                            }
+                        } else if (read_n == -1) {
+                            Logger::get()->error("pread for SSL file failed: {}", strerror(errno));
+                            file_fds_.erase(sock_ptr);
+                            file_offsets_.erase(sock_ptr);
+                            file_sizes_.erase(sock_ptr);
+                            cleanup(sock);
+                            return;
+                        }
+                        // read_n == 0 means EOF, treat as done
+                    } else {
+                        // 非 SSL：使用 sendfile 零拷贝
+                        while (remaining > 0) {
+                            ssize_t n = sendfile(fd, file_fd, &offset, remaining);
+                            if (n > 0) {
+                                remaining -= n;
+                            } else if (n == -1) {
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    file_offsets_[sock_ptr] = offset;
+                                    epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                                    return;
+                                } else {
+                                    Logger::get()->error("sendfile failed: {}", strerror(errno));
+                                    file_fds_.erase(sock_ptr);
+                                    file_offsets_.erase(sock_ptr);
+                                    file_sizes_.erase(sock_ptr);
+                                    cleanup(sock);
+                                    return;
+                                }
                             }
                         }
                     }

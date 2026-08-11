@@ -9,7 +9,8 @@ RUN apt-get update && \
         make \
         nlohmann-json3-dev \
         libspdlog-dev \
-        zlib1g-dev && \
+        zlib1g-dev \
+        libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
@@ -38,7 +39,8 @@ FROM ubuntu:22.04
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libspdlog1 \
-        zlib1g && \
+        zlib1g \
+        libssl3 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

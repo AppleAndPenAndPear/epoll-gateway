@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+
 using namespace std;
 
 Socket::Socket(int domain, int type, int protocol){
@@ -15,6 +16,7 @@ Socket::Socket(int domain, int type, int protocol){
 Socket::Socket(int fd) : fd_(fd) {}
 
 Socket::~Socket(){
+  closeSSL();  // 确保 SSL 资源被释放
   if(fd_ != -1){
     Logger::get()->debug("socket fd {} closed", fd_);
     close(fd_);
@@ -22,16 +24,23 @@ Socket::~Socket(){
   }
 }
 
-Socket::Socket(Socket&& other) noexcept : fd_(other.fd_) { 
-  other.fd_ = -1; 
+Socket::Socket(Socket&& other) noexcept : fd_(other.fd_), ssl_(other.ssl_), is_ssl_(other.is_ssl_) { 
+  other.fd_ = -1;
+  other.ssl_ = nullptr;
+  other.is_ssl_ = false;
 }
 
 Socket& Socket::operator=(Socket&& other) noexcept {
   if (this != &other) {
+    closeSSL();
     if (fd_ != -1) close(fd_);
-      fd_ = other.fd_;
-      other.fd_ = -1;
-    }
+    fd_ = other.fd_;
+    ssl_ = other.ssl_;
+    is_ssl_ = other.is_ssl_;
+    other.fd_ = -1;
+    other.ssl_ = nullptr;
+    other.is_ssl_ = false;
+  }
   return *this;
 }
 
@@ -165,4 +174,68 @@ void Socket::closefd(){
     close(fd_);
     fd_ = -1;
   }
+}
+
+bool Socket::initSSL(SSL_CTX* ctx) {
+  ssl_ = SSL_new(ctx);
+  if (!ssl_) return false;
+  SSL_set_fd(ssl_, fd_);
+  is_ssl_ = true;
+  return true;
+}
+
+bool Socket::sslAccept() {
+  int ret = SSL_accept(ssl_);
+  if (ret == 1) return true;
+  int err = SSL_get_error(ssl_, ret);
+  if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+    // 握手未完成，需要等待事件
+    return false;
+  }
+  // 其他错误
+  Logger::get()->error("SSL_accept failed: {}", ERR_error_string(ERR_get_error(), nullptr));
+  return false;
+}
+
+void Socket::closeSSL() {
+    if (ssl_) {
+        SSL_shutdown(ssl_);
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+        is_ssl_ = false;
+    }
+}
+
+ssize_t Socket::sslRead(char* buf, size_t size) {
+    int n = SSL_read(ssl_, buf, size);
+    if (n > 0) return n;
+    int err = SSL_get_error(ssl_, n);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (err == SSL_ERROR_ZERO_RETURN) {
+        return 0;  // 对端关闭
+    }
+    // 其他错误
+    Logger::get()->error("SSL_read error: {}", ERR_error_string(ERR_get_error(), nullptr));
+    errno = EIO;
+    return -1;
+}
+
+ssize_t Socket::sslWrite(char* buf, size_t size) {
+    int n = SSL_write(ssl_, buf, size);
+    if (n > 0) return n;
+    int err = SSL_get_error(ssl_, n);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        errno = EAGAIN;
+        return -1;
+    }
+    Logger::get()->error("SSL_write error: {}", ERR_error_string(ERR_get_error(), nullptr));
+    errno = EIO;
+    return -1;
+}
+
+bool Socket::get_is_ssl_() {
+    return is_ssl_;
 }

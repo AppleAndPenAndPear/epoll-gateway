@@ -19,6 +19,7 @@ endif()
 # 使用 find_package 来查找 vcpkg 安装的 spdlog
 find_package(spdlog CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 #创建静态库 libcommon，包含服务端和客户端共享的代码
 set(COMMON_SOURCES
@@ -31,7 +32,7 @@ set(COMMON_SOURCES
     src/common/http_parser.cpp
 )
 add_library(common STATIC ${COMMON_SOURCES})
-target_include_directories(common PUBLIC include)
+target_include_directories(common PUBLIC include/common)
 target_link_libraries(common PUBLIC
     spdlog::spdlog
     Threads::Threads
@@ -54,8 +55,9 @@ set(SERVER_SOURCES
 )
 #创建服务端的可执行文件
 add_executable(server ${SERVER_SOURCES})
-#链接第common库
-target_link_libraries(server PRIVATE common z)
+#链接common库
+target_link_libraries(server PRIVATE common z OpenSSL::SSL OpenSSL::Crypto)
+target_include_directories(server PRIVATE include/server)
 
 #客户端可执行文件
 set(CLIENT_SOURCES
@@ -64,7 +66,8 @@ set(CLIENT_SOURCES
     src/client/clienthandler.cpp
 )
 add_executable(client ${CLIENT_SOURCES})
-target_link_libraries(client PRIVATE common)
+target_link_libraries(client PRIVATE common OpenSSL::SSL OpenSSL::Crypto)
+target_include_directories(client PRIVATE include/client)
 
 # 生成json文件
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

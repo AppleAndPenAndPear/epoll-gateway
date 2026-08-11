@@ -12,5 +12,7 @@ target_link_libraries(runTests PRIVATE
     GTest::Main       # 提供 main 入口
 )
 
+target_include_directories(runTests PRIVATE ${CMAKE_SOURCE_DIR}/include/server)
+
 include(GoogleTest)
 gtest_discover_tests(runTests)
