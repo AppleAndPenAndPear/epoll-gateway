@@ -3,6 +3,25 @@
 #include <fstream>
 #include <string>
 
+// 上游服务器
+struct UpstreamServer {
+    std::string host;
+    int port;
+};
+
+// 一组上游服务器（一个后端服务）
+struct Upstream {
+    std::vector<UpstreamServer> servers;
+    std::string algorithm; // 暂时不用，后续实现负载均衡
+};
+
+// 路由规则：匹配路径，转发到指定上游
+struct Route {
+    std::string method;
+    std::string path;       // 形如 "/api/users/*"
+    std::string upstream;   // 指向 upstreams 的 key
+};
+
 struct Config {
     // 服务器端口
     unsigned short port = 5005;
@@ -24,6 +43,9 @@ struct Config {
         size_t scale_up_threshold = 2;
         size_t scale_down_threshold = 1;
     } thread_pool;
+
+    std::unordered_map<std::string, Upstream> upstreams;
+    std::vector<Route> routes;
 
     // 从 JSON 文件加载配置，如果文件不存在或解析失败，保持默认值
     static Config from_file(const std::string& path) {
@@ -62,6 +84,35 @@ struct Config {
         if (j.contains("keepalive_timeout")) {
             config.keepalive_timeout = j["keepalive_timeout"];
         }
+
+        // 解析 upstreams
+        if (j.contains("upstreams")) {
+            for (auto& [name, val] : j["upstreams"].items()) {
+                Upstream up;
+                if (val.contains("servers")) {
+                    for (auto& srv : val["servers"]) {
+                        UpstreamServer s;
+                        s.host = srv.value("host", "127.0.0.1");
+                        s.port = srv.value("port", 80);
+                        up.servers.push_back(s);
+                    }
+                }
+                up.algorithm = val.value("algorithm", "round_robin");
+                config.upstreams[name] = up;
+            }
+        }
+
+        // 解析 routes
+        if (j.contains("routes")) {
+            for (auto& item : j["routes"]) {
+                Route r;
+                r.method = item.value("method", "GET");
+                r.path = item.value("path", "/");
+                r.upstream = item.value("upstream", "");
+                config.routes.push_back(r);
+            }
+        }
+
         return config;
     }
 };

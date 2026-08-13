@@ -5,8 +5,8 @@
 #include <fcntl.h>
 
 
-TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool,const std::string& www_root,size_t cache_max,size_t cache_max_file_size_mb, int keepalive_timeout):epoll_(),listen_sock_(std::move(listen_sock)),
-  pool_(pool),closed_(false),handler_(epoll_, www_root, cache_max, cache_max_file_size_mb),keepalive_timeout_(keepalive_timeout){
+TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config):epoll_(),listen_sock_(std::move(listen_sock)),
+  pool_(pool),closed_(false),handler_(epoll_, config),keepalive_timeout_(config.keepalive_timeout){
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
 
   SSL_library_init();

@@ -16,6 +16,7 @@
 #include "gzip_utils.h"
 #include <string>
 #include "metrics.h"
+#include "http_client.h"
 using json = nlohmann::json;
 
 static std::string to_hex(size_t n) {
@@ -24,7 +25,7 @@ static std::string to_hex(size_t n) {
     return oss.str();
 }
 
-HttpHandler::HttpHandler(Epoll& epoll,const std::string& www_root,size_t cache_max,size_t cache_max_file_size_mb) : epoll_(epoll), www_root_(www_root), cache_(cache_max, cache_max_file_size_mb) {
+HttpHandler::HttpHandler(Epoll& epoll, const Config& config) : epoll_(epoll), www_root_(config.www_root), config_(config), cache_(config.cache_max_entries, config.cache_max_file_size_mb) {
     // 注册示例路由
     addRoute("GET", "/metrics", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
         std::string body = Metrics::instance().to_string();
@@ -106,6 +107,40 @@ HttpHandler::HttpHandler(Epoll& epoll,const std::string& www_root,size_t cache_m
         resp.chunked = true;      // 关键：设置 chunked 标志
         resp.body = payload;
     });
+
+    for (const auto& route : config.routes) {
+        // 简单路径匹配：如果请求路径以 route.path 去掉末尾 '*' 开头，则匹配
+        std::string pattern = route.path;
+        if (!pattern.empty() && pattern.back() == '*') {
+            pattern.pop_back(); // 去除 '*'
+        }
+        addRoute(route.method, route.path, [this, route](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
+            // 查找 upstream
+            auto it = config_.upstreams.find(route.upstream);
+            if (it == config_.upstreams.end() || it->second.servers.empty()) {
+                resp.status_code = 502;
+                resp.body = "Bad Gateway: no upstream server";
+                resp.headers["Content-Length"] = std::to_string(resp.body.size());
+                return;
+            }
+            // 暂时取第一个服务器
+            const auto& server = it->second.servers[0];
+
+            // 构造转发的路径：将匹配部分替换为后端实际路径（简单处理：直接转发原始路径）
+            std::string forward_path = req.path;
+            // 转发请求
+            BackendResponse be = forward_request(server.host, server.port,
+                                                req.method, forward_path,
+                                                req.headers, req.body);
+            resp.status_code = be.status_code;
+            resp.body = be.body;
+            // 透传后端响应头
+            for (const auto& [k, v] : be.headers) {
+                resp.headers[k] = v;
+            }
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        });
+    }
 }
 
 void HttpHandler::on_connect(Socket* sock){

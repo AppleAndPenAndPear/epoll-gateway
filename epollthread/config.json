@@ -11,5 +11,19 @@
     },
     "cache_max_entries": 1024,
     "cache_max_file_size_mb": 1,
-    "keepalive_timeout": 5
+    "keepalive_timeout": 5,
+    "upstreams": {
+        "test-service": {
+            "servers": [
+                {"host": "127.0.0.1", "port": 8081}
+            ]
+        }
+    },
+    "routes": [
+        {
+            "method": "GET",
+            "path": "/api/test/*",
+            "upstream": "test-service"
+        }
+    ]
 }

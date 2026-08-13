@@ -32,7 +32,7 @@ private:
 
   SSL_CTX* ssl_ctx_ = nullptr;
 public:
-  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool,const std::string& www_root,size_t cache_max = 1024,size_t cache_max_file_size_mb = 1, int keepalive_timeout = 60);
+  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config);
 
   void run();
   void handle_accept();

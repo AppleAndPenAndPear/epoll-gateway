@@ -47,6 +47,7 @@ set(SERVER_SOURCES
     src/server/main.cpp
     src/server/server.cpp
     src/server/http_handler.cpp
+    src/server/http_client.cpp
     src/server/pool.cpp
     src/server/content_type.cpp
     src/server/tcpworker.cpp

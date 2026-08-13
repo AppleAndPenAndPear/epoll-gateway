@@ -33,7 +33,7 @@ int main(){
                     config.thread_pool.scale_up_threshold,
                     config.thread_pool.scale_down_threshold);
         logger->info("Starting epoll server on port {}", config.port);
-        t.start(config.num_workers,config.www_root,config.cache_max_entries,config.cache_max_file_size_mb,config.keepalive_timeout);
+        t.start(config.num_workers, config);
     } catch (const system_error& e) {
         logger->critical("Server startup failed: {}", e.what());
         std::cerr << "系统错误: " << e.what() << " [code: " << e.code() << "]\n";

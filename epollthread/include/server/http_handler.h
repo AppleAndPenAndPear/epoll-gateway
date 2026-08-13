@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include "fd_cache.h"
+#include "config.h"
 
 class HttpHandler {
 private:
@@ -56,9 +57,10 @@ private:
     std::unordered_map<Socket*, std::chrono::steady_clock::time_point> request_start_time_;
     std::unordered_map<Socket*, HttpRequest> last_requests_; // 记录上一个请求，用于日志输出
     FdCache fd_cache_;   // 文件描述符缓存
+    Config config_;       // 存储配置（含 upstreams/routes）
 
 public:
-    explicit HttpHandler(Epoll& epoll,const std::string& www_root,size_t cache_max = 1024,size_t cache_max_file_size_mb = 1);
+    explicit HttpHandler(Epoll& epoll, const Config& config);
     void on_connect(Socket* sock);                          // 初始化
     void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // 处理读事件
     void handle_write(std::shared_ptr<Socket> sock);

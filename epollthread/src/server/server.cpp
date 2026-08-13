@@ -19,7 +19,7 @@ Tcpserver::Tcpserver(unsigned short port,int backlog,size_t min_threads, size_t 
 Tcpserver::~Tcpserver(){
 }
 
-void Tcpserver::start(unsigned int num_workers,const std::string& www_root,size_t cache_max_entries,size_t cache_max_file_size_mb, int keepalive_timeout) {
+void Tcpserver::start(unsigned int num_workers, const Config& config) {
   if (num_workers == 0) {
     num_workers = std::thread::hardware_concurrency();
     if (num_workers == 0) num_workers = 4; // 兜底
@@ -29,7 +29,7 @@ void Tcpserver::start(unsigned int num_workers,const std::string& www_root,size_
   // 创建 N 个 listen socket 并启动 Worker 线程
   for (unsigned int i = 0; i < num_workers; ++i) {
     Socket listen_sock = create_listen_sock();
-    workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), www_root, cache_max_entries, cache_max_file_size_mb, keepalive_timeout));
+    workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config));
     threads_.emplace_back(&TcpWorker::run, workers_.back().get());
   }
 

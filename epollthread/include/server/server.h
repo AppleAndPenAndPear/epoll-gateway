@@ -31,7 +31,7 @@ public:
   Tcpserver(unsigned short port,int backlog,size_t min_threads, size_t max_threads,size_t scale_up_factor , size_t scale_down_factor);
   ~Tcpserver();
 
-  void start(unsigned int num_workers = 0,const std::string& www_root = "./www",size_t cache_max_entries = 1024,size_t cache_max_file_size_mb = 1, int keepalive_timeout = 60);
+  void start(unsigned int num_workers, const Config& config);
 
   void stop();
 };

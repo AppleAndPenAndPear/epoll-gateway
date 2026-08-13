@@ -17,6 +17,11 @@ inline std::vector<std::string> splitPath(const std::string& path, char delimite
 
 // 匹配路由模式，提取参数
 inline bool matchRoute(const std::string& pattern, const std::string& path,std::map<std::string, std::string>& params) {
+    // 通配符前缀匹配：如 "/api/users/*" 可匹配 "/api/users/123"、"/api/users/123/orders"
+    if (!pattern.empty() && pattern.back() == '*') {
+        std::string prefix = pattern.substr(0, pattern.size() - 1);
+        return path.compare(0, prefix.size(), prefix) == 0;
+    }
     auto patternParts = splitPath(pattern);
     auto pathParts = splitPath(path);
     if (patternParts.size() != pathParts.size()) return false;
