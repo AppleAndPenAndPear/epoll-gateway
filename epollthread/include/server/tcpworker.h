@@ -4,6 +4,7 @@
 #include "pool.h"
 #include "myepoll.h"
 #include "http_handler.h"
+#include "upstream_manager.h"
 
 extern std::atomic<bool> stop_server_flag;
 
@@ -20,6 +21,8 @@ private:
     SSLState ssl_state;
   };
   std::unordered_map<int, ConnInfo> conns_;
+
+  UpstreamManager upstream_manager_;
   
   HttpHandler handler_;
   std::unordered_map<int, time_t> last_active_; // 记录每个连接的最后活跃时间（秒级）

@@ -6,7 +6,7 @@
 
 
 TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config):epoll_(),listen_sock_(std::move(listen_sock)),
-  pool_(pool),closed_(false),handler_(epoll_, config),keepalive_timeout_(config.keepalive_timeout){
+  pool_(pool),closed_(false),handler_(epoll_, config,upstream_manager_),keepalive_timeout_(config.keepalive_timeout),upstream_manager_(config.upstream_config){
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
 
   SSL_library_init();
@@ -46,6 +46,8 @@ void TcpWorker::check_timeout() {
             ++it;
         }
     }
+    
+    upstream_manager_.check_health();  // 每秒主动健康检查
 }
 
 void TcpWorker::run(){

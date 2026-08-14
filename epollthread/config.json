@@ -15,8 +15,10 @@
     "upstreams": {
         "test-service": {
             "servers": [
-                {"host": "127.0.0.1", "port": 8081}
-            ]
+                {"host": "127.0.0.1", "port": 8081},
+                {"host": "127.0.0.1", "port": 8082}
+            ],
+            "algorithm": "round_robin"
         }
     },
     "routes": [

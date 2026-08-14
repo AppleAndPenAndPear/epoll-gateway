@@ -7,12 +7,14 @@
 struct UpstreamServer {
     std::string host;
     int port;
+    bool healthy = true;          // 当前是否健康
+    int consecutive_failures = 0; // 连续失败次数
 };
 
 // 一组上游服务器（一个后端服务）
 struct Upstream {
     std::vector<UpstreamServer> servers;
-    std::string algorithm; // 暂时不用，后续实现负载均衡
+    std::string algorithm;  //实现负载均衡
 };
 
 // 路由规则：匹配路径，转发到指定上游
@@ -20,6 +22,11 @@ struct Route {
     std::string method;
     std::string path;       // 形如 "/api/users/*"
     std::string upstream;   // 指向 upstreams 的 key
+};
+
+struct UpstreamConfig {
+    std::unordered_map<std::string, Upstream> upstreams;
+    std::vector<Route> routes;
 };
 
 struct Config {
@@ -44,8 +51,7 @@ struct Config {
         size_t scale_down_threshold = 1;
     } thread_pool;
 
-    std::unordered_map<std::string, Upstream> upstreams;
-    std::vector<Route> routes;
+    UpstreamConfig upstream_config;
 
     // 从 JSON 文件加载配置，如果文件不存在或解析失败，保持默认值
     static Config from_file(const std::string& path) {
@@ -98,7 +104,7 @@ struct Config {
                     }
                 }
                 up.algorithm = val.value("algorithm", "round_robin");
-                config.upstreams[name] = up;
+                config.upstream_config.upstreams[name] = up;
             }
         }
 
@@ -109,7 +115,7 @@ struct Config {
                 r.method = item.value("method", "GET");
                 r.path = item.value("path", "/");
                 r.upstream = item.value("upstream", "");
-                config.routes.push_back(r);
+                config.upstream_config.routes.push_back(r);
             }
         }
 

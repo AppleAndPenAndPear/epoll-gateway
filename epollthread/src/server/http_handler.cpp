@@ -17,6 +17,9 @@
 #include <string>
 #include "metrics.h"
 #include "http_client.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "upstream_manager.h"
 using json = nlohmann::json;
 
 static std::string to_hex(size_t n) {
@@ -25,7 +28,10 @@ static std::string to_hex(size_t n) {
     return oss.str();
 }
 
-HttpHandler::HttpHandler(Epoll& epoll, const Config& config) : epoll_(epoll), www_root_(config.www_root), config_(config), cache_(config.cache_max_entries, config.cache_max_file_size_mb) {
+
+HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
+cache_(config.cache_max_entries, config.cache_max_file_size_mb), 
+upstream_manager_(upstream_manager) {                                                                     
     // 注册示例路由
     addRoute("GET", "/metrics", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
         std::string body = Metrics::instance().to_string();
@@ -108,7 +114,7 @@ HttpHandler::HttpHandler(Epoll& epoll, const Config& config) : epoll_(epoll), ww
         resp.body = payload;
     });
 
-    for (const auto& route : config.routes) {
+    for (const auto& route : config.upstream_config.routes) {
         // 简单路径匹配：如果请求路径以 route.path 去掉末尾 '*' 开头，则匹配
         std::string pattern = route.path;
         if (!pattern.empty() && pattern.back() == '*') {
@@ -116,15 +122,15 @@ HttpHandler::HttpHandler(Epoll& epoll, const Config& config) : epoll_(epoll), ww
         }
         addRoute(route.method, route.path, [this, route](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
             // 查找 upstream
-            auto it = config_.upstreams.find(route.upstream);
-            if (it == config_.upstreams.end() || it->second.servers.empty()) {
+            auto it = config_.upstream_config.upstreams.find(route.upstream);
+            if (it == config_.upstream_config.upstreams.end() || it->second.servers.empty()) {
                 resp.status_code = 502;
                 resp.body = "Bad Gateway: no upstream server";
                 resp.headers["Content-Length"] = std::to_string(resp.body.size());
                 return;
             }
-            // 暂时取第一个服务器
-            const auto& server = it->second.servers[0];
+
+            const auto& server = upstream_manager_.pick_server(route.upstream);
 
             // 构造转发的路径：将匹配部分替换为后端实际路径（简单处理：直接转发原始路径）
             std::string forward_path = req.path;

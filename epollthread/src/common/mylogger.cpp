@@ -34,6 +34,9 @@ void Logger::init(const string& log_file_path){
             
             //生产环境：日志级别设置为 debug，方便调试
             logger->set_level(spdlog::level::debug);
+            // 每条 info 及以上日志写完后立即 flush，保证 tail -f 实时可见
+            // （否则异步 logger 会把内容缓冲在 FILE* 缓冲区里，后端挂掉等低频日志要等进程退出才落盘）
+            logger->flush_on(spdlog::level::info);
             logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 
             // 4. 注册并设为默认

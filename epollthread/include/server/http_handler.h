@@ -11,6 +11,7 @@
 #include <map>
 #include "fd_cache.h"
 #include "config.h"
+#include "upstream_manager.h"
 
 class HttpHandler {
 private:
@@ -57,10 +58,11 @@ private:
     std::unordered_map<Socket*, std::chrono::steady_clock::time_point> request_start_time_;
     std::unordered_map<Socket*, HttpRequest> last_requests_; // 记录上一个请求，用于日志输出
     FdCache fd_cache_;   // 文件描述符缓存
-    Config config_;       // 存储配置（含 upstreams/routes）
-
+    const Config& config_;               // 引用，只读访问静态文件配置等
+    
+    UpstreamManager& upstream_manager_;  // 引用，用于选择后端
 public:
-    explicit HttpHandler(Epoll& epoll, const Config& config);
+    explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager);
     void on_connect(Socket* sock);                          // 初始化
     void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // 处理读事件
     void handle_write(std::shared_ptr<Socket> sock);
@@ -68,4 +70,5 @@ public:
     void cleanup(std::shared_ptr<Socket> sock);
     void process_request(Socket* sock_ptr);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // 注册路由：method 为 "GET"、"POST" 等，path 如 "/api/hello"
+
 };

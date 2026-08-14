@@ -53,6 +53,7 @@ set(SERVER_SOURCES
     src/server/tcpworker.cpp
     src/server/gzip_utils.cpp
     src/server/metrics.cpp
+    src/server/upstream_manager.cpp
 )
 #创建服务端的可执行文件
 add_executable(server ${SERVER_SOURCES})
