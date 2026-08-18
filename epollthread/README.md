@@ -1,11 +1,13 @@
 # epollthread
 
-基于 C++17 实现的高性能多线程网络服务器框架，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合动态线程池和异步日志，支持海量并发连接。项目已从最初的 Echo 演示进化为一个**完整的轻量级 HTTP 应用服务器**，支持 HTTP/1.1 协议解析、Keep-Alive 长连接、零拷贝文件传输、LRU 内存文件缓存、FD 文件描述符缓存、RESTful 路由、JSON API、Chunked 传输编码、Gzip 压缩、空闲连接超时、Docker 容器化部署，并包含单元测试及 AddressSanitizer 内存检测。
+基于 C++17 实现的高性能多线程网络服务器框架，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合动态线程池和异步日志，支持海量并发连接。项目已从最初的 Echo 演示进化为一个**完整的轻量级 HTTP/HTTPS 应用服务器**，支持 HTTP/1.1 协议解析、TLS/SSL 加密传输、Keep-Alive 长连接、零拷贝文件传输、LRU 内存文件缓存、FD 文件描述符缓存、RESTful 路由、JSON API、Chunked 传输编码、Gzip 压缩、反向代理与上游负载均衡、令牌桶限流、API Key 认证、空闲连接超时、Docker 容器化部署，并包含单元测试及 AddressSanitizer 内存检测。
 
 ## 特性
 - **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡，无锁竞争。
 - **HTTP/1.1 协议支持**：内置状态机 HTTP 解析器，支持 GET / HEAD / POST / PUT / DELETE 方法，解析请求行、头部、查询字符串、消息体，含 Chunked 传输编码解析。
+- **HTTPS/TLS 加密传输**：基于 OpenSSL 集成 TLS 加密，通过 `certs/server.crt` 与 `certs/server.key` 实现安全连接，握手与加密数据传输均运行在非阻塞 epoll 事件循环中。
 - **RESTful 路由系统**：可注册任意方法+路径模式（如 `/users/{id}`）的处理函数，支持动态路由参数提取与分发，轻松构建 JSON API。
+- **反向代理与上游负载均衡**：将匹配的路由转发至配置的上游服务（`upstreams` + `routes`），内置轮询（Round-Robin）负载均衡与主动 TCP 健康检查，自动摘除故障后端节点。
 - **静态文件服务**：根据 URL 路径映射本地文件，使用 `sendfile` 系统调用实现**零拷贝**传输；自动设置 `Content-Type`（支持 HTML、CSS、JS、JSON、图片、字体等常见格式）。
 - **双层缓存机制**：
   - **LRU 内存文件缓存**：每个 Worker 维护独立的文件内容缓存，对频繁访问的小文件进行内存缓存，减少磁盘 I/O，大幅提升重复请求吞吐量。
@@ -14,7 +16,9 @@
 - **Chunked 传输编码**：支持 `Transfer-Encoding: chunked` 响应，适用于动态生成或流式输出的内容。
 - **连接复用**：正确处理 `Connection: keep-alive`，支持在同一条 TCP 连接上串行处理多个请求（HTTP Pipelining），保证响应顺序。
 - **空闲连接超时**：可配置的超时时间，自动关闭长时间无活动的连接，防止资源泄漏。
-- **错误处理与状态码**：支持 200、400、403、404、405、413、500 等状态码，返回友好错误页面，并防御路径穿越攻击。
+- **错误处理与状态码**：支持 200、400、403、404、405、413、429、500、502 等状态码，返回友好错误页面，并防御路径穿越攻击。
+- **令牌桶限流**：基于令牌桶算法的全局限流器，跨 Worker 共享计数，按客户端 IP 精确控制请求速率，超限返回 `429 Too Many Requests`，令牌补充采用小数累积避免截断误差。
+- **API Key 认证**：提供 API Key 校验与提取工具（支持 `X-API-Key` 请求头与 `Authorization: Bearer` 两种方式），配合配置中的 `api_keys` 为不同客户端分配差异化限流额度。
 - **非阻塞 I/O + 边缘触发**：所有套接字使用非阻塞模式，结合 `EPOLLET` 和 `EPOLLONESHOT`，精细控制事件通知，避免惊群和重复触发。
 - **动态线程池**：可配置最小/最大线程数，依据任务负载自动扩缩容（目前预留接口，用于未来异步业务处理）。
 - **异步日志系统**：基于 `spdlog` 的全局线程池，支持控制台彩色输出与文件滚动存储，可分别控制各级别日志输出，性能开销低。
@@ -62,8 +66,9 @@
 ```
 
 - **Tcpserver**：负责创建 N 个 listen socket，启动对应数量的 `TcpWorker` 线程。
-- **TcpWorker**：每个 Worker 持有独立的 epoll 实例、连接表、`HttpHandler`，全权处理归属连接的所有 I/O 事件，并负责超时连接清理。
-- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、路由匹配、Keep-Alive 管理、文件服务、错误响应、内存缓存等。同时将请求指标上报给 `Metrics` 单例。
+- **TcpWorker**：每个 Worker 持有独立的 epoll 实例、连接表、`HttpHandler` 与 SSL 上下文，全权处理归属连接的所有 I/O 事件（含 TLS 握手），并负责超时连接清理与上游健康检查。
+- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、路由匹配、Keep-Alive 管理、文件服务、错误响应、内存缓存、限流检查等。同时将请求指标上报给 `Metrics` 单例。
+- **UpstreamManager**：管理上游服务器集群，负责健康检查与轮询选路，为反向代理提供可用的后端节点。
 - **Metrics**：线程安全的指标收集器（单例），记录请求总数、状态码分布、延迟直方图、多级缓存命中率，通过 `/metrics` 端点以 Prometheus 文本格式暴露。
 - **Prometheus**：定期从 `server:5005/metrics` 刮取指标数据，存储时序数据。
 - **Grafana**：连接 Prometheus 作为数据源，提供实时可视化仪表盘。
@@ -75,30 +80,42 @@
 ```
 epollthread/
 ├── include/                  # 头文件
-│   ├── server.h              # Tcpserver 服务端主类
-│   ├── tcpworker.h           # TcpWorker 工作线程
-│   ├── http_handler.h        # HTTP 请求处理与路由
-│   ├── http_parser.h         # HTTP/1.1 协议解析器（状态机）
-│   ├── metrics.h             # Prometheus 指标收集器（单例，线程安全）
-│   ├── pool.h                # DynamicThreadPool 动态线程池
-│   ├── mysocket.h            # Socket RAII 封装
-│   ├── myepoll.h             # Epoll RAII 封装
-│   ├── mylogger.h            # 异步日志封装
-│   ├── config.h              # JSON 配置加载
-│   ├── file_cache.h          # LRU 内存文件缓存
-│   ├── fd_cache.h            # FD 文件描述符缓存（TTL）
-│   ├── gzip_utils.h          # Gzip 压缩工具
-│   ├── content_type.h        # Content-Type 映射
-│   ├── route_utils.h         # 路由匹配与参数提取
-│   ├── error_utils.h         # 错误处理工具
-│   ├── client.h              # 非阻塞客户端
-│   └── clienthandler.h       # 客户端处理器
+│   ├── server/               # 服务端头文件
+│   │   ├── server.h          # Tcpserver 服务端主类
+│   │   ├── tcpworker.h       # TcpWorker 工作线程（含 SSL 状态机）
+│   │   ├── http_handler.h    # HTTP 请求处理与路由
+│   │   ├── http_client.h     # 反向代理转发（forward_request）
+│   │   ├── upstream_manager.h# 上游服务器管理与健康检查
+│   │   ├── rate_limiter.h    # 令牌桶限流器
+│   │   ├── rate_limiter_manager.h # 限流器管理器
+│   │   ├── api_key_manager.h # API Key 校验
+│   │   ├── metrics.h         # Prometheus 指标收集器（单例，线程安全）
+│   │   ├── pool.h            # DynamicThreadPool 动态线程池
+│   │   ├── config.h          # JSON 配置加载
+│   │   ├── gzip_utils.h      # Gzip 压缩工具
+│   │   ├── content_type.h    # Content-Type 映射
+│   │   ├── route_utils.h     # 路由匹配与参数提取
+│   │   └── echohandler.h     # Echo 处理器（早期演示）
+│   ├── client/               # 客户端头文件
+│   │   ├── client.h          # 非阻塞客户端
+│   │   └── clienthandler.h   # 客户端处理器
+│   └── common/               # 公共头文件
+│       ├── mysocket.h        # Socket RAII 封装（含 SSL 支持）
+│       ├── myepoll.h         # Epoll RAII 封装
+│       ├── mylogger.h        # 异步日志封装
+│       ├── http_parser.h     # HTTP/1.1 协议解析器（状态机）
+│       ├── file_cache.h      # LRU 内存文件缓存
+│       ├── fd_cache.h        # FD 文件描述符缓存（TTL）
+│       └── error_utils.h     # 错误处理工具
 ├── src/                      # 源文件
 │   ├── server/               # 服务端源码
 │   │   ├── main.cpp          # 服务端入口
 │   │   ├── server.cpp        # Tcpserver 实现
-│   │   ├── tcpworker.cpp     # TcpWorker 实现
-│   │   ├── http_handler.cpp  # HttpHandler 实现（含路由注册）
+│   │   ├── tcpworker.cpp     # TcpWorker 实现（含 TLS 握手）
+│   │   ├── http_handler.cpp  # HttpHandler 实现（含路由注册、限流）
+│   │   ├── http_client.cpp   # 反向代理转发实现
+│   │   ├── upstream_manager.cpp # 上游管理与健康检查实现
+│   │   ├── rate_limiter.cpp  # 令牌桶限流器实现
 │   │   ├── metrics.cpp       # Metrics 指标收集实现
 │   │   ├── pool.cpp          # 动态线程池实现
 │   │   ├── content_type.cpp  # Content-Type 实现
@@ -108,13 +125,16 @@ epollthread/
 │   │   ├── client.cpp        # Client 实现
 │   │   └── clienthandler.cpp # ClientHandler 实现
 │   └── common/               # 公共模块源码
-│       ├── mysocket.cpp      # Socket 实现
+│       ├── mysocket.cpp      # Socket 实现（含 SSL）
 │       ├── myepoll.cpp       # Epoll 实现
 │       ├── mylogger.cpp      # Logger 实现
 │       ├── error_utils.cpp   # 错误处理实现
 │       ├── fd_cache.cpp      # FD 缓存实现
 │       ├── file_cache.cpp    # 文件缓存实现
 │       └── http_parser.cpp   # HTTP 解析器实现
+├── certs/                    # TLS 证书与私钥
+│   ├── server.crt
+│   └── server.key
 ├── tests/                    # 单元测试
 │   ├── CMakeLists.txt
 │   ├── test_http_parser.cpp  # HTTP 解析器测试
@@ -150,6 +170,7 @@ epollthread/
 |---|---|---|
 | [spdlog](https://github.com/gabime/spdlog) | 异步日志 | vcpkg / apt |
 | [nlohmann/json](https://github.com/nlohmann/json) | JSON 配置与 API | vcpkg / apt |
+| [OpenSSL](https://www.openssl.org/) | TLS/SSL 加密传输 | 系统自带 / apt |
 | [zlib](https://zlib.net/) | Gzip 压缩 | 系统自带 / apt |
 | [Google Test](https://github.com/google/googletest) | 单元测试 | vcpkg / apt |
 
@@ -198,7 +219,27 @@ cmake --build build -j$(nproc)
     },
     "cache_max_entries": 1024,      // LRU 文件缓存最大条目数
     "cache_max_file_size_mb": 1,    // 可缓存的最大文件大小（MB）
-    "keepalive_timeout": 60         // Keep-Alive 空闲超时（秒）
+    "keepalive_timeout": 60,        // Keep-Alive 空闲超时（秒）
+    "upstreams": {                  // 上游服务定义
+        "test-service": {
+            "servers": [
+                {"host": "127.0.0.1", "port": 8081},
+                {"host": "127.0.0.1", "port": 8082}
+            ],
+            "algorithm": "round_robin"
+        }
+    },
+    "routes": [                     // 反向代理路由（转发到上游）
+        {"method": "GET", "path": "/api/test/*", "upstream": "test-service"}
+    ],
+    "rate_limit": {                 // 默认限流（令牌桶）
+        "capacity": 20,
+        "refill_per_second": 5
+    },
+    "api_keys": [                   // API Key 及其差异化限流额度
+        {"key": "test-key-123", "name": "测试客户端", "rate_limit": {"capacity": 200, "refill_per_second": 100}},
+        {"key": "premium-key-456", "name": "高级客户端", "rate_limit": {"capacity": 1000, "refill_per_second": 500}}
+    ]
 }
 ```
 
@@ -240,8 +281,8 @@ sudo docker-compose down
 ```
 
 访问地址：
-- 服务主页：http://localhost:5005
-- 服务指标：http://localhost:5005/metrics
+- 服务主页：https://localhost:5005（自签名证书，需手动信任）
+- 服务指标：https://localhost:5005/metrics
 - Prometheus：http://localhost:9090
 - Grafana：http://localhost:3000（默认用户名/密码：`admin`/`admin`）
 
@@ -274,6 +315,7 @@ docker stop my-server && docker rm my-server
 | `GET` | `/users/{id}` | 动态路由，返回模拟用户数据 |
 | `GET` | `/chunked` | Chunked 分块传输演示 |
 | `GET` | `/metrics` | Prometheus 指标端点（文本格式） |
+| `GET` | `/api/test/*` | 反向代理（转发至 `test-service` 上游，由配置驱动） |
 | `GET` | `/<path>` | 静态文件服务（默认行为） |
 
 ## Prometheus + Grafana 监控
@@ -333,6 +375,39 @@ sum(rate(epoll_server_cache_hits[1m])) /
 sum(rate(epoll_server_cache_hits[1m]) + rate(epoll_server_cache_misses[1m]))
 ```
 
+## HTTPS 加密传输
+
+服务端集成 OpenSSL，在 TCP 连接建立后自动执行 TLS 握手，使用 `certs/server.crt` 与 `certs/server.key` 作为证书与私钥。客户端需以 HTTPS 方式访问：
+
+```bash
+# 使用 -k 忽略自签名证书校验
+curl -kv https://localhost:5005/
+
+# 或使用 openssl 客户端直接测试 TLS 握手
+openssl s_client -connect localhost:5005
+```
+
+> 注意：证书为演示用途的自签名证书，生产环境请替换为受信任机构签发的证书。
+
+## 反向代理
+
+通过 `config.json` 中的 `upstreams` 与 `routes` 配置，可将请求透明转发到后端服务：
+
+- **`upstreams`**：定义一组后端服务器及其负载均衡算法（当前支持 `round_robin`）。
+- **`routes`**：将匹配的「方法 + 路径」转发到指定的上游（路径支持 `*` 通配符）。
+- **健康检查**：每个 Worker 每秒主动对上游节点执行 TCP 连接探测，自动摘除故障节点并在恢复后重新加入。
+- **负载均衡**：`UpstreamManager` 采用轮询策略在健康节点间分发请求，转发逻辑由 `http_client::forward_request` 实现。
+
+## 限流与 API Key 认证
+
+- **令牌桶限流**：基于 `RateLimiter` 令牌桶算法，全局限流器跨 Worker 共享（配合 `SO_REUSEPORT` 多 Worker 场景保证总量准确），按客户端 IP 计数，超限返回 `429 Too Many Requests`。
+- **API Key 认证**：支持从 `X-API-Key` 请求头或 `Authorization: Bearer <key>` 提取 API Key，配合 `api_keys` 配置为不同客户端分配差异化的限流额度。
+
+```bash
+# 触发限流后返回 429
+for i in $(seq 1 30); do curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:5005/api/hello; done
+```
+
 ## 客户端
 
 配套的非阻塞 TCP 客户端位于 `src/client/`，可独立编译运行：
@@ -365,30 +440,11 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 
 
 访问服务
-浏览器打开 http://localhost:5005 查看默认页面。
-访问 http://localhost:5005/index.html 或其他静态文件。
-使用 curl -v http://localhost:5005/ 查看详细请求/响应头。
-测试 Keep-Alive：
-echo -ne "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\nGET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n" | nc localhost 5005
-测试 HEAD 方法：curl -I http://localhost:5005/index.html
+服务器默认启用 HTTPS，浏览器访问 https://localhost:5005 查看默认页面（自签名证书需手动信任）。
+使用 curl -kv https://localhost:5005/ 查看详细请求/响应头。
+测试 HEAD 方法：curl -kI https://localhost:5005/index.html
 检查服务器标识：响应头中可见 Server: EpollHTTP/0.2
 按下 Ctrl+C 优雅关闭服务器，日志完整保存在 logs/epollserver.log
-
-配置文件示例 (config.json)
-{
-    "port": 5005,
-    "backlog": 1024,
-    "num_workers": 2,
-    "www_root": "./www",
-    "cache_max_entries": 1024,
-    "cache_max_file_size_mb": 1,
-    "thread_pool": {
-        "min": 2,
-        "max": 10,
-        "scale_up": 2,
-        "scale_down": 1
-    }
-}
 
 技术栈
 技术	说明
@@ -405,53 +461,7 @@ Docker Compose	多容器服务编排
 Prometheus	指标采集与时序数据库
 Grafana	指标可视化仪表盘
 zlib	Gzip 压缩
-
-项目结构
-.
-├── include/                  # 头文件
-│   ├── common/
-│   │   ├── mysocket.h
-│   │   ├── myepoll.h
-│   │   ├── mylogger.h
-│   │   └── error_utils.h
-│   ├── server.h
-│   ├── tcpworker.h
-│   ├── http_handler.h        # HTTP 请求处理
-│   ├── http_parser.h         # HTTP 解析器
-│   ├── content_type.h        # MIME 类型映射
-│   ├── file_cache.h          # LRU 文件缓存
-│   ├── pool.h
-│   ├── client.h
-│   └── clienthandler.h
-├── src/
-│   ├── common/               # 公共组件
-│   │   ├── mysocket.cpp
-│   │   ├── myepoll.cpp
-│   │   ├── mylogger.cpp
-│   │   └── error_utils.cpp
-│   ├── server/               # 服务端
-│   │   ├── main.cpp
-│   │   ├── server.cpp
-│   │   ├── http_handler.cpp
-│   │   ├── http_parser.cpp
-│   │   ├── content_type.cpp
-│   │   └── pool.cpp
-│   └── client/               # 客户端（Echo 测试）
-│       ├── main.cpp
-│       ├── client.cpp
-│       └── clienthandler.cpp
-├── tests/                    # 单元测试
-│   ├── test_http_parser.cpp
-│   ├── test_file_cache.cpp
-│   ├── test_http_response.cpp
-│   └── CMakeLists.txt
-├── www/                      # 静态文件根目录（可选）
-├── config.json               # 配置文件（可选）
-├── CMakeLists.txt
-├── Dockerfile                # Docker 镜像构建文件
-├── .dockerignore
-├── build.sh, start.sh        # 便捷脚本
-└── README.md
+OpenSSL	TLS/SSL 加密传输
 
 核心设计细节
 1. HTTP 协议解析与管线化
@@ -501,12 +511,10 @@ Worker 在每次超时返回时检查标志，主动退出事件循环。
 具体压测数据请参见后续压测报告。
 
 后续计划
-完整的 Transfer-Encoding: chunked 请求解析
-路由参数支持（如 /users/{id}）
 支持 CGI/FastCGI 动态处理
-支持 HTTPS（OpenSSL）
+支持 WebSocket
 跨平台 kqueue（macOS）
-集成 Prometheus 指标输出
+HTTP/2 支持
 压力测试与性能剖析报告
 CI/CD (GitHub Actions / Gitee CI)
 

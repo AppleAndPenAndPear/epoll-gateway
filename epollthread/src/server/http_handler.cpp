@@ -877,3 +877,20 @@ bool HttpHandler::rate_limit_check(const std::string& client_ip) {
 
     return it->second->try_acquire();
 }
+
+std::string HttpHandler::extract_api_key(const HttpRequest& req){
+    // 1. 优先从 X-API-Key 头
+    auto it = req.headers.find("x-api-key");
+    if (it != req.headers.end()) {
+        return it->second;
+    }
+    // 2. 从 Authorization: Bearer <key>
+    auto auth = req.headers.find("authorization");
+    if (auth != req.headers.end()) {
+        const std::string& val = auth->second;
+        if (val.rfind("Bearer ", 0) == 0) {
+            return val.substr(7);
+        }
+    }
+    return "";
+}

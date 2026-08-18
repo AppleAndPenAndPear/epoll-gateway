@@ -78,4 +78,5 @@ public:
     void cleanup(std::shared_ptr<Socket> sock);
     void process_request(Socket* sock_ptr);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // 注册路由：method 为 "GET"、"POST" 等，path 如 "/api/hello"
+    std::string extract_api_key(const HttpRequest& req);
 };
