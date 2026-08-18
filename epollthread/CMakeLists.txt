@@ -54,6 +54,7 @@ set(SERVER_SOURCES
     src/server/gzip_utils.cpp
     src/server/metrics.cpp
     src/server/upstream_manager.cpp
+    src/server/rate_limiter.cpp
 )
 #创建服务端的可执行文件
 add_executable(server ${SERVER_SOURCES})

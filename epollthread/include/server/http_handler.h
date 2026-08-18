@@ -12,6 +12,8 @@
 #include "fd_cache.h"
 #include "config.h"
 #include "upstream_manager.h"
+#include "rate_limiter.h"
+
 
 class HttpHandler {
 private:
@@ -61,6 +63,12 @@ private:
     const Config& config_;               // 引用，只读访问静态文件配置等
     
     UpstreamManager& upstream_manager_;  // 引用，用于选择后端
+
+    // 全局限流器：跨所有 worker 共享，保证 SO_REUSEPORT 多 worker 下限流总量准确
+    static std::mutex rate_limiter_mutex_;
+    static std::unordered_map<std::string, std::unique_ptr<RateLimiter>> rate_limiters_;
+
+    bool rate_limit_check(const std::string& client_ip);
 public:
     explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager);
     void on_connect(Socket* sock);                          // 初始化
@@ -70,5 +78,4 @@ public:
     void cleanup(std::shared_ptr<Socket> sock);
     void process_request(Socket* sock_ptr);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // 注册路由：method 为 "GET"、"POST" 等，path 如 "/api/hello"
-
 };

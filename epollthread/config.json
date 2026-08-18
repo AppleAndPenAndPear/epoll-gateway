@@ -27,5 +27,9 @@
             "path": "/api/test/*",
             "upstream": "test-service"
         }
-    ]
+    ],
+    "rate_limit": {
+        "capacity": 20,
+        "refill_per_second": 5
+    }
 }

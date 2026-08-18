@@ -3,6 +3,11 @@
 #include <fstream>
 #include <string>
 
+struct RateLimitConfig {
+    size_t capacity = 100;
+    size_t refill_per_second = 50;
+};
+
 // 上游服务器
 struct UpstreamServer {
     std::string host;
@@ -52,6 +57,8 @@ struct Config {
     } thread_pool;
 
     UpstreamConfig upstream_config;
+
+    RateLimitConfig rate_limit_config;
 
     // 从 JSON 文件加载配置，如果文件不存在或解析失败，保持默认值
     static Config from_file(const std::string& path) {
@@ -116,6 +123,17 @@ struct Config {
                 r.path = item.value("path", "/");
                 r.upstream = item.value("upstream", "");
                 config.upstream_config.routes.push_back(r);
+            }
+        }
+
+        // 解析 rate limit 配置
+        if (j.contains("rate_limit")){
+            auto& rl = j["rate_limit"];
+            if (rl.contains("capacity")) {
+                config.rate_limit_config.capacity = rl["capacity"];
+            }
+            if (rl.contains("refill_per_second")) {
+                config.rate_limit_config.refill_per_second = rl["refill_per_second"];
             }
         }
 

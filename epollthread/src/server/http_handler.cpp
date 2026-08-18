@@ -22,6 +22,10 @@
 #include "upstream_manager.h"
 using json = nlohmann::json;
 
+// 全局限流器的静态成员定义（跨 worker 共享）
+std::mutex HttpHandler::rate_limiter_mutex_;
+std::unordered_map<std::string, std::unique_ptr<RateLimiter>> HttpHandler::rate_limiters_;
+
 static std::string to_hex(size_t n) {
     std::ostringstream oss;
     oss << std::hex << n;
@@ -183,9 +187,19 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         // 获取已解析好的请求引用
                         auto& req = requests_[sock_ptr];
 
+                        // ─── 限流检查 ───
+                        if (!rate_limit_check(client_ip)) {
+                            Logger::get()->warn("Rate limit exceeded for IP {} on fd {}", client_ip, fd);
+                            last_requests_[sock_ptr] = req;   // 记录请求，便于访问日志输出完整信息
+                            send_error_response(sock_ptr, 429, "Too Many Requests");
+                            parsers_[sock_ptr].reset();
+                            continue;
+                        }
+
                         // ─── 新增：方法合法性检查 ───
                         if (req.method != "GET" && req.method != "HEAD" && req.method != "POST" && req.method != "PUT" && req.method != "DELETE") {
                             Logger::get()->warn("HTTP method not allowed: {} on fd {}", req.method, fd);
+                            last_requests_[sock_ptr] = req;   // 记录请求，便于访问日志输出完整信息
                             send_error_response(sock_ptr, 405, "Method Not Allowed");
                             parsers_[sock_ptr].reset();
                             continue;  // 错误响应已放入发送队列，继续解析下一个请求（如果有）
@@ -846,4 +860,20 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
         if (!token.empty()) tokens.push_back(token);
     }
     return tokens;
+}
+
+bool HttpHandler::rate_limit_check(const std::string& client_ip) {
+    Logger::get()->info("rate_limit_check called for IP: {}", client_ip);
+    std::lock_guard<std::mutex> lock(rate_limiter_mutex_);
+
+    auto it = rate_limiters_.find(client_ip);
+    if (it == rate_limiters_.end()) {
+        // 为新 IP 创建默认限流器,从配置读取
+        it = rate_limiters_.emplace(
+            client_ip,
+            std::make_unique<RateLimiter>(config_.rate_limit_config.capacity, config_.rate_limit_config.refill_per_second)
+        ).first;
+    }
+
+    return it->second->try_acquire();
 }

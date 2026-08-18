@@ -11,6 +11,8 @@ BackendResponse forward_request(const std::string& host, int port,
                                 const std::unordered_map<std::string, std::string>& req_headers,
                                 const std::string& req_body) {
     BackendResponse resp;
+    resp.status_code = 502;          // 默认网关错误，避免连接失败时返回未初始化状态码
+    resp.body = "Bad Gateway";
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return resp;
 
