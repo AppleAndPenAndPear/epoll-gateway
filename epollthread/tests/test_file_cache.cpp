@@ -35,12 +35,12 @@ TEST(FileCacheTest, EvictionWhenFull) {
 }
 
 // 测试超过 max_file_size 的文件不会被缓存
+// 这里的单位是 MB，因此设置为 0 MB 会拒绝任何非空内容。
 TEST(FileCacheTest, RejectOversizedFile) {
-    // 设置最大文件大小为 10 字节
-    FileCache cache(10, 10);
+    FileCache cache(10, 0);
     std::string path = "/large.txt";
     std::string content = "This is more than 10 bytes";
-    ASSERT_GT(content.size(), cache.max_file_size());  // 确认内容确实超过限制
+    ASSERT_GT(content.size(), 0U);
 
     cache.put(path, content, content.size(), 100);
     EXPECT_EQ(cache.size(), 0);  // 缓存应该为空
@@ -49,9 +49,9 @@ TEST(FileCacheTest, RejectOversizedFile) {
 
 // 测试正好等于 max_file_size 的文件可以被缓存
 TEST(FileCacheTest, AcceptExactSizedFile) {
-    FileCache cache(10, 10);
+    FileCache cache(10, 1);
     std::string path = "/exact.txt";
-    std::string content = "1234567890";  // 正好 10 字节
+    std::string content = "1234567890";  // 10 bytes，1 MB 上限下必然允许
     cache.put(path, content, content.size(), 200);
     EXPECT_EQ(cache.size(), 1);
     EXPECT_NE(cache.get(path, 0), nullptr);

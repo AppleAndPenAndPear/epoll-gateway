@@ -13,7 +13,8 @@
 #include "config.h"
 #include "upstream_manager.h"
 #include "rate_limiter.h"
-
+#include "rate_limiter_manager.h"
+#include "api_key_manager.h"
 
 class HttpHandler {
 private:
@@ -64,13 +65,13 @@ private:
     
     UpstreamManager& upstream_manager_;  // 引用，用于选择后端
 
-    // 全局限流器：跨所有 worker 共享，保证 SO_REUSEPORT 多 worker 下限流总量准确
-    static std::mutex rate_limiter_mutex_;
-    static std::unordered_map<std::string, std::unique_ptr<RateLimiter>> rate_limiters_;
+    std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // 跨 worker 共享的限流器
+    ApiKeyManager& api_key_manager_;                             // API Key 鉴权
 
-    bool rate_limit_check(const std::string& client_ip);
+    // 判断请求是否需要鉴权（公开路由如静态文件、/metrics 无需鉴权）
+    bool requires_auth(const HttpRequest& req) const;
 public:
-    explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager);
+    explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager,ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
     void on_connect(Socket* sock);                          // 初始化
     void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // 处理读事件
     void handle_write(std::shared_ptr<Socket> sock);

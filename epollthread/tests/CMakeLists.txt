@@ -3,6 +3,8 @@ add_executable(runTests
     test_file_cache.cpp
     test_http_response.cpp
     test_route_utils.cpp
+    test_auth_and_rate_limit.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
 )
 
 # 链接你的公共库和 gtest

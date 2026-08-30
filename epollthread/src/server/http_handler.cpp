@@ -22,10 +22,6 @@
 #include "upstream_manager.h"
 using json = nlohmann::json;
 
-// 全局限流器的静态成员定义（跨 worker 共享）
-std::mutex HttpHandler::rate_limiter_mutex_;
-std::unordered_map<std::string, std::unique_ptr<RateLimiter>> HttpHandler::rate_limiters_;
-
 static std::string to_hex(size_t n) {
     std::ostringstream oss;
     oss << std::hex << n;
@@ -33,9 +29,9 @@ static std::string to_hex(size_t n) {
 }
 
 
-HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
+HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager, ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
 cache_(config.cache_max_entries, config.cache_max_file_size_mb), 
-upstream_manager_(upstream_manager) {                                                                     
+upstream_manager_(upstream_manager), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {                                                                     
     // 注册示例路由
     addRoute("GET", "/metrics", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
         std::string body = Metrics::instance().to_string();
@@ -187,22 +183,39 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         // 获取已解析好的请求引用
                         auto& req = requests_[sock_ptr];
 
-                        // ─── 限流检查 ───
-                        if (!rate_limit_check(client_ip)) {
+                        // ─── 鉴权检查（先保护受限路由，避免未授权请求进入正常处理流程） ───
+                        const ApiKeyConfig* api_key_cfg = nullptr;
+                        if (requires_auth(req)) {
+                            std::string key = extract_api_key(req);
+                            if (key.empty() || !api_key_manager_.validate(key)) {
+                                Logger::get()->warn("Authentication failed for {} {} on fd {}", req.method, req.path, fd);
+                                last_requests_[sock_ptr] = req;
+                                send_error_response(sock_ptr, 401, "Unauthorized");
+                                parsers_[sock_ptr].reset();
+                                continue;
+                            }
+                            api_key_cfg = api_key_manager_.get(key);
+                        }
+
+                        // ─── 限流检查（在进入 method/route 处理前先做） ───
+                        bool rate_limited = api_key_cfg
+                            ? !rate_limiter_manager_->try_acquire("api_key:" + api_key_cfg->key, api_key_cfg->rate_limit)
+                            : !rate_limiter_manager_->try_acquire("ip:" + client_ip, config_.rate_limit_config);
+                        if (rate_limited) {
                             Logger::get()->warn("Rate limit exceeded for IP {} on fd {}", client_ip, fd);
-                            last_requests_[sock_ptr] = req;   // 记录请求，便于访问日志输出完整信息
+                            last_requests_[sock_ptr] = req;
                             send_error_response(sock_ptr, 429, "Too Many Requests");
                             parsers_[sock_ptr].reset();
                             continue;
                         }
 
-                        // ─── 新增：方法合法性检查 ───
+                        // ─── 方法合法性检查（最后再决定是否允许进入路由处理） ───
                         if (req.method != "GET" && req.method != "HEAD" && req.method != "POST" && req.method != "PUT" && req.method != "DELETE") {
                             Logger::get()->warn("HTTP method not allowed: {} on fd {}", req.method, fd);
-                            last_requests_[sock_ptr] = req;   // 记录请求，便于访问日志输出完整信息
+                            last_requests_[sock_ptr] = req;
                             send_error_response(sock_ptr, 405, "Method Not Allowed");
                             parsers_[sock_ptr].reset();
-                            continue;  // 错误响应已放入发送队列，继续解析下一个请求（如果有）
+                            continue;
                         }
                         
                         //记录user-agent（key 已统一小写）
@@ -862,20 +875,9 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
     return tokens;
 }
 
-bool HttpHandler::rate_limit_check(const std::string& client_ip) {
-    Logger::get()->info("rate_limit_check called for IP: {}", client_ip);
-    std::lock_guard<std::mutex> lock(rate_limiter_mutex_);
-
-    auto it = rate_limiters_.find(client_ip);
-    if (it == rate_limiters_.end()) {
-        // 为新 IP 创建默认限流器,从配置读取
-        it = rate_limiters_.emplace(
-            client_ip,
-            std::make_unique<RateLimiter>(config_.rate_limit_config.capacity, config_.rate_limit_config.refill_per_second)
-        ).first;
-    }
-
-    return it->second->try_acquire();
+bool HttpHandler::requires_auth(const HttpRequest& req) const {
+    // 仅对 /api/ 前缀的接口要求鉴权；静态文件与 /metrics 等公开路由无需鉴权
+    return req.path.rfind("/api/", 0) == 0;
 }
 
 std::string HttpHandler::extract_api_key(const HttpRequest& req){

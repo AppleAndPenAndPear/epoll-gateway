@@ -26,10 +26,12 @@ void Tcpserver::start(unsigned int num_workers, const Config& config) {
   }
   Logger::get()->info("Starting {} worker threads with SO_REUSEPORT", num_workers);
 
+  auto shared_limiter = std::make_shared<RateLimiterManager>(config.rate_limit_config);
+
   // 创建 N 个 listen socket 并启动 Worker 线程
   for (unsigned int i = 0; i < num_workers; ++i) {
     Socket listen_sock = create_listen_sock();
-    workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config));
+    workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config, shared_limiter));
     threads_.emplace_back(&TcpWorker::run, workers_.back().get());
   }
 

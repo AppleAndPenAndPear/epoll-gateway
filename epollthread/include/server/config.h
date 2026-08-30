@@ -8,6 +8,12 @@ struct RateLimitConfig {
     size_t refill_per_second = 50;
 };
 
+struct ApiKeyConfig {
+    std::string key;
+    std::string name;       //  API Key 的备注名称,描述这个 Key 的用途
+    RateLimitConfig rate_limit{200, 100};   // 每个 key 的差异化限流额度
+};
+
 // 上游服务器
 struct UpstreamServer {
     std::string host;
@@ -59,6 +65,8 @@ struct Config {
     UpstreamConfig upstream_config;
 
     RateLimitConfig rate_limit_config;
+
+    std::vector<ApiKeyConfig> api_keys;      // API Key 列表
 
     // 从 JSON 文件加载配置，如果文件不存在或解析失败，保持默认值
     static Config from_file(const std::string& path) {
@@ -134,6 +142,20 @@ struct Config {
             }
             if (rl.contains("refill_per_second")) {
                 config.rate_limit_config.refill_per_second = rl["refill_per_second"];
+            }
+        }
+
+        if(j.contains("api_keys")){
+            for (auto& item : j["api_keys"]) {
+                ApiKeyConfig ak;
+                ak.key = item.value("key", "");
+                ak.name = item.value("name", "");
+                if (item.contains("rate_limit")) {
+                    auto& rl = item["rate_limit"];
+                    ak.rate_limit.capacity = rl.value("capacity", 200);
+                    ak.rate_limit.refill_per_second = rl.value("refill_per_second", 100);
+                }
+                config.api_keys.push_back(ak);
             }
         }
 

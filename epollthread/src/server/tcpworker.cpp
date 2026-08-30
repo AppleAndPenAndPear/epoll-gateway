@@ -5,8 +5,16 @@
 #include <fcntl.h>
 
 
-TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config):epoll_(),listen_sock_(std::move(listen_sock)),
-  pool_(pool),closed_(false),handler_(epoll_, config,upstream_manager_),keepalive_timeout_(config.keepalive_timeout),upstream_manager_(config.upstream_config){
+TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager):
+  listen_sock_(std::move(listen_sock)),
+  pool_(pool),
+  closed_(false),
+  epoll_(),
+  upstream_manager_(config.upstream_config),
+  api_key_manager_(config.api_keys),
+  rate_limiter_manager_(std::move(rate_limiter_manager)),
+  handler_(epoll_, config, upstream_manager_, api_key_manager_, rate_limiter_manager_),
+  keepalive_timeout_(config.keepalive_timeout) {
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
 
   SSL_library_init();
@@ -48,6 +56,12 @@ void TcpWorker::check_timeout() {
     }
     
     upstream_manager_.check_health();  // 每秒主动健康检查
+
+    // 定期清理长期未使用的限流器，防止内存无限增长（跨 worker 共享，互斥锁保证安全）
+    if (now - last_limiter_cleanup_ >= 60) {
+        rate_limiter_manager_->cleanup();
+        last_limiter_cleanup_ = now;
+    }
 }
 
 void TcpWorker::run(){
