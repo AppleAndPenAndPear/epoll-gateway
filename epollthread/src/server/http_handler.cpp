@@ -31,8 +31,12 @@ static std::string to_hex(size_t n) {
 
 HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager, ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
 cache_(config.cache_max_entries, config.cache_max_file_size_mb), 
-upstream_manager_(upstream_manager), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {                                                                     
-    // 注册示例路由
+upstream_manager_(upstream_manager), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
+    register_default_routes();
+    register_configured_routes();
+}
+
+void HttpHandler::register_default_routes() {
     addRoute("GET", "/metrics", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
         std::string body = Metrics::instance().to_string();
         resp.status_code = 200;
@@ -113,39 +117,13 @@ upstream_manager_(upstream_manager), api_key_manager_(api_key_manager), rate_lim
         resp.chunked = true;      // 关键：设置 chunked 标志
         resp.body = payload;
     });
+}
 
-    for (const auto& route : config.upstream_config.routes) {
-        // 简单路径匹配：如果请求路径以 route.path 去掉末尾 '*' 开头，则匹配
-        std::string pattern = route.path;
-        if (!pattern.empty() && pattern.back() == '*') {
-            pattern.pop_back(); // 去除 '*'
-        }
-        addRoute(route.method, route.path, [this, route](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
-            // 查找 upstream
-            auto it = config_.upstream_config.upstreams.find(route.upstream);
-            if (it == config_.upstream_config.upstreams.end() || it->second.servers.empty()) {
-                resp.status_code = 502;
-                resp.body = "Bad Gateway: no upstream server";
-                resp.headers["Content-Length"] = std::to_string(resp.body.size());
-                return;
-            }
-
-            const auto& server = upstream_manager_.pick_server(route.upstream);
-
-            // 构造转发的路径：将匹配部分替换为后端实际路径（简单处理：直接转发原始路径）
-            std::string forward_path = req.path;
-            // 转发请求
-            BackendResponse be = forward_request(server.host, server.port,
-                                                req.method, forward_path,
-                                                req.headers, req.body);
-            resp.status_code = be.status_code;
-            resp.body = be.body;
-            // 透传后端响应头
-            for (const auto& [k, v] : be.headers) {
-                resp.headers[k] = v;
-            }
-            resp.headers["Content-Length"] = std::to_string(resp.body.size());
-        });
+void HttpHandler::register_configured_routes() {
+    for (const auto& route : config_.upstream_config.routes) {
+        GatewayRoute route_policy = route;
+        route_policy.target_type = route.target_type.empty() ? "upstream" : route.target_type;
+        addRoute(route_policy, {});
     }
 }
 
@@ -183,11 +161,26 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         // 获取已解析好的请求引用
                         auto& req = requests_[sock_ptr];
 
-                        // ─── 鉴权检查（先保护受限路由，避免未授权请求进入正常处理流程） ───
+                        auto resolved = resolve_route(req);
+                        if (!resolved.route) {
+                            Logger::get()->warn("No matching route for {} {} on fd {}", req.method, req.path, fd);
+                            last_requests_[sock_ptr] = req;
+                            send_error_response(sock_ptr, 404, "Not Found");
+                            parsers_[sock_ptr].reset();
+                            continue;
+                        }
+
+                        const GatewayRoute& route_policy = resolved.route->route;
+
+                        // ─── 鉴权检查：由路由策略决定是否需要 auth ───
                         const ApiKeyConfig* api_key_cfg = nullptr;
-                        if (requires_auth(req)) {
+                        if (route_policy.auth_required && !route_policy.allow_anonymous) {
                             std::string key = extract_api_key(req);
-                            if (key.empty() || !api_key_manager_.validate(key)) {
+                            auto host_it = req.headers.find("host");
+                            auto tenant_it = req.headers.find("x-tenant-id");
+                            const std::string host = host_it == req.headers.end() ? "" : host_it->second;
+                            const std::string tenant = tenant_it == req.headers.end() ? "" : tenant_it->second;
+                            if (key.empty() || !api_key_manager_.authorize(key, route_policy, host, tenant)) {
                                 Logger::get()->warn("Authentication failed for {} {} on fd {}", req.method, req.path, fd);
                                 last_requests_[sock_ptr] = req;
                                 send_error_response(sock_ptr, 401, "Unauthorized");
@@ -197,12 +190,9 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             api_key_cfg = api_key_manager_.get(key);
                         }
 
-                        // ─── 限流检查（在进入 method/route 处理前先做） ───
-                        bool rate_limited = api_key_cfg
-                            ? !rate_limiter_manager_->try_acquire("api_key:" + api_key_cfg->key, api_key_cfg->rate_limit)
-                            : !rate_limiter_manager_->try_acquire("ip:" + client_ip, config_.rate_limit_config);
-                        if (rate_limited) {
-                            Logger::get()->warn("Rate limit exceeded for IP {} on fd {}", client_ip, fd);
+                        // ─── 限流检查：按 route_policy 决定策略 ───
+                        if (should_rate_limit(req, route_policy, client_ip, api_key_cfg)) {
+                            Logger::get()->warn("Rate limit exceeded for {} {} on fd {}", req.method, req.path, fd);
                             last_requests_[sock_ptr] = req;
                             send_error_response(sock_ptr, 429, "Too Many Requests");
                             parsers_[sock_ptr].reset();
@@ -297,6 +287,104 @@ void HttpHandler::process_request(Socket* sock_ptr){
     parsers_[sock_ptr].reset();       // 重置解析器状态
 }
 
+HttpResponse HttpHandler::make_error_response(int code, const std::string& status, const std::string& message) const {
+    HttpResponse resp;
+    resp.status_code = code;
+    resp.status_message = status;
+    resp.body = "<h1>" + std::to_string(code) + " " + message + "</h1>";
+    resp.headers["Content-Type"] = "text/html";
+    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+    resp.headers["Connection"] = "close";
+    return resp;
+}
+
+HttpHandler::ResolvedRoute HttpHandler::resolve_route(const HttpRequest& req) const {
+    ResolvedRoute matched;
+    for (const auto& registered : routes_) {
+        RouteParams params;
+        const auto host_it = req.headers.find("host");
+        const auto tenant_it = req.headers.find("x-tenant-id");
+        const std::string host = host_it == req.headers.end() ? "" : host_it->second;
+        const std::string tenant = tenant_it == req.headers.end() ? "" : tenant_it->second;
+        if (routeMatchesRequest(registered.route, req.method, host, tenant, req.path, params)) {
+            matched.route = &registered;
+            matched.params = std::move(params);
+            return matched;
+        }
+    }
+    return matched;
+}
+
+void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) const {
+    if (!matched.route) {
+        resp.status_code = 404;
+        resp.status_message = "Not Found";
+        resp.body = "<h1>404 Not Found</h1>";
+        resp.headers["Content-Type"] = "text/html";
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        return;
+    }
+
+    if (matched.route->route.target_type == "local" && matched.route->handler) {
+        matched.route->handler(req, resp, matched.params);
+        return;
+    }
+
+    if (matched.route->route.target_type == "upstream") {
+        const auto& route = matched.route->route;
+        const std::string& upstream_name = route.upstream_target.name;
+        auto it = config_.upstream_config.upstreams.find(upstream_name);
+        if (it == config_.upstream_config.upstreams.end() || it->second.servers.empty()) {
+            resp.status_code = 502;
+            resp.status_message = "Bad Gateway";
+            resp.body = "Bad Gateway: no upstream server";
+            resp.headers["Content-Type"] = "text/plain";
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+            return;
+        }
+
+        const auto& server = upstream_manager_.pick_server(upstream_name);
+        BackendResponse be = forward_request(server.host, server.port, req.method, req.path,
+                                             req.headers, req.body,
+                                             route.upstream_target.timeout_ms);
+        if (be.error != BackendError::None) {
+            Metrics::instance().record_upstream_error(be.error);
+            const bool timed_out = be.error == BackendError::ConnectTimeout ||
+                                   be.error == BackendError::WriteTimeout ||
+                                   be.error == BackendError::ReadTimeout;
+            resp = make_error_response(
+                timed_out ? 504 : 502,
+                timed_out ? "Gateway Timeout" : "Bad Gateway",
+                timed_out ? "The upstream service timed out"
+                          : "The upstream service returned an invalid response or could not be reached");
+            return;
+        }
+        resp.status_code = be.status_code;
+        resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
+        resp.body = be.body;
+        for (const auto& [k, v] : be.headers) {
+            resp.headers[k] = v;
+        }
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        return;
+    }
+
+    if (matched.route->route.target_type == "static") {
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.body = "<h1>Static route dispatched</h1>";
+        resp.headers["Content-Type"] = "text/html";
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        return;
+    }
+
+    resp.status_code = 404;
+    resp.status_message = "Not Found";
+    resp.body = "<h1>404 Not Found</h1>";
+    resp.headers["Content-Type"] = "text/html";
+    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+}
+
 void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
     last_requests_[sock] = req;
     HttpResponse resp;
@@ -305,24 +393,15 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
     // 默认首页
     if (path.empty() || path == "/") path = "/index.html"; // 默认首页
 
+    auto matched = resolve_route(req);
     bool path_handled = false;
 
-    std::string req_path = req.path;
-    std::string req_method = req.method;
-
-    // 遍历已注册的路由，尝试匹配
-    for (const auto& route : routes_) {
-        if (route.method != req_method) continue;
-
-        RouteParams params;
-        if (matchRoute(route.pattern, req_path, params)) {
-            route.handler(req, resp, params);
-            path_handled = true;
-            break;
-        }
+    if (matched.route) {
+        dispatch_route(req, matched, resp);
+        path_handled = true;
     }
 
-    bool already_compressed = false;  // ★ 提前声明
+    bool already_compressed = false;
     
     if (!path_handled) {
         //防止目录遍历攻击，简单处理：不允许 ".."
@@ -593,13 +672,7 @@ after_file:
 }
 
 void HttpHandler::send_error_response(Socket* sock, int code, const std::string& message){
-    HttpResponse resp;
-    resp.status_code = code;
-    resp.status_message = message;
-    resp.body = "<h1>" + std::to_string(code) + " " + message + "</h1>";
-    resp.headers["Content-Type"] = "text/html";
-    resp.headers["Content-Length"] = std::to_string(resp.body.size());
-    // 错误响应通常不保持连接
+    HttpResponse resp = make_error_response(code, message, message);
     keep_alive_[sock] = false;
     resp.headers["Connection"] = "close";
 
@@ -608,7 +681,6 @@ void HttpHandler::send_error_response(Socket* sock, int code, const std::string&
     queue.emplace_back(header.begin(), header.end());
     queue.emplace_back(resp.body.begin(), resp.body.end());
 
-    // ---- 新增：存储状态码和响应大小，以便 handle_write 记录日志 ----
     resp_status_[sock] = code;
     resp_size_[sock] = header.size() + resp.body.size();
 
@@ -862,7 +934,25 @@ void HttpHandler::close_connection(std::shared_ptr<Socket> sock){
 }
 
 void HttpHandler::addRoute(const std::string& method, const std::string& pattern, RouteHandler handler) {
-    routes_.push_back({method, pattern, handler});
+    GatewayRoute route;
+    route.method = method;
+    route.path = pattern;
+    route.target_type = "local";
+    route.enabled = true;
+    route.auth_required = false;
+    route.allow_anonymous = true;
+    route.rate_limit_policy = "route";
+    route.host = "*";
+    route.tenant = "*";
+    routes_.push_back({route, handler});
+}
+
+void HttpHandler::addRoute(const GatewayRoute& route, RouteHandler handler) {
+    GatewayRoute route_policy = route;
+    route_policy.target_type = route_policy.target_type.empty() ? "local" : route_policy.target_type;
+    route_policy.host = route_policy.host.empty() ? "*" : route_policy.host;
+    route_policy.tenant = route_policy.tenant.empty() ? "*" : route_policy.tenant;
+    routes_.push_back({route_policy, std::move(handler)});
 }
 
 std::vector<std::string> split(const std::string& s, char delimiter) {
@@ -878,6 +968,16 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
 bool HttpHandler::requires_auth(const HttpRequest& req) const {
     // 仅对 /api/ 前缀的接口要求鉴权；静态文件与 /metrics 等公开路由无需鉴权
     return req.path.rfind("/api/", 0) == 0;
+}
+
+bool HttpHandler::should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const {
+    if (route.rate_limit_policy == "route") {
+        return !rate_limiter_manager_->try_acquire("route:" + route.path + ":" + req.method, config_.rate_limit_config);
+    }
+    if (route.rate_limit_policy == "api_key" && api_key_cfg) {
+        return !rate_limiter_manager_->try_acquire("api_key:" + api_key_cfg->key, api_key_cfg->rate_limit);
+    }
+    return !rate_limiter_manager_->try_acquire("ip:" + client_ip, config_.rate_limit_config);
 }
 
 std::string HttpHandler::extract_api_key(const HttpRequest& req){

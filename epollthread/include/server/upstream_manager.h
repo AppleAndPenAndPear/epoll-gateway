@@ -10,9 +10,10 @@ private:
     UpstreamConfig config_;  // 拷贝一份配置，内部管理健康状态
     std::mutex mutex_;       // 保护 config_ 和轮询索引
     std::unordered_map<std::string, size_t> round_robin_indices_;
+    int health_check_timeout_ms_;
 
     // 内部健康探测：TCP 连接测试
-    bool health_probe(const std::string& host, int port);
+    bool health_probe(const std::string& host, int port) const;
 public:
     explicit UpstreamManager(const UpstreamConfig& config);
 

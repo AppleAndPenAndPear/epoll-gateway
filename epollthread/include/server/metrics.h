@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <sstream>
+#include "http_client.h"
 
 class Metrics {
 private:
@@ -27,6 +28,7 @@ private:
     // gzip 压缩缓存统计
     std::atomic<uint64_t> gzip_cache_hits_{0};
     std::atomic<uint64_t> gzip_cache_misses_{0};
+    std::array<std::atomic<uint64_t>, 8> upstream_error_counts_{};
 public:
     static Metrics& instance(){
         static Metrics inst;
@@ -52,4 +54,5 @@ public:
 
     void record_gzip_cache_hit();
     void record_gzip_cache_miss();
+    void record_upstream_error(BackendError error);
 };

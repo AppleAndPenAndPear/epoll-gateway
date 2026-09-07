@@ -23,9 +23,13 @@
     },
     "routes": [
         {
+            "name": "test-service-api",
             "method": "GET",
             "path": "/api/test/*",
-            "upstream": "test-service"
+            "upstream_target": {
+                "name": "test-service",
+                "timeout_ms": 5000
+            }
         }
     ],
     "rate_limit": {

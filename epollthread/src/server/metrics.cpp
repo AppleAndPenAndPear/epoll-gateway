@@ -53,6 +53,16 @@ void Metrics::record_gzip_cache_miss()  {
     gzip_cache_misses_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Metrics::record_upstream_error(BackendError error) {
+    if (error == BackendError::None) {
+        return;
+    }
+    const auto index = static_cast<size_t>(error);
+    if (index < upstream_error_counts_.size()) {
+        upstream_error_counts_[index].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 std::string Metrics::to_string() const {
         std::ostringstream oss;
         // 总请求
@@ -99,6 +109,17 @@ std::string Metrics::to_string() const {
         oss << "# HELP epoll_gzip_cache_misses_total Total gzip cache misses\n";
         oss << "# TYPE epoll_gzip_cache_misses_total counter\n";
         oss << "epoll_gzip_cache_misses_total " << gzip_cache_misses_.load() << "\n";
+
+        oss << "# HELP epoll_upstream_errors_total Upstream proxy errors by type\n";
+        oss << "# TYPE epoll_upstream_errors_total counter\n";
+        const std::array<const char*, 8> error_names = {
+            "none", "connect_failed", "connect_timeout", "write_failed",
+            "write_timeout", "read_failed", "read_timeout", "invalid_response"
+        };
+        for (size_t i = 1; i < error_names.size(); ++i) {
+            oss << "epoll_upstream_errors_total{type=\"" << error_names[i] << "\"} "
+                << upstream_error_counts_[i].load() << "\n";
+        }
 
         oss << "# EOF\n";
         return oss.str();

@@ -23,6 +23,7 @@ find_package(OpenSSL REQUIRED)
 
 #创建静态库 libcommon，包含服务端和客户端共享的代码
 set(COMMON_SOURCES
+    src/common/poller.cpp
     src/common/mysocket.cpp
     src/common/myepoll.cpp
     src/common/error_utils.cpp
@@ -36,6 +37,8 @@ target_include_directories(common PUBLIC include/common)
 target_link_libraries(common PUBLIC
     spdlog::spdlog
     Threads::Threads
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 # 可选：为 common 设置编译警告选项
 target_compile_options(common PRIVATE

@@ -27,7 +27,7 @@ public:
   Socket(Socket&& other) noexcept;
   Socket& operator=(Socket&& other) noexcept;
 
-  int getFd();
+  int getFd() const;
 
   template<typename T>
   bool setOption(int level, int optname, const T& value) {
@@ -60,11 +60,12 @@ public:
 
   std::optional<int> accept(struct sockaddr* addr,socklen_t* addrlen);
 
-  ssize_t recv(char* data,int size,int flags);
+  ssize_t recv(char* data,size_t size,int flags);
 
-  ssize_t send(char* data,int size,int flags);
+  ssize_t send(const char* data,size_t size,int flags);
 
-  bool connect(struct sockaddr* addr,int size);
+  bool connect(const struct sockaddr* addr,socklen_t size);
+  int socketError() const;
 
   void closefd();
 

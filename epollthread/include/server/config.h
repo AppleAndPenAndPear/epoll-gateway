@@ -2,6 +2,8 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 struct RateLimitConfig {
     size_t capacity = 100;
@@ -12,6 +14,8 @@ struct ApiKeyConfig {
     std::string key;
     std::string name;       //  API Key 的备注名称,描述这个 Key 的用途
     RateLimitConfig rate_limit{200, 100};   // 每个 key 的差异化限流额度
+    std::vector<std::string> allowed_hosts;
+    std::vector<std::string> allowed_tenants;
 };
 
 // 上游服务器
@@ -28,16 +32,38 @@ struct Upstream {
     std::string algorithm;  //实现负载均衡
 };
 
-// 路由规则：匹配路径，转发到指定上游
-struct Route {
-    std::string method;
-    std::string path;       // 形如 "/api/users/*"
-    std::string upstream;   // 指向 upstreams 的 key
+//描述某条路由要使用哪个 upstream，以及该路由的执行参数
+struct UpstreamTarget {
+    std::string name;
+    int timeout_ms = 5000;      //请求后端时最多允许等待多久
+};
+
+// 网关路由规则：不仅匹配路径，还携带安全策略和执行目标
+struct GatewayRoute {
+    std::string name;
+    std::string method = "GET";
+    std::string path = "/";
+    std::string host = "*";               // 允许的 Host，例如 "api.example.com"
+    std::string tenant = "*";             // 允许的 tenant，例如 "team-a"
+    std::string target_type = "upstream";  // local | upstream | static
+    std::string handler_name;
+    UpstreamTarget upstream_target;
+    std::string static_root;
+
+    bool enabled = true;        //是否启用
+    bool auth_required = true;
+    bool allow_anonymous = false;
+
+    std::string rate_limit_policy = "api_key"; // api_key | ip | route
+
+    std::vector<std::string> allowed_api_keys;
+    std::vector<std::string> denied_api_keys;
 };
 
 struct UpstreamConfig {
     std::unordered_map<std::string, Upstream> upstreams;
-    std::vector<Route> routes;
+    std::vector<GatewayRoute> routes;
+    int health_check_timeout_ms = 500;
 };
 
 struct Config {
@@ -122,14 +148,50 @@ struct Config {
                 config.upstream_config.upstreams[name] = up;
             }
         }
+        if (j.contains("upstream_health_check_timeout_ms")) {
+            config.upstream_config.health_check_timeout_ms =
+                j.value("upstream_health_check_timeout_ms", 500);
+        }
 
         // 解析 routes
         if (j.contains("routes")) {
             for (auto& item : j["routes"]) {
-                Route r;
+                GatewayRoute r;
+                r.name = item.value("name", "");
                 r.method = item.value("method", "GET");
                 r.path = item.value("path", "/");
-                r.upstream = item.value("upstream", "");
+                r.host = item.value("host", "*");
+                r.tenant = item.value("tenant", "*");
+                r.target_type = item.value("target_type", "upstream");
+                r.handler_name = item.value("handler", "");
+                r.static_root = item.value("static_root", "");
+
+                r.enabled = item.value("enabled", true);
+                r.auth_required = item.value("auth_required", true);
+                r.allow_anonymous = item.value("allow_anonymous", false);
+                r.rate_limit_policy = item.value("rate_limit_policy", "api_key");
+                const int legacy_timeout_ms = item.value("timeout_ms", 5000);
+
+                if (item.contains("upstream_target")) {
+                    const auto& target = item["upstream_target"];
+                    r.upstream_target.name = target.value("name", "");
+                    r.upstream_target.timeout_ms = target.value("timeout_ms", legacy_timeout_ms);
+                } else {
+                    r.upstream_target.name = "";
+                    r.upstream_target.timeout_ms = legacy_timeout_ms;
+                }
+
+                if (item.contains("allowed_api_keys")) {
+                    for (const auto& k : item["allowed_api_keys"]) {
+                        r.allowed_api_keys.push_back(k.get<std::string>());
+                    }
+                }
+                if (item.contains("denied_api_keys")) {
+                    for (const auto& k : item["denied_api_keys"]) {
+                        r.denied_api_keys.push_back(k.get<std::string>());
+                    }
+                }
+
                 config.upstream_config.routes.push_back(r);
             }
         }
@@ -154,6 +216,16 @@ struct Config {
                     auto& rl = item["rate_limit"];
                     ak.rate_limit.capacity = rl.value("capacity", 200);
                     ak.rate_limit.refill_per_second = rl.value("refill_per_second", 100);
+                }
+                if (item.contains("allowed_hosts")) {
+                    for (const auto& host : item["allowed_hosts"]) {
+                        ak.allowed_hosts.push_back(host.get<std::string>());
+                    }
+                }
+                if (item.contains("allowed_tenants")) {
+                    for (const auto& tenant : item["allowed_tenants"]) {
+                        ak.allowed_tenants.push_back(tenant.get<std::string>());
+                    }
                 }
                 config.api_keys.push_back(ak);
             }

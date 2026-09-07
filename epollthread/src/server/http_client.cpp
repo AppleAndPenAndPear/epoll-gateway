@@ -1,32 +1,68 @@
 #include "http_client.h"
+#include "mysocket.h"
+#include "poller.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
+#include <cerrno>
 #include <sstream>
+#include <stdexcept>
+
+namespace {
+
+BackendResponse make_error_response(int status_code, BackendError error, const std::string& body) {
+    BackendResponse response;
+    response.status_code = status_code;
+    response.body = body;
+    response.error = error;
+    return response;
+}
+
+}
 
 BackendResponse forward_request(const std::string& host, int port,
                                 const std::string& method,
                                 const std::string& path,
                                 const std::unordered_map<std::string, std::string>& req_headers,
-                                const std::string& req_body) {
-    BackendResponse resp;
-    resp.status_code = 502;          // 默认网关错误，避免连接失败时返回未初始化状态码
-    resp.body = "Bad Gateway";
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return resp;
+                                const std::string& req_body,
+                                int timeout_ms) {
+    if (timeout_ms <= 0) {
+        return make_error_response(504, BackendError::ConnectTimeout, "Gateway Timeout");
+    }
+
+    BackendResponse resp = make_error_response(502, BackendError::ConnectFailed, "Bad Gateway");
+    BackendError current_phase_error = BackendError::ConnectFailed;
+    try {
+    Socket upstream_socket(AF_INET, SOCK_STREAM, 0);
+    try {
+            upstream_socket.setnonblocking();
+    } catch (const std::exception&) {
+        resp.error = BackendError::ConnectFailed;
+        return resp;
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        resp.error = BackendError::ConnectFailed;
+        return resp;
+    }
 
-    if (connect(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return resp; // 连接失败，返回空响应
+    bool connected = upstream_socket.connect(reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+    if (!connected) {
+        const auto wait_result = Poller::wait(upstream_socket.getFd(), Poller::Event::Write, timeout_ms);
+        if (wait_result == Poller::WaitResult::Timeout) {
+            return make_error_response(504, BackendError::ConnectTimeout, "Gateway Timeout");
+        }
+        if (wait_result != Poller::WaitResult::Ready || upstream_socket.socketError() != 0) {
+            resp.error = BackendError::ConnectFailed;
+            return resp;
+        }
     }
 
     // 构造 HTTP 请求
+    current_phase_error = BackendError::WriteFailed;
     std::ostringstream req_stream;
     req_stream << method << " " << path << " HTTP/1.1\r\n";
     req_stream << "Host: " << host << ":" << port << "\r\n";
@@ -42,21 +78,64 @@ BackendResponse forward_request(const std::string& host, int port,
     req_stream << req_body;
 
     std::string request = req_stream.str();
-    send(fd, request.data(), request.size(), 0);
+    size_t sent = 0;
+    while (sent < request.size()) {
+        const auto wait_result = Poller::wait(upstream_socket.getFd(), Poller::Event::Write, timeout_ms);
+        if (wait_result == Poller::WaitResult::Timeout) {
+            return make_error_response(504, BackendError::WriteTimeout, "Gateway Timeout");
+        }
+        if (wait_result != Poller::WaitResult::Ready) {
+            resp.error = BackendError::WriteFailed;
+            return resp;
+        }
+        ssize_t written = upstream_socket.send(request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            resp.error = BackendError::WriteFailed;
+            return resp;
+        }
+        if (written == 0) {
+            resp.error = BackendError::WriteFailed;
+            return resp;
+        }
+        sent += static_cast<size_t>(written);
+    }
 
     // 读取响应
+    current_phase_error = BackendError::ReadFailed;
     char buf[65536];
-    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-    close(fd);
+    const auto wait_result = Poller::wait(upstream_socket.getFd(), Poller::Event::Read, timeout_ms);
+    if (wait_result == Poller::WaitResult::Timeout) {
+        return make_error_response(504, BackendError::ReadTimeout, "Gateway Timeout");
+    }
+    if (wait_result != Poller::WaitResult::Ready) {
+        resp.error = BackendError::ReadFailed;
+        return resp;
+    }
+    ssize_t n = upstream_socket.recv(buf, sizeof(buf) - 1, 0);
 
-    if (n <= 0) return resp;
+    if (n <= 0) {
+        resp.error = BackendError::ReadFailed;
+        return resp;
+    }
 
     std::string response(buf, n);
     size_t pos = response.find(' ');
-    if (pos == std::string::npos) return resp;
+    if (pos == std::string::npos) {
+        resp.error = BackendError::InvalidResponse;
+        return resp;
+    }
     size_t pos2 = response.find(' ', pos + 1);
-    if (pos2 == std::string::npos) return resp;
-    resp.status_code = std::stoi(response.substr(pos + 1, pos2 - pos - 1));
+    if (pos2 == std::string::npos) {
+        resp.error = BackendError::InvalidResponse;
+        return resp;
+    }
+    try {
+        resp.status_code = std::stoi(response.substr(pos + 1, pos2 - pos - 1));
+    } catch (const std::exception&) {
+        resp.error = BackendError::InvalidResponse;
+        return resp;
+    }
 
     // 解析头部和 body
     size_t header_end = response.find("\r\n\r\n");
@@ -77,7 +156,15 @@ BackendResponse forward_request(const std::string& host, int port,
             if (line_end == std::string::npos) break;
             line_start = line_end + 2;
         }
+    } else {
+        resp.error = BackendError::InvalidResponse;
+        return resp;
     }
 
+    resp.error = BackendError::None;
     return resp;
+    } catch (const std::exception&) {
+        resp.error = current_phase_error;
+        return resp;
+    }
 }

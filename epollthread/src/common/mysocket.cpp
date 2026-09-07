@@ -44,7 +44,7 @@ Socket& Socket::operator=(Socket&& other) noexcept {
   return *this;
 }
 
-int Socket::getFd(){
+int Socket::getFd() const {
   return fd_;
 }
 
@@ -123,7 +123,7 @@ std::optional<int> Socket::accept(struct sockaddr* addr,socklen_t* addrlen){
   return clientsock;
 }
 
-ssize_t Socket::recv(char* data, int size, int flags) {
+ssize_t Socket::recv(char* data, size_t size, int flags) {
     ssize_t n = ::recv(fd_, data, size, flags);
     if (n == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -140,7 +140,7 @@ ssize_t Socket::recv(char* data, int size, int flags) {
     return n;
 }
 
-ssize_t Socket::send(char* data,int size,int flags){
+ssize_t Socket::send(const char* data,size_t size,int flags){
   ssize_t n = ::send(fd_,data,size,flags);
   if (n == -1) {
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EPIPE) {
@@ -153,7 +153,7 @@ ssize_t Socket::send(char* data,int size,int flags){
   return n;
 }
 
-bool Socket::connect(struct sockaddr* addr,int size){
+bool Socket::connect(const struct sockaddr* addr,socklen_t size){
   int ret = ::connect(fd_, addr, size);
   if (ret == 0) {
     Logger::get()->debug("Socket fd {} connected immediately", fd_);
@@ -168,9 +168,19 @@ bool Socket::connect(struct sockaddr* addr,int size){
   throw_system_error("connect() failed");
 }
 
+int Socket::socketError() const {
+  int error = 0;
+  socklen_t length = sizeof(error);
+  if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length) < 0) {
+    return errno;
+  }
+  return error;
+}
+
 void Socket::closefd(){
   if (fd_ != -1) {
     Logger::get()->debug("Explicitly closing socket fd {}", fd_);
+    closeSSL();
     close(fd_);
     fd_ = -1;
   }

@@ -21,6 +21,16 @@ private:
     using RouteParams = std::map<std::string, std::string>;
     using RouteHandler = std::function<void(const HttpRequest&, HttpResponse&, const RouteParams&)>;
 
+    struct RegisteredRoute {
+        GatewayRoute route;
+        RouteHandler handler;
+    };
+
+    struct ResolvedRoute {
+        const RegisteredRoute* route = nullptr;
+        RouteParams params;
+    };
+
     Epoll& epoll_;
     // 每个连接的读缓冲区（用于拼接头）
     std::unordered_map<Socket*, std::string> read_bufs_;
@@ -43,19 +53,18 @@ private:
     FileCache cache_;   // 新增缓存
 
     void send_response(Socket* sock, const HttpRequest& req);
+    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) const;
+    ResolvedRoute resolve_route(const HttpRequest& req) const;
+    void register_default_routes();
+    void register_configured_routes();
+    HttpResponse make_error_response(int code, const std::string& status, const std::string& message) const;
 
     void send_error_response(Socket* sock, int code, const std::string& message);
 
     // 辅助：序列化响应头（不含 body）
     std::string headers_to_string(const HttpResponse& resp);
 
-    // 改为存储路由模式和处理函数，支持参数提取
-    struct Route {
-        std::string method;
-        std::string pattern;   // 如 "/users/{id}"
-        RouteHandler handler;
-    };
-    std::vector<Route> routes_;
+    std::vector<RegisteredRoute> routes_;
 
     std::unordered_map<Socket*, std::string> client_ip_map_;
     std::unordered_map<Socket*, std::chrono::steady_clock::time_point> request_start_time_;
@@ -70,6 +79,7 @@ private:
 
     // 判断请求是否需要鉴权（公开路由如静态文件、/metrics 无需鉴权）
     bool requires_auth(const HttpRequest& req) const;
+    bool should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const;
 public:
     explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager,ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
     void on_connect(Socket* sock);                          // 初始化
@@ -79,5 +89,6 @@ public:
     void cleanup(std::shared_ptr<Socket> sock);
     void process_request(Socket* sock_ptr);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // 注册路由：method 为 "GET"、"POST" 等，path 如 "/api/hello"
+    void addRoute(const GatewayRoute& route, RouteHandler handler);
     std::string extract_api_key(const HttpRequest& req);
 };

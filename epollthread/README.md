@@ -1,13 +1,16 @@
 # epollthread
 
-基于 C++17 实现的高性能多线程网络服务器框架，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合动态线程池和异步日志，支持海量并发连接。项目已从最初的 Echo 演示进化为一个**完整的轻量级 HTTP/HTTPS 应用服务器**，支持 HTTP/1.1 协议解析、TLS/SSL 加密传输、Keep-Alive 长连接、零拷贝文件传输、LRU 内存文件缓存、FD 文件描述符缓存、RESTful 路由、JSON API、Chunked 传输编码、Gzip 压缩、反向代理与上游负载均衡、令牌桶限流、API Key 认证、空闲连接超时、Docker 容器化部署，并包含单元测试及 AddressSanitizer 内存检测。
+基于 C++17 实现的高性能多线程 HTTP/HTTPS 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、TLS、Keep-Alive、零拷贝文件传输、LRU/FD 缓存、配置驱动路由、反向代理与上游健康检查、API Key 鉴权、host/tenant 策略、令牌桶限流、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试及 AddressSanitizer 支持。
 
 ## 特性
 - **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡，无锁竞争。
 - **HTTP/1.1 协议支持**：内置状态机 HTTP 解析器，支持 GET / HEAD / POST / PUT / DELETE 方法，解析请求行、头部、查询字符串、消息体，含 Chunked 传输编码解析。
 - **HTTPS/TLS 加密传输**：基于 OpenSSL 集成 TLS 加密，通过 `certs/server.crt` 与 `certs/server.key` 实现安全连接，握手与加密数据传输均运行在非阻塞 epoll 事件循环中。
 - **RESTful 路由系统**：可注册任意方法+路径模式（如 `/users/{id}`）的处理函数，支持动态路由参数提取与分发，轻松构建 JSON API。
-- **反向代理与上游负载均衡**：将匹配的路由转发至配置的上游服务（`upstreams` + `routes`），内置轮询（Round-Robin）负载均衡与主动 TCP 健康检查，自动摘除故障后端节点。
+- **配置驱动网关路由**：通过 `routes` 配置 method、path、host、tenant、鉴权、限流和执行目标；路由注册与执行分离，支持 `local`、`upstream`、`static` 三类目标。
+- **反向代理与上游负载均衡**：通过 `UpstreamTarget` 引用 upstream 服务组，由 `UpstreamManager` 进行轮询选路和主动 TCP 健康检查，自动摘除故障节点。
+- **上游访问控制与超时**：支持 route/API Key 的 host、tenant 绑定；连接、发送、读取阶段均具备超时控制，区分 502 与 504。
+- **上游错误分类**：区分连接失败、连接超时、发送失败、发送超时、读取失败、读取超时和非法响应，并通过 Prometheus 暴露错误计数。
 - **静态文件服务**：根据 URL 路径映射本地文件，使用 `sendfile` 系统调用实现**零拷贝**传输；自动设置 `Content-Type`（支持 HTML、CSS、JS、JSON、图片、字体等常见格式）。
 - **双层缓存机制**：
   - **LRU 内存文件缓存**：每个 Worker 维护独立的文件内容缓存，对频繁访问的小文件进行内存缓存，减少磁盘 I/O，大幅提升重复请求吞吐量。
@@ -16,21 +19,22 @@
 - **Chunked 传输编码**：支持 `Transfer-Encoding: chunked` 响应，适用于动态生成或流式输出的内容。
 - **连接复用**：正确处理 `Connection: keep-alive`，支持在同一条 TCP 连接上串行处理多个请求（HTTP Pipelining），保证响应顺序。
 - **空闲连接超时**：可配置的超时时间，自动关闭长时间无活动的连接，防止资源泄漏。
-- **错误处理与状态码**：支持 200、400、403、404、405、413、429、500、502 等状态码，返回友好错误页面，并防御路径穿越攻击。
+- **错误处理与状态码**：支持 200、400、403、404、405、413、429、500、502、504 等状态码，区分后端不可达与后端超时，并防御路径穿越攻击。
 - **令牌桶限流**：基于令牌桶算法的全局限流器，跨 Worker 共享计数，按客户端 IP 精确控制请求速率，超限返回 `429 Too Many Requests`，令牌补充采用小数累积避免截断误差。
-- **API Key 认证**：提供 API Key 校验与提取工具（支持 `X-API-Key` 请求头与 `Authorization: Bearer` 两种方式），配合配置中的 `api_keys` 为不同客户端分配差异化限流额度。
+- **API Key 认证**：提供 API Key 校验与提取工具（支持 `X-API-Key` 请求头与 `Authorization: Bearer` 两种方式），支持 route allow/deny 以及 API Key 的 host/tenant 范围和差异化限流额度。
 - **非阻塞 I/O + 边缘触发**：所有套接字使用非阻塞模式，结合 `EPOLLET` 和 `EPOLLONESHOT`，精细控制事件通知，避免惊群和重复触发。
 - **动态线程池**：可配置最小/最大线程数，依据任务负载自动扩缩容（目前预留接口，用于未来异步业务处理）。
 - **异步日志系统**：基于 `spdlog` 的全局线程池，支持控制台彩色输出与文件滚动存储，可分别控制各级别日志输出，性能开销低。
 - **请求/响应日志**：记录每个请求的方法、路径、状态码、User-Agent、客户端 IP 及响应大小，便于监控与分析。
 - **RAII 资源管理**：`Socket`、`Epoll` 等资源封装为 RAII 类，支持移动语义，杜绝描述符泄漏。
+- **等待器职责分离**：`Socket` 只负责 fd 生命周期和 I/O，`Poller` 封装单 fd 的 poll 等待，`Epoll` 负责长期管理大量连接。
 - **优雅关闭**：捕获 `SIGINT`/`SIGTERM` 信号，安全通知所有 Worker 线程退出，保证日志完整、资源正确回收。
 - **外部配置驱动**：通过 JSON 配置文件指定端口、线程数、Web 根目录、线程池参数、缓存大小、超时时间等，方便部署和调整。
 - **配套非阻塞客户端**：独立的状态机客户端，支持连接、发送、接收全流程，展示 epoll 在客户端的使用方法。
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
-- **单元测试**：基于 Google Test，覆盖 HTTP 解析器、LRU 缓存、响应序列化、路由匹配等核心模块。
+- **单元测试**：基于 Google Test，覆盖 HTTP 解析器、LRU 缓存、响应序列化、路由匹配、API Key 策略、HTTP client 超时、upstream 健康检查等核心模块。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
-- **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、文件缓存命中率、FD 缓存命中率、Gzip 压缩缓存命中率等。
+- **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
 - **Grafana 可视化监控**：集成 Grafana + Prometheus 监控栈，通过 `docker-compose` 一键部署，开箱即用的指标采集与仪表盘展示。
 
 ## 架构概览
@@ -50,9 +54,13 @@
     └────┬────┘    └────┬────┘      └────┬────┘
          │               │               │
     HttpHandler    HttpHandler      HttpHandler
-    (HTTP解析+路由)  (HTTP解析+路由)    (HTTP解析+路由)
+    (解析+路由+策略) (解析+路由+策略)  (解析+路由+策略)
     (文件服务+缓存)  (文件服务+缓存)    (文件服务+缓存)
-    (Gzip压缩)     (Gzip压缩)       (Gzip压缩)
+         │               │               │
+         └───────────────┼───────────────┘
+                         │
+              UpstreamManager + HttpClient
+              (健康检查、选路、超时、代理)
          │               │               │
          └───────────────┴───────────────┘
                          │
@@ -67,8 +75,10 @@
 
 - **Tcpserver**：负责创建 N 个 listen socket，启动对应数量的 `TcpWorker` 线程。
 - **TcpWorker**：每个 Worker 持有独立的 epoll 实例、连接表、`HttpHandler` 与 SSL 上下文，全权处理归属连接的所有 I/O 事件（含 TLS 握手），并负责超时连接清理与上游健康检查。
-- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、路由匹配、Keep-Alive 管理、文件服务、错误响应、内存缓存、限流检查等。同时将请求指标上报给 `Metrics` 单例。
-- **UpstreamManager**：管理上游服务器集群，负责健康检查与轮询选路，为反向代理提供可用的后端节点。
+- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、配置路由匹配、host/tenant 策略、API Key 鉴权、限流、Keep-Alive、文件服务和错误响应。
+- **UpstreamManager**：管理上游服务器集群，使用非阻塞 Socket + Poller 执行带超时的 TCP 健康检查，并负责轮询选路。
+- **HttpClient**：执行同步的单后端 HTTP 转发，使用 `Socket + Poller` 实现连接、发送和读取超时，并返回结构化 `BackendError`。
+- **Poller**：封装单次 `poll` 等待；它与 `Epoll` 分工不同，前者用于单个后端连接等待，后者用于 worker 事件循环。
 - **Metrics**：线程安全的指标收集器（单例），记录请求总数、状态码分布、延迟直方图、多级缓存命中率，通过 `/metrics` 端点以 Prometheus 文本格式暴露。
 - **Prometheus**：定期从 `server:5005/metrics` 刮取指标数据，存储时序数据。
 - **Grafana**：连接 Prometheus 作为数据源，提供实时可视化仪表盘。
@@ -84,7 +94,7 @@ epollthread/
 │   │   ├── server.h          # Tcpserver 服务端主类
 │   │   ├── tcpworker.h       # TcpWorker 工作线程（含 SSL 状态机）
 │   │   ├── http_handler.h    # HTTP 请求处理与路由
-│   │   ├── http_client.h     # 反向代理转发（forward_request）
+│   │   ├── http_client.h     # 反向代理转发与 BackendError
 │   │   ├── upstream_manager.h# 上游服务器管理与健康检查
 │   │   ├── rate_limiter.h    # 令牌桶限流器
 │   │   ├── rate_limiter_manager.h # 限流器管理器
@@ -101,6 +111,7 @@ epollthread/
 │   │   └── clienthandler.h   # 客户端处理器
 │   └── common/               # 公共头文件
 │       ├── mysocket.h        # Socket RAII 封装（含 SSL 支持）
+│       ├── poller.h          # 单 fd poll 等待封装
 │       ├── myepoll.h         # Epoll RAII 封装
 │       ├── mylogger.h        # 异步日志封装
 │       ├── http_parser.h     # HTTP/1.1 协议解析器（状态机）
@@ -125,6 +136,7 @@ epollthread/
 │   │   ├── client.cpp        # Client 实现
 │   │   └── clienthandler.cpp # ClientHandler 实现
 │   └── common/               # 公共模块源码
+│       ├── poller.cpp        # Poller 实现
 │       ├── mysocket.cpp      # Socket 实现（含 SSL）
 │       ├── myepoll.cpp       # Epoll 实现
 │       ├── mylogger.cpp      # Logger 实现
@@ -140,7 +152,10 @@ epollthread/
 │   ├── test_http_parser.cpp  # HTTP 解析器测试
 │   ├── test_file_cache.cpp   # LRU 缓存测试
 │   ├── test_http_response.cpp# HTTP 响应测试
-│   └── test_route_utils.cpp  # 路由匹配测试
+│   ├── test_route_utils.cpp  # 路由匹配测试
+│   ├── test_auth_and_rate_limit.cpp # API Key 和限流测试
+│   ├── test_http_client.cpp  # upstream 超时和错误分类测试
+│   └── test_upstream_manager.cpp # upstream 健康检查测试
 ├── www/                      # 静态文件根目录
 │   ├── index.html
 │   └── big.html
@@ -229,16 +244,40 @@ cmake --build build -j$(nproc)
             "algorithm": "round_robin"
         }
     },
-    "routes": [                     // 反向代理路由（转发到上游）
-        {"method": "GET", "path": "/api/test/*", "upstream": "test-service"}
+    "upstream_health_check_timeout_ms": 500, // 上游 TCP 健康检查超时（毫秒）
+    "routes": [                     // 配置驱动路由
+        {
+            "name": "test-service-api",
+            "method": "GET",
+            "path": "/api/test/*",
+            "host": "*",
+            "tenant": "*",
+            "target_type": "upstream",
+            "upstream_target": {
+                "name": "test-service",
+                "timeout_ms": 5000
+            },
+            "auth_required": true,
+            "allowed_api_keys": ["test-key-123", "premium-key-456"]
+        }
     ],
     "rate_limit": {                 // 默认限流（令牌桶）
         "capacity": 20,
         "refill_per_second": 5
     },
-    "api_keys": [                   // API Key 及其差异化限流额度
-        {"key": "test-key-123", "name": "测试客户端", "rate_limit": {"capacity": 200, "refill_per_second": 100}},
-        {"key": "premium-key-456", "name": "高级客户端", "rate_limit": {"capacity": 1000, "refill_per_second": 500}}
+    "api_keys": [                   // API Key、限流额度和 host/tenant 范围
+        {
+            "key": "test-key-123",
+            "name": "测试客户端",
+            "rate_limit": {"capacity": 200, "refill_per_second": 100},
+            "allowed_hosts": ["*"],
+            "allowed_tenants": ["*"]
+        },
+        {
+            "key": "premium-key-456",
+            "name": "高级客户端",
+            "rate_limit": {"capacity": 1000, "refill_per_second": 500}
+        }
     ]
 }
 ```
@@ -260,6 +299,9 @@ cd build
 cmake .. -DBUILD_TESTS=ON
 cmake --build . -j$(nproc)
 ./tests/runTests
+
+# 或使用 CTest
+ctest --test-dir build --output-on-failure
 ```
 
 ## Docker 构建与运行
@@ -315,7 +357,7 @@ docker stop my-server && docker rm my-server
 | `GET` | `/users/{id}` | 动态路由，返回模拟用户数据 |
 | `GET` | `/chunked` | Chunked 分块传输演示 |
 | `GET` | `/metrics` | Prometheus 指标端点（文本格式） |
-| `GET` | `/api/test/*` | 反向代理（转发至 `test-service` 上游，由配置驱动） |
+| `GET` | `/api/test/*` | 配置驱动反向代理，通过 `upstream_target.name` 转发至 `test-service` |
 | `GET` | `/<path>` | 静态文件服务（默认行为） |
 
 ## Prometheus + Grafana 监控

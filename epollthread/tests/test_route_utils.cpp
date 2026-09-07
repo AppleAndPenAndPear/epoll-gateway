@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "config.h"
 #include "route_utils.h"
 
 TEST(RouteUtilsTest, ExactMatch) {
@@ -31,4 +32,29 @@ TEST(RouteUtilsTest, MismatchedSegmentCount) {
 TEST(RouteUtilsTest, NonParamMismatch) {
     std::map<std::string, std::string> params;
     EXPECT_FALSE(matchRoute("/users/{id}", "/admin/123", params));
+}
+
+TEST(RouteUtilsTest, RouteMetadataMatchByHostMethodAndTenant) {
+    GatewayRoute route;
+    route.method = "GET";
+    route.path = "/v1/users/{id}";
+    route.host = "api.example.com";
+    route.tenant = "tenant-a";
+
+    std::map<std::string, std::string> params;
+    EXPECT_TRUE(routeMatchesRequest(route, "GET", "api.example.com", "tenant-a", "/v1/users/123", params));
+    EXPECT_EQ(params["id"], "123");
+}
+
+TEST(RouteUtilsTest, RouteMetadataRejectsWrongHostOrTenant) {
+    GatewayRoute route;
+    route.method = "GET";
+    route.path = "/v1/users/{id}";
+    route.host = "api.example.com";
+    route.tenant = "tenant-a";
+
+    std::map<std::string, std::string> params;
+    EXPECT_FALSE(routeMatchesRequest(route, "GET", "api.other.com", "tenant-a", "/v1/users/123", params));
+    EXPECT_FALSE(routeMatchesRequest(route, "GET", "api.example.com", "tenant-b", "/v1/users/123", params));
+    EXPECT_FALSE(routeMatchesRequest(route, "POST", "api.example.com", "tenant-a", "/v1/users/123", params));
 }

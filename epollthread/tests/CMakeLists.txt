@@ -4,7 +4,11 @@ add_executable(runTests
     test_http_response.cpp
     test_route_utils.cpp
     test_auth_and_rate_limit.cpp
+    test_http_client.cpp
+    test_upstream_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp
 )
 
 # 链接你的公共库和 gtest

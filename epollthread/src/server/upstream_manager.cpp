@@ -1,12 +1,15 @@
 #include "upstream_manager.h"
+#include "mysocket.h"
+#include "poller.h"
 #include "mylogger.h"
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <stdexcept>
+#include <tuple>
+#include <vector>
 
-UpstreamManager::UpstreamManager(const UpstreamConfig& config) : config_(config) {}
+UpstreamManager::UpstreamManager(const UpstreamConfig& config)
+    : config_(config), health_check_timeout_ms_(config.health_check_timeout_ms) {}
 
 const UpstreamServer& UpstreamManager::pick_server(const std::string& upstream_name) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -33,45 +36,74 @@ const UpstreamServer& UpstreamManager::pick_server(const std::string& upstream_n
 }
 
 void UpstreamManager::check_health() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    struct ProbeTarget {
+        std::string upstream_name;
+        size_t server_index;
+        std::string host;
+        int port;
+    };
 
-    for (auto& [name, upstream] : config_.upstreams) {
-        for (auto& server : upstream.servers) {
-            bool ok = health_probe(server.host, server.port);
-            if (!ok && server.healthy) {
-                Logger::get()->warn("Upstream {} server {}:{} is down", name, server.host, server.port);
-                server.healthy = false;
-                server.consecutive_failures++;
-            } else if (ok && !server.healthy) {
-                Logger::get()->info("Upstream {} server {}:{} is back online", name, server.host, server.port);
-                server.healthy = true;
-                server.consecutive_failures = 0;
-            } else if (!ok) {
-                server.consecutive_failures++;
-            } else {
-                server.consecutive_failures = 0;
+    std::vector<ProbeTarget> targets;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [name, upstream] : config_.upstreams) {
+            for (size_t index = 0; index < upstream.servers.size(); ++index) {
+                const auto& server = upstream.servers[index];
+                targets.push_back({name, index, server.host, server.port});
             }
+        }
+    }
+
+    std::vector<std::tuple<std::string, size_t, bool>> results;
+    results.reserve(targets.size());
+    for (const auto& target : targets) {
+        results.emplace_back(target.upstream_name, target.server_index,
+                             health_probe(target.host, target.port));
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [name, index, ok] : results) {
+        auto upstream_it = config_.upstreams.find(name);
+        if (upstream_it == config_.upstreams.end() || index >= upstream_it->second.servers.size()) {
+            continue;
+        }
+        auto& server = upstream_it->second.servers[index];
+        if (!ok && server.healthy) {
+            Logger::get()->warn("Upstream {} server {}:{} is down", name, server.host, server.port);
+            server.healthy = false;
+            server.consecutive_failures++;
+        } else if (ok && !server.healthy) {
+            Logger::get()->info("Upstream {} server {}:{} is back online", name, server.host, server.port);
+            server.healthy = true;
+            server.consecutive_failures = 0;
+        } else if (!ok) {
+            server.consecutive_failures++;
+        } else {
+            server.consecutive_failures = 0;
         }
     }
 }
 
-bool UpstreamManager::health_probe(const std::string& host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+bool UpstreamManager::health_probe(const std::string& host, int port) const {
+    try {
+        Socket socket(AF_INET, SOCK_STREAM, 0);
+        socket.setnonblocking();
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        close(fd);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        if (inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1) {
+            return false;
+        }
+
+        if (socket.connect(reinterpret_cast<const sockaddr*>(&address), sizeof(address))) {
+            return true;
+        }
+
+        const auto result = Poller::wait(socket.getFd(), Poller::Event::Write,
+                                         health_check_timeout_ms_);
+        return result == Poller::WaitResult::Ready && socket.socketError() == 0;
+    } catch (const std::exception&) {
         return false;
     }
-
-    if (connect(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return false;
-    }
-
-    close(fd);
-    return true;
 }
