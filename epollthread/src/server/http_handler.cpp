@@ -20,7 +20,80 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "upstream_manager.h"
+#include <atomic>
+#include <cstdint>
 using json = nlohmann::json;
+
+namespace {
+
+std::atomic<uint64_t> g_trace_counter{0};
+
+std::string generate_trace_id() {
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const uint64_t seq = ++g_trace_counter;
+    std::ostringstream oss;
+    oss << std::hex << std::setw(8) << std::setfill('0') << (now_ns & 0xffffffffULL)
+        << std::setw(8) << std::setfill('0') << (seq & 0xffffffffULL);
+    return oss.str();
+}
+
+std::string classify_failure_reason(int status_code, const BackendError* error = nullptr) {
+    if (status_code >= 200 && status_code < 400) return "none";
+    if (status_code == 401) return "auth_failed";
+    if (status_code == 403) return "forbidden";
+    if (status_code == 404) return "route_not_found";
+    if (status_code == 405) return "method_not_allowed";
+    if (status_code == 413) return "payload_too_large";
+    if (status_code == 429) return "rate_limited";
+    if (status_code == 503) return "upstream_circuit_open";
+    if (status_code == 502) return error == nullptr ? "upstream_unavailable" : "upstream_unavailable";
+    if (status_code == 504) return "upstream_timeout";
+    if (status_code == 500) return "internal_error";
+    if (error != nullptr) {
+        switch (*error) {
+            case BackendError::ConnectFailed: return "connect_failed";
+            case BackendError::ConnectTimeout: return "connect_timeout";
+            case BackendError::WriteFailed: return "write_failed";
+            case BackendError::WriteTimeout: return "write_timeout";
+            case BackendError::ReadFailed: return "read_failed";
+            case BackendError::ReadTimeout: return "read_timeout";
+            case BackendError::InvalidResponse: return "invalid_upstream_response";
+            default: return "unknown_error";
+        }
+    }
+    return "unknown_error";
+}
+
+std::string redact_api_key(const std::string& key) {
+    if (key.empty()) {
+        return "anonymous";
+    }
+    if (key.size() <= 8) {
+        return "[redacted]";
+    }
+    return key.substr(0, 4) + "..." + key.substr(key.size() - 4);
+}
+
+void emit_audit_log(const HttpRequest& req, int status_code, const std::string& failure_reason, const std::string& route_name, const std::string& host, const std::string& tenant) {
+    const std::string trace_id = req.trace_id.empty() ? "unknown" : req.trace_id;
+    const std::string key = req.headers.count("x-api-key") ? req.headers.at("x-api-key") : "";
+    const std::string api_key = redact_api_key(key);
+    Logger::get()->info(
+        "AUDIT trace_id={} method={} path={} host={} tenant={} route={} status={} failure={} api_key={} user_agent={}",
+        trace_id,
+        req.method,
+        req.path,
+        host,
+        tenant,
+        route_name,
+        status_code,
+        failure_reason,
+        api_key,
+        req.headers.count("user-agent") ? req.headers.at("user-agent") : "-");
+}
+
+} // anonymous namespace
 
 static std::string to_hex(size_t n) {
     std::ostringstream oss;
@@ -34,6 +107,20 @@ cache_(config.cache_max_entries, config.cache_max_file_size_mb),
 upstream_manager_(upstream_manager), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
     register_default_routes();
     register_configured_routes();
+}
+
+void HttpHandler::reload_config(const Config& config) {
+    config_ = config;
+    www_root_ = config.www_root;
+    upstream_manager_.reload(config.upstream_config);
+    api_key_manager_.reload(config.api_keys);
+    rate_limiter_manager_->update_default_config(config.rate_limit_config);
+    routes_.clear();
+    register_default_routes();
+    register_configured_routes();
+    Logger::get()->info("Runtime configuration reloaded: {} routes, {} upstreams",
+                        config_.upstream_config.routes.size(),
+                        config_.upstream_config.upstreams.size());
 }
 
 void HttpHandler::register_default_routes() {
@@ -161,16 +248,36 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         // 获取已解析好的请求引用
                         auto& req = requests_[sock_ptr];
 
+                        const auto host_it = req.headers.find("host");
+                        const auto tenant_it = req.headers.find("x-tenant-id");
+                        if (host_it != req.headers.end()) req.host = host_it->second;
+                        if (tenant_it != req.headers.end()) req.tenant = tenant_it->second;
+                        if (req.trace_id.empty()) {
+                            req.trace_id = req.headers.count("x-trace-id") ? req.headers["x-trace-id"] : generate_trace_id();
+                        }
+                        req.headers["x-trace-id"] = req.trace_id;
+
                         auto resolved = resolve_route(req);
                         if (!resolved.route) {
-                            Logger::get()->warn("No matching route for {} {} on fd {}", req.method, req.path, fd);
+                            if (resolved.path_matched) {
+                                Logger::get()->debug("Method {} is not allowed for {} on fd {}",
+                                                     req.method, req.path, fd);
+                                last_requests_[sock_ptr] = req;
+                                send_error_response(sock_ptr, 405, "Method Not Allowed", resolved.allow_methods);
+                                parsers_[sock_ptr].reset();
+                                continue;
+                            }
+                            // 未命中路由时仍交给 send_response 处理，允许静态文件 fallback 决定最终结果。
+                            Logger::get()->debug("No matching route for {} {} on fd {}", req.method, req.path, fd);
                             last_requests_[sock_ptr] = req;
-                            send_error_response(sock_ptr, 404, "Not Found");
+                            send_response(sock_ptr, req, resolved);
                             parsers_[sock_ptr].reset();
                             continue;
                         }
 
                         const GatewayRoute& route_policy = resolved.route->route;
+                        const std::string route_name = route_policy.name.empty() ? route_policy.path : route_policy.name;
+                        req.headers["x-route-name"] = route_name;
 
                         // ─── 鉴权检查：由路由策略决定是否需要 auth ───
                         const ApiKeyConfig* api_key_cfg = nullptr;
@@ -181,7 +288,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             const std::string host = host_it == req.headers.end() ? "" : host_it->second;
                             const std::string tenant = tenant_it == req.headers.end() ? "" : tenant_it->second;
                             if (key.empty() || !api_key_manager_.authorize(key, route_policy, host, tenant)) {
-                                Logger::get()->warn("Authentication failed for {} {} on fd {}", req.method, req.path, fd);
+                                Logger::get()->debug("Authentication failed for {} {} on fd {}", req.method, req.path, fd);
                                 last_requests_[sock_ptr] = req;
                                 send_error_response(sock_ptr, 401, "Unauthorized");
                                 parsers_[sock_ptr].reset();
@@ -192,7 +299,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
 
                         // ─── 限流检查：按 route_policy 决定策略 ───
                         if (should_rate_limit(req, route_policy, client_ip, api_key_cfg)) {
-                            Logger::get()->warn("Rate limit exceeded for {} {} on fd {}", req.method, req.path, fd);
+                            Logger::get()->debug("Rate limit exceeded for {} {} on fd {}", req.method, req.path, fd);
                             last_requests_[sock_ptr] = req;
                             send_error_response(sock_ptr, 429, "Too Many Requests");
                             parsers_[sock_ptr].reset();
@@ -201,7 +308,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
 
                         // ─── 方法合法性检查（最后再决定是否允许进入路由处理） ───
                         if (req.method != "GET" && req.method != "HEAD" && req.method != "POST" && req.method != "PUT" && req.method != "DELETE") {
-                            Logger::get()->warn("HTTP method not allowed: {} on fd {}", req.method, fd);
+                            Logger::get()->debug("HTTP method not allowed: {} on fd {}", req.method, fd);
                             last_requests_[sock_ptr] = req;
                             send_error_response(sock_ptr, 405, "Method Not Allowed");
                             parsers_[sock_ptr].reset();
@@ -211,7 +318,8 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         //记录user-agent（key 已统一小写）
                         auto ua_it = req.headers.find("user-agent");
                         std::string user_agent = (ua_it != req.headers.end()) ? ua_it->second : "-";
-                        Logger::get()->info("Request: {} {} {} - UA: {}", req.method, req.path, req.version, user_agent);
+                        // CLF 在响应完成后记录完整访问结果；这里保留入口诊断，但避免生产 info 日志重复。
+                        Logger::get()->debug("Request: {} {} {} - UA: {}", req.method, req.path, req.version, user_agent);
 
                         // 检查 connection 头，决定 keep-alive（key 已统一小写）
                         auto it = req.headers.find("connection");
@@ -224,7 +332,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         }
 
                         // 准备响应（使用本次解析出的 request）
-                        send_response(sock_ptr, req);  // 你需要调整 send_response
+                        send_response(sock_ptr, req, resolved);
 
                         // 重置解析器，为下一个请求做准备
                         parsers_[sock_ptr].reset();
@@ -236,6 +344,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                     if (parsers_[sock_ptr].is_body_too_large()) {
                         Logger::get()->warn("Request body too large (>{}) on fd {}",
                             HttpParser::MAX_BODY_SIZE, fd);
+                        last_requests_[sock_ptr] = requests_[sock_ptr];
                         send_error_response(sock_ptr, 413, "Payload Too Large");
                         // 清除部分已消费的数据
                         if (consumed > 0) read_buf.erase(0, consumed);
@@ -282,7 +391,8 @@ void HttpHandler::process_request(Socket* sock_ptr){
     } else {
         keep_alive_[sock_ptr] = true; // HTTP/1.1 默认 keep-alive
     }
-    send_response(sock_ptr, req);          // 准备响应
+    auto matched = resolve_route(req);
+    send_response(sock_ptr, req, matched); // 准备响应
     request_ready_[sock_ptr] = false; // 允许解析下一个请求
     parsers_[sock_ptr].reset();       // 重置解析器状态
 }
@@ -306,6 +416,14 @@ HttpHandler::ResolvedRoute HttpHandler::resolve_route(const HttpRequest& req) co
         const auto tenant_it = req.headers.find("x-tenant-id");
         const std::string host = host_it == req.headers.end() ? "" : host_it->second;
         const std::string tenant = tenant_it == req.headers.end() ? "" : tenant_it->second;
+        if (routeMatchesPath(registered.route, host, tenant, req.path, params)) {
+            matched.path_matched = true;
+            const std::string method = registered.route.method.empty() ? "*" : registered.route.method;
+            if (!matched.allow_methods.empty()) {
+                matched.allow_methods += ", ";
+            }
+            matched.allow_methods += method;
+        }
         if (routeMatchesRequest(registered.route, req.method, host, tenant, req.path, params)) {
             matched.route = &registered;
             matched.params = std::move(params);
@@ -344,10 +462,29 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         }
 
         const auto& server = upstream_manager_.pick_server(upstream_name);
-        BackendResponse be = forward_request(server.host, server.port, req.method, req.path,
-                                             req.headers, req.body,
-                                             route.upstream_target.timeout_ms);
+        // 熔断判断发生在连接后端之前；被熔断时不产生新的后端连接。
+        if (!upstream_manager_.allow_request(upstream_name, server,route.upstream_target.circuit_recovery_timeout_ms)) {
+            resp = make_error_response(503, "Service Unavailable", "Upstream circuit is open");
+            return;
+        }
+
+        BackendResponse be;
+        be.status_code = 502;
+        be.body = "Bad Gateway";
+        be.error = BackendError::ConnectFailed;
+        int attempt_count = 0;
+        while (true) {
+            be = forward_request(server.host, server.port, req.method, req.path,
+                                 req.headers, req.body,
+                                 route.upstream_target.timeout_ms);
+            if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
+                !should_retry_backend_request(req.method, be.error, attempt_count)) {
+                break;
+            }
+            ++attempt_count;
+        }
         if (be.error != BackendError::None) {
+            upstream_manager_.record_failure(upstream_name, server,route.upstream_target.circuit_failure_threshold,route.upstream_target.circuit_recovery_timeout_ms);
             Metrics::instance().record_upstream_error(be.error);
             const bool timed_out = be.error == BackendError::ConnectTimeout ||
                                    be.error == BackendError::WriteTimeout ||
@@ -359,6 +496,7 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
                           : "The upstream service returned an invalid response or could not be reached");
             return;
         }
+        upstream_manager_.record_success(upstream_name, server);
         resp.status_code = be.status_code;
         resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
         resp.body = be.body;
@@ -370,10 +508,34 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
     }
 
     if (matched.route->route.target_type == "static") {
+        std::string static_root = matched.route->route.static_root.empty() ? config_.www_root : matched.route->route.static_root;
+        std::string resolved;
+        const std::string request_path = req.path.empty() ? "/" : req.path;
+        if (!is_safe_static_path("/", request_path, static_root, resolved)) {
+            resp.status_code = 403;
+            resp.status_message = "Forbidden";
+            resp.body = "<h1>403 Forbidden</h1>";
+            resp.headers["Content-Type"] = "text/html";
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+            return;
+        }
+
+        std::ifstream file(resolved, std::ios::binary);
+        if (!file.is_open()) {
+            resp.status_code = 404;
+            resp.status_message = "Not Found";
+            resp.body = "<h1>404 Not Found</h1>";
+            resp.headers["Content-Type"] = "text/html";
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+            return;
+        }
+
+        std::ostringstream buffer;
+        buffer << file.rdbuf();
         resp.status_code = 200;
         resp.status_message = "OK";
-        resp.body = "<h1>Static route dispatched</h1>";
-        resp.headers["Content-Type"] = "text/html";
+        resp.body = buffer.str();
+        resp.headers["Content-Type"] = get_content_type(resolved);
         resp.headers["Content-Length"] = std::to_string(resp.body.size());
         return;
     }
@@ -385,27 +547,37 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
     resp.headers["Content-Length"] = std::to_string(resp.body.size());
 }
 
-void HttpHandler::send_response(Socket* sock, const HttpRequest& req){
+void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched){
     last_requests_[sock] = req;
     HttpResponse resp;
+    resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
     std::string path = req.path;
 
     // 默认首页
     if (path.empty() || path == "/") path = "/index.html"; // 默认首页
 
-    auto matched = resolve_route(req);
     bool path_handled = false;
 
     if (matched.route) {
         dispatch_route(req, matched, resp);
+        resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
         path_handled = true;
     }
 
     bool already_compressed = false;
     
     if (!path_handled) {
-        //防止目录遍历攻击，简单处理：不允许 ".."
-        if (path.find("..") != std::string::npos) {
+        // 未匹配路由时，静态 fallback 只允许 GET/HEAD，避免 POST 等方法读取静态资源。
+        if (req.method != "GET" && req.method != "HEAD") {
+            resp.status_code = 405;
+            resp.status_message = "Method Not Allowed";
+            resp.body = "<h1>405 Method Not Allowed</h1>";
+            resp.headers["Content-Length"] = std::to_string(resp.body.size());
+            resp.headers["Content-Type"] = "text/html";
+            resp.chunked = false;
+        }
+        // 防止目录遍历攻击，简单处理：不允许 ".."
+        else if (path.find("..") != std::string::npos) {
             // 返回 403 Forbidden
             resp.status_code = 403;
             resp.status_message = "Forbidden";
@@ -671,10 +843,17 @@ after_file:
     epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
 }
 
-void HttpHandler::send_error_response(Socket* sock, int code, const std::string& message){
+void HttpHandler::send_error_response(Socket* sock, int code, const std::string& message,const std::string& allow_methods){
     HttpResponse resp = make_error_response(code, message, message);
+    auto req_it = last_requests_.find(sock);
+    if (req_it != last_requests_.end() && !req_it->second.trace_id.empty()) {
+        resp.headers["X-Trace-Id"] = req_it->second.trace_id;
+    }
     keep_alive_[sock] = false;
     resp.headers["Connection"] = "close";
+    if (!allow_methods.empty()) {
+        resp.headers["Allow"] = allow_methods;
+    }
 
     std::string header = headers_to_string(resp);
     auto& queue = send_queues_[sock];
@@ -847,7 +1026,33 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     double duration = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start_it->second).count();
                     Metrics::instance().record_request(status_it->second, duration);
+                    std::string route_name = "-";
+                    auto req_it = last_requests_.find(sock_ptr);
+                    if (req_it != last_requests_.end()) {
+                        const auto& req = req_it->second;
+                        if (req.headers.count("x-route-name") != 0) {
+                            route_name = req.headers.at("x-route-name");
+                        } else if (req.path.rfind("/", 0) == 0) {
+                            route_name = req.path;
+                        }
+                        Metrics::instance().record_route_request(route_name, req.host, req.tenant, status_it->second, duration);
+                    }
                     // 注意：这里我们不删除 start_time，因为后面 CLF 日志可能还要用，或者我们可以在记录完 CLF 后再删除
+                }
+
+                // 响应真正发送完成后统一写审计日志，避免在鉴权/限流/路由分支重复记录。
+                auto audit_request_it = last_requests_.find(sock_ptr);
+                if (audit_request_it != last_requests_.end() && status_it != resp_status_.end() &&
+                    status_it->second >= 400) {
+                    const auto& audit_request = audit_request_it->second;
+                    const auto route_it = audit_request.headers.find("x-route-name");
+                    const std::string route_name = route_it == audit_request.headers.end() ? "-" : route_it->second;
+                    emit_audit_log(audit_request,
+                                   status_it->second,
+                                   classify_failure_reason(status_it->second),
+                                   route_name,
+                                   audit_request.host.empty() ? "-" : audit_request.host,
+                                   audit_request.tenant.empty() ? "-" : audit_request.tenant);
                 }
 
                 // ★ 新增：记录 CLF 格式的访问日志

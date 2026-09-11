@@ -15,6 +15,11 @@ public:
     explicit RateLimiterManager(const RateLimitConfig& default_config)
         : default_config_(default_config) {}
 
+    void update_default_config(const RateLimitConfig& config) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        default_config_ = config;
+    }
+
     // 使用默认配置尝试获取令牌
     bool try_acquire(const std::string& key) {
         return try_acquire(key, default_config_);

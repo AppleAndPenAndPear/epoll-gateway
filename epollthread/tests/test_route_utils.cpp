@@ -58,3 +58,21 @@ TEST(RouteUtilsTest, RouteMetadataRejectsWrongHostOrTenant) {
     EXPECT_FALSE(routeMatchesRequest(route, "GET", "api.example.com", "tenant-b", "/v1/users/123", params));
     EXPECT_FALSE(routeMatchesRequest(route, "POST", "api.example.com", "tenant-a", "/v1/users/123", params));
 }
+
+TEST(RouteUtilsTest, SeparatesPathMatchFromMethodMatch) {
+    GatewayRoute route;
+    route.method = "GET";
+    route.path = "/v1/orders";
+
+    std::map<std::string, std::string> params;
+    EXPECT_TRUE(routeMatchesPath(route, "api.example.com", "tenant-a", "/v1/orders", params));
+    EXPECT_FALSE(routeMatchesRequest(route, "POST", "api.example.com", "tenant-a", "/v1/orders", params));
+}
+
+TEST(RouteUtilsTest, StaticRootRejectsPathTraversal) {
+    std::string resolved;
+    EXPECT_FALSE(is_safe_static_path("/static", "/static/../../etc/passwd", "/var/www", resolved));
+    EXPECT_FALSE(is_safe_static_path("/static", "/static/..", "/var/www", resolved));
+    EXPECT_TRUE(is_safe_static_path("/static", "/static/index.html", "/var/www", resolved));
+    EXPECT_TRUE(resolved.find("/var/www/index.html") != std::string::npos);
+}

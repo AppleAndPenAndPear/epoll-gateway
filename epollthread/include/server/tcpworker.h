@@ -7,6 +7,7 @@
 #include "upstream_manager.h"
 
 extern std::atomic<bool> stop_server_flag;
+extern std::atomic<uint64_t> config_reload_generation;
 
 class TcpWorker {
 private:
@@ -32,13 +33,15 @@ private:
   time_t last_timeout_check_ = 0; // 上次执行超时检查的时间
   time_t last_limiter_cleanup_ = 0; // 上次清理限流器的时间
   std::unordered_map<int, std::string> client_ips_; // 记录客户端 IP 地址，便于日志输出
+  std::string config_path_;
+  uint64_t applied_reload_generation_ = 0;
 
   void update_active(int fd);
   void check_timeout();
 
   SSL_CTX* ssl_ctx_ = nullptr;
 public:
-  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
+  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path);
 
   void run();
   void handle_accept();

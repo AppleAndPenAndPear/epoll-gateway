@@ -7,7 +7,10 @@ struct HttpRequest {
     std::string method;
     std::string path;
     std::string version;
-    std::string query;   // 新增
+    std::string query;
+    std::string trace_id;       //记录请求的 trace_id，便于日志追踪
+    std::string host;
+    std::string tenant;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 
@@ -16,6 +19,9 @@ struct HttpRequest {
         path.clear();
         version.clear();
         query.clear();
+        trace_id.clear();
+        host.clear();
+        tenant.clear();
         headers.clear();
         body.clear();
     }

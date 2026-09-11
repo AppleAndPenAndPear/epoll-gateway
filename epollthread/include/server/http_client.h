@@ -21,6 +21,10 @@ struct BackendResponse {
 
 using BackendError = BackendResponse::Error;
 
+bool should_retry_backend_request(const std::string& method,
+                                 BackendError error,
+                                 int attempt_count);
+
 BackendResponse forward_request(const std::string& host, int port,
                                 const std::string& method,
                                 const std::string& path,

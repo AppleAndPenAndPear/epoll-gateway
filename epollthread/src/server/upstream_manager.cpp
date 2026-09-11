@@ -7,9 +7,78 @@
 #include <stdexcept>
 #include <tuple>
 #include <vector>
+#include <algorithm>
 
 UpstreamManager::UpstreamManager(const UpstreamConfig& config)
     : config_(config), health_check_timeout_ms_(config.health_check_timeout_ms) {}
+
+namespace {
+std::string circuit_key(const std::string& upstream_name, const UpstreamServer& server) {
+    return upstream_name + "|" + server.host + ":" + std::to_string(server.port);
+}
+}
+
+void UpstreamManager::reload(const UpstreamConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_ = config;
+    health_check_timeout_ms_ = config.health_check_timeout_ms;
+    round_robin_indices_.clear();
+    circuit_states_.clear();
+}
+
+bool UpstreamManager::allow_request(const std::string& upstream_name,
+                                    const UpstreamServer& server,
+                                    int recovery_timeout_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = circuit_states_[circuit_key(upstream_name, server)];
+
+    // CLOSED：当前没有达到失败阈值，正常放行请求。
+    if (!state.open) {
+        return true;
+    }
+
+    // OPEN：后端刚刚连续失败，先进入冷却窗口，不继续放大故障流量。
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - state.opened_at).count();
+
+    // 冷却未结束，或者已有其他请求占用了半开探测名额，直接拒绝。
+    if (elapsed < recovery_timeout_ms || state.half_open_probe) {
+        return false;
+    }
+
+    // HALF-OPEN：冷却结束，只放行一个探测请求；结果由 record_success/failure 决定。
+    state.half_open_probe = true;
+    return true;
+}
+
+void UpstreamManager::record_success(const std::string& upstream_name,
+                                     const UpstreamServer& server) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = circuit_states_[circuit_key(upstream_name, server)];
+    // 探测或普通请求成功，清空失败计数并关闭熔断，恢复正常放行。
+    state.consecutive_failures = 0;
+    state.open = false;
+    state.half_open_probe = false;
+}
+
+void UpstreamManager::record_failure(const std::string& upstream_name,
+                                     const UpstreamServer& server,
+                                     int failure_threshold,
+                                     int recovery_timeout_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = circuit_states_[circuit_key(upstream_name, server)];
+    // 最终失败结果（包括本次请求允许的重试都失败）才会累计熔断失败次数。
+    state.half_open_probe = false;
+    state.consecutive_failures++;
+    if (state.consecutive_failures >= std::max(1, failure_threshold)) {
+        // OPEN：达到阈值，记录打开时间，后续请求进入恢复等待窗口。
+        state.open = true;
+        state.opened_at = std::chrono::steady_clock::now();
+        Logger::get()->warn("Circuit opened for upstream {} server {}:{} for {} ms after {} failures",
+                            upstream_name, server.host, server.port,
+                            recovery_timeout_ms, state.consecutive_failures);
+    }
+}
 
 const UpstreamServer& UpstreamManager::pick_server(const std::string& upstream_name) {
     std::lock_guard<std::mutex> lock(mutex_);

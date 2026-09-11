@@ -18,6 +18,31 @@ BackendResponse make_error_response(int status_code, BackendError error, const s
     return response;
 }
 
+bool is_transient_backend_error(BackendError error) {
+    switch (error) {
+        case BackendError::ConnectFailed:
+        case BackendError::ConnectTimeout:
+        case BackendError::WriteFailed:
+        case BackendError::WriteTimeout:
+        case BackendError::ReadFailed:
+        case BackendError::ReadTimeout:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}
+
+bool should_retry_backend_request(const std::string& method,
+                                 BackendError error,
+                                 int attempt_count) {
+    if (attempt_count >= 2) {
+        return false;
+    }
+
+    const bool idempotent = method == "GET" || method == "HEAD" || method == "OPTIONS";
+    return idempotent && is_transient_backend_error(error);
 }
 
 BackendResponse forward_request(const std::string& host, int port,

@@ -6,6 +6,7 @@
 #include <map>
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 
 inline std::string normalize_header_value(const std::string& value) {
     std::string normalized = value;
@@ -56,17 +57,12 @@ inline bool matchRoute(const std::string& pattern, const std::string& path,std::
     return true;
 }
 
-inline bool routeMatchesRequest(const GatewayRoute& route,
-                               const std::string& method,
-                               const std::string& host,
-                               const std::string& tenant,
-                               const std::string& path,
-                               std::map<std::string, std::string>& params) {
+inline bool routeMatchesPath(const GatewayRoute& route,
+                             const std::string& host,
+                             const std::string& tenant,
+                             const std::string& path,
+                             std::map<std::string, std::string>& params) {
     if (!route.enabled) {
-        return false;
-    }
-
-    if (!route.method.empty() && route.method != "*" && route.method != method) {
         return false;
     }
 
@@ -83,4 +79,65 @@ inline bool routeMatchesRequest(const GatewayRoute& route,
     }
 
     return matchRoute(route.path, path, params);
+}
+
+inline bool routeMatchesRequest(const GatewayRoute& route,
+                               const std::string& method,
+                               const std::string& host,
+                               const std::string& tenant,
+                               const std::string& path,
+                               std::map<std::string, std::string>& params) {
+    if (!routeMatchesPath(route, host, tenant, path, params)) {
+        return false;
+    }
+    return route.method.empty() || route.method == "*" || route.method == method;
+}
+
+inline bool is_safe_static_path(const std::string& mount_path,      //mount_path：挂载点，例如 /static
+                                const std::string& request_path,
+                                const std::string& root_dir,        //root_dir：静态文件根目录，例如 /var/www
+                                std::string& resolved_path) {       //resolved_path：如果合法，输出最终安全文件路径
+    std::error_code ec;
+    std::filesystem::path root = std::filesystem::weakly_canonical(root_dir, ec);
+    if (ec) {
+        return false;
+    }
+
+    std::string suffix = request_path;
+    if (!mount_path.empty() && suffix.rfind(mount_path, 0) == 0) {
+        suffix = suffix.substr(mount_path.size());
+    }
+    if (suffix.empty()) {
+        suffix = "/";
+    }
+    if (suffix == "/") {
+        suffix = "/index.html";
+    }
+
+    //防止路径穿越
+    while (!suffix.empty() && suffix[0] == '/') {
+        suffix.erase(0, 1);
+    }
+    if (suffix.find("..") != std::string::npos) {
+        return false;
+    }
+
+    std::filesystem::path candidate = root / std::filesystem::path(suffix).lexically_normal();
+    std::filesystem::path canonical_root = std::filesystem::weakly_canonical(root, ec);
+    if (ec) {
+        return false;
+    }
+    std::filesystem::path canonical_candidate = std::filesystem::weakly_canonical(candidate, ec);
+    if (ec) {
+        return false;
+    }
+
+    const std::string root_str = canonical_root.string();
+    const std::string candidate_str = canonical_candidate.string();
+    if (candidate_str.rfind(root_str, 0) != 0) {
+        return false;
+    }
+
+    resolved_path = canonical_candidate.string();
+    return true;
 }

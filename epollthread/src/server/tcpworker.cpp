@@ -3,9 +3,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <fstream>
 
 
-TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager):
+TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path):
   listen_sock_(std::move(listen_sock)),
   pool_(pool),
   closed_(false),
@@ -14,7 +15,9 @@ TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config
   api_key_manager_(config.api_keys),
   rate_limiter_manager_(std::move(rate_limiter_manager)),
   handler_(epoll_, config, upstream_manager_, api_key_manager_, rate_limiter_manager_),
-  keepalive_timeout_(config.keepalive_timeout) {
+  keepalive_timeout_(config.keepalive_timeout),
+  config_path_(config_path),
+  applied_reload_generation_(config_reload_generation.load(std::memory_order_relaxed)) {
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
 
   SSL_library_init();
@@ -31,7 +34,19 @@ void TcpWorker::update_active(int fd) {
 }
 
 void TcpWorker::check_timeout() {
-    time_t now = time(nullptr);
+  time_t now = time(nullptr);
+  const uint64_t reload_generation = config_reload_generation.load(std::memory_order_relaxed);
+  if (reload_generation != applied_reload_generation_) {
+    std::ifstream config_file(config_path_);
+    if (!config_file.is_open() || !Config::is_valid_file(config_path_)) {
+      Logger::get()->error("Runtime configuration reload skipped: invalid or unavailable {}", config_path_);
+    } else {
+      Config reloaded = Config::from_file(config_path_);
+      handler_.reload_config(reloaded);
+      keepalive_timeout_ = reloaded.keepalive_timeout;
+      applied_reload_generation_ = reload_generation;
+    }
+  }
     for (auto it = last_active_.begin(); it != last_active_.end(); ) {
         int fd = it->first;
         // 如果 fd 已经无效（被关闭），直接移除记录

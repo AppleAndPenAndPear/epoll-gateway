@@ -23,3 +23,23 @@ TEST(UpstreamManagerTest, HealthCheckMarksUnavailableServerUnhealthy) {
     EXPECT_GE(server.consecutive_failures, 1);
     EXPECT_LT(elapsed.count(), 500);
 }
+
+TEST(UpstreamManagerTest, CircuitOpensAfterFailuresAndAllowsRecoveryProbe) {
+    UpstreamConfig config;
+    config.upstreams["backend"] = Upstream{
+        {UpstreamServer{"127.0.0.1", 1}},
+        "round_robin"
+    };
+
+    UpstreamManager manager(config);
+    const auto& server = manager.config().upstreams.at("backend").servers.at(0);
+
+    EXPECT_TRUE(manager.allow_request("backend", server, 0));
+    manager.record_failure("backend", server, 2, 0);
+    EXPECT_TRUE(manager.allow_request("backend", server, 0));
+    manager.record_failure("backend", server, 2, 10000);
+    EXPECT_FALSE(manager.allow_request("backend", server, 10000));
+
+    manager.record_success("backend", server);
+    EXPECT_TRUE(manager.allow_request("backend", server, 10000));
+}

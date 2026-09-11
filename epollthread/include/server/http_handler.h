@@ -29,6 +29,9 @@ private:
     struct ResolvedRoute {
         const RegisteredRoute* route = nullptr;
         RouteParams params;
+        // 路径、Host、Tenant 已匹配，但 HTTP method 不匹配时为 true，用于返回 405。
+        bool path_matched = false;
+        std::string allow_methods;
     };
 
     Epoll& epoll_;
@@ -52,14 +55,15 @@ private:
     std::string www_root_;      //文件路径
     FileCache cache_;   // 新增缓存
 
-    void send_response(Socket* sock, const HttpRequest& req);
+    void send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched);
     void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) const;
     ResolvedRoute resolve_route(const HttpRequest& req) const;
     void register_default_routes();
     void register_configured_routes();
     HttpResponse make_error_response(int code, const std::string& status, const std::string& message) const;
 
-    void send_error_response(Socket* sock, int code, const std::string& message);
+    void send_error_response(Socket* sock, int code, const std::string& message,
+                             const std::string& allow_methods = "");
 
     // 辅助：序列化响应头（不含 body）
     std::string headers_to_string(const HttpResponse& resp);
@@ -70,7 +74,7 @@ private:
     std::unordered_map<Socket*, std::chrono::steady_clock::time_point> request_start_time_;
     std::unordered_map<Socket*, HttpRequest> last_requests_; // 记录上一个请求，用于日志输出
     FdCache fd_cache_;   // 文件描述符缓存
-    const Config& config_;               // 引用，只读访问静态文件配置等
+    Config config_;                      // 运行时配置快照，可通过 reload 更新
     
     UpstreamManager& upstream_manager_;  // 引用，用于选择后端
 
@@ -82,6 +86,7 @@ private:
     bool should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const;
 public:
     explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager,ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
+    void reload_config(const Config& config);
     void on_connect(Socket* sock);                          // 初始化
     void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // 处理读事件
     void handle_write(std::shared_ptr<Socket> sock);

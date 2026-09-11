@@ -17,6 +17,13 @@ public:
         return keys_.find(key) != keys_.end();
     }
 
+    void reload(const std::vector<ApiKeyConfig>& keys) {
+        keys_.clear();
+        for (const auto& key : keys) {
+            keys_[key.key] = key;
+        }
+    }
+
     const ApiKeyConfig* get(const std::string& key) const {
         auto it = keys_.find(key);
         if (it != keys_.end()) return &it->second;

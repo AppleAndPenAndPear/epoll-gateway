@@ -15,7 +15,7 @@ void Metrics::record_request(int status_code, double duration_seconds) {
     else if (status_code >= 300 && status_code < 400) requests_3xx_.fetch_add(1, std::memory_order_relaxed);
     else if (status_code >= 400 && status_code < 500) requests_4xx_.fetch_add(1, std::memory_order_relaxed);
     else if (status_code >= 500) requests_5xx_.fetch_add(1, std::memory_order_relaxed);
-        
+
     // std::atomic<double> 不支持 fetch_add，使用 CAS 循环
     double old_sum = duration_sum_.load(std::memory_order_relaxed);
     while (!duration_sum_.compare_exchange_weak(old_sum, old_sum + duration_seconds,std::memory_order_relaxed, std::memory_order_relaxed)) {}
@@ -28,6 +28,37 @@ void Metrics::record_request(int status_code, double duration_seconds) {
     }
     // +Inf 桶（所有请求）
     duration_buckets_[bucket_boundaries_.size()].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Metrics::record_route_request(const std::string& route_name,
+                                  const std::string& host,
+                                  const std::string& tenant,
+                                  int status_code,
+                                  double duration_seconds) {
+    std::string tag = route_name + "|" + host + "|" + tenant;
+    std::lock_guard<std::mutex> lock(route_metrics_mutex_);
+    auto& sample = route_metrics_[tag];
+    sample.total_requests.fetch_add(1, std::memory_order_relaxed);
+    if (status_code >= 200 && status_code < 300) sample.requests_2xx.fetch_add(1, std::memory_order_relaxed);
+    else if (status_code >= 300 && status_code < 400) sample.requests_3xx.fetch_add(1, std::memory_order_relaxed);
+    else if (status_code >= 400 && status_code < 500) sample.requests_4xx.fetch_add(1, std::memory_order_relaxed);
+    else if (status_code >= 500) sample.requests_5xx.fetch_add(1, std::memory_order_relaxed);
+    if (status_code == 504 || status_code == 503 || status_code == 502) {
+        sample.timeout_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (status_code == 401) {
+        sample.auth_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (status_code == 429) {
+        sample.rate_limit_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    double old_sum = sample.duration_sum.load(std::memory_order_relaxed);
+    while (!sample.duration_sum.compare_exchange_weak(old_sum,
+                                                     old_sum + duration_seconds,
+                                                     std::memory_order_relaxed,
+                                                     std::memory_order_relaxed)) {
+    }
+    sample.duration_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Metrics::record_cache_hit() {
@@ -65,6 +96,7 @@ void Metrics::record_upstream_error(BackendError error) {
 
 std::string Metrics::to_string() const {
         std::ostringstream oss;
+    std::lock_guard<std::mutex> lock(route_metrics_mutex_);
         // 总请求
         oss << "# HELP epoll_http_requests_total Total number of HTTP requests\n";
         oss << "# TYPE epoll_http_requests_total counter\n";
@@ -119,6 +151,27 @@ std::string Metrics::to_string() const {
         for (size_t i = 1; i < error_names.size(); ++i) {
             oss << "epoll_upstream_errors_total{type=\"" << error_names[i] << "\"} "
                 << upstream_error_counts_[i].load() << "\n";
+        }
+
+        oss << "# HELP epoll_route_requests_total Route-level request totals by route, host, tenant\n";
+        oss << "# TYPE epoll_route_requests_total counter\n";
+        for (const auto& [key, sample] : route_metrics_) {
+            std::string route = key;
+            auto sep1 = route.find('|');
+            auto sep2 = route.rfind('|');
+            std::string route_name = sep1 == std::string::npos ? route : route.substr(0, sep1);
+            std::string host = sep1 == std::string::npos ? "-" : route.substr(sep1 + 1, sep2 - sep1 - 1);
+            std::string tenant = sep2 == std::string::npos ? "-" : route.substr(sep2 + 1);
+            oss << "epoll_route_requests_total{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\",code=\"2xx\"} "
+                << sample.requests_2xx.load() << "\n";
+            oss << "epoll_route_requests_total{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\",code=\"4xx\"} "
+                << sample.requests_4xx.load() << "\n";
+            oss << "epoll_route_requests_total{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\",code=\"5xx\"} "
+                << sample.requests_5xx.load() << "\n";
+            oss << "epoll_route_latency_seconds_sum{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\"} "
+                << sample.duration_sum.load() << "\n";
+            oss << "epoll_route_latency_seconds_count{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\"} "
+                << sample.duration_count.load() << "\n";
         }
 
         oss << "# EOF\n";

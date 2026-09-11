@@ -36,6 +36,10 @@ struct Upstream {
 struct UpstreamTarget {
     std::string name;
     int timeout_ms = 5000;      //请求后端时最多允许等待多久
+    int max_retries = 1;        //单次请求允许的额外重试次数
+    int circuit_failure_threshold = 5;
+    // 熔断打开后至少等待这么久，之后允许一次半开探测请求。
+    int circuit_recovery_timeout_ms = 10000;
 };
 
 // 网关路由规则：不仅匹配路径，还携带安全策略和执行目标
@@ -93,6 +97,20 @@ struct Config {
     RateLimitConfig rate_limit_config;
 
     std::vector<ApiKeyConfig> api_keys;      // API Key 列表
+
+    static bool is_valid_file(const std::string& path) {
+        std::ifstream ifs(path);
+        if (!ifs.is_open()) {
+            return false;
+        }
+        try {
+            nlohmann::json j;
+            ifs >> j;
+            return j.is_object();
+        } catch (...) {
+            return false;
+        }
+    }
 
     // 从 JSON 文件加载配置，如果文件不存在或解析失败，保持默认值
     static Config from_file(const std::string& path) {
@@ -176,9 +194,15 @@ struct Config {
                     const auto& target = item["upstream_target"];
                     r.upstream_target.name = target.value("name", "");
                     r.upstream_target.timeout_ms = target.value("timeout_ms", legacy_timeout_ms);
+                    r.upstream_target.max_retries = target.value("max_retries", 1);
+                    r.upstream_target.circuit_failure_threshold = target.value("circuit_failure_threshold", 5);
+                    r.upstream_target.circuit_recovery_timeout_ms = target.value("circuit_recovery_timeout_ms", 10000);
                 } else {
                     r.upstream_target.name = "";
                     r.upstream_target.timeout_ms = legacy_timeout_ms;
+                    r.upstream_target.max_retries = 1;
+                    r.upstream_target.circuit_failure_threshold = 5;
+                    r.upstream_target.circuit_recovery_timeout_ms = 10000;
                 }
 
                 if (item.contains("allowed_api_keys")) {

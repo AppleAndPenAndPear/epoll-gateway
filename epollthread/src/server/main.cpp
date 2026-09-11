@@ -6,9 +6,12 @@
 #include "config.h"
 
 std::atomic<bool> stop_server_flag{false};
+std::atomic<uint64_t> config_reload_generation{0};
 void signal_handler(int signal) {
     if (signal == SIGINT || signal == SIGTERM)
         stop_server_flag.store(true);
+    else if (signal == SIGHUP)
+        config_reload_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 int main(){
@@ -22,6 +25,7 @@ int main(){
     // 注册信号
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    std::signal(SIGHUP, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
     logger->info("Starting epoll server...");
@@ -33,7 +37,7 @@ int main(){
                     config.thread_pool.scale_up_threshold,
                     config.thread_pool.scale_down_threshold);
         logger->info("Starting epoll server on port {}", config.port);
-        t.start(config.num_workers, config);
+        t.start(config.num_workers, config, "config.json");
     } catch (const system_error& e) {
         logger->critical("Server startup failed: {}", e.what());
         std::cerr << "系统错误: " << e.what() << " [code: " << e.code() << "]\n";

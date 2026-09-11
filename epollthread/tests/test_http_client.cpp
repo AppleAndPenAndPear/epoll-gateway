@@ -73,3 +73,11 @@ TEST(HttpClientTest, DistinguishesConnectionFailure) {
     EXPECT_EQ(response.status_code, 502);
     EXPECT_EQ(response.error, BackendError::ConnectFailed);
 }
+
+TEST(HttpClientTest, OnlyRetriesIdempotentMethods) {
+    EXPECT_TRUE(should_retry_backend_request("GET", BackendError::ReadTimeout, 0));
+    EXPECT_TRUE(should_retry_backend_request("HEAD", BackendError::ConnectTimeout, 0));
+    EXPECT_FALSE(should_retry_backend_request("POST", BackendError::ReadTimeout, 0));
+    EXPECT_FALSE(should_retry_backend_request("PUT", BackendError::WriteFailed, 0));
+    EXPECT_FALSE(should_retry_backend_request("GET", BackendError::InvalidResponse, 0));
+}
