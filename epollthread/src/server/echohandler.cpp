@@ -6,13 +6,13 @@ EchoHandler::EchoHandler(Epoll& epoll) : myepoll(epoll){ }
 
 void EchoHandler::handle_read(shared_ptr<Socket> sock) {
     int fd = sock->getFd();
-    try {       //Socket::recv 和 Socket::send 在遇到非 EAGAIN 错误时会直接抛出异常，EchoHandler 没有捕获它们会导致异常穿透到 Tcpserver::run() 的事件循环，使整个服务器崩溃
+    try {       // Socket::recv and Socket::send throw directly on errors other than EAGAIN; if EchoHandler does not catch them, the exception escapes into the Tcpserver::run() event loop and crashes the whole server
         char buffer[4096];
         while (true) {
             int n = sock->recv(buffer, sizeof(buffer), 0);
             if (n > 0) {
                 send_queue[sock.get()].emplace_back(buffer, buffer + n);
-                // 确保监听可写事件
+                // Ensure writability is monitored
                 update_event(fd, EPOLLIN | EPOLLOUT);
             } else if (n == 0) {
                 Logger::get()->info("EchoHandler: fd {} closed by peer", fd);
@@ -20,9 +20,9 @@ void EchoHandler::handle_read(shared_ptr<Socket> sock) {
                 return;
             } else { // n == -1
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break; // 数据已读完
+                    break; // All data read
                 } else {
-                    // 其他错误：抛出异常，由外层 catch 统一清理
+                    // Other error: throw; the outer catch performs unified cleanup
                     throw_system_error("recv in handle_read");
                 }
             }
@@ -32,7 +32,7 @@ void EchoHandler::handle_read(shared_ptr<Socket> sock) {
         cleanup(sock);
     }
 
-    // 重新激活事件：依据是否有待发送数据决定监听可写
+    // Re-arm events: monitor writability depending on whether data is pending
     auto it = send_queue.find(sock.get());
     if (it != send_queue.end() && !it->second.empty()) {
         myepoll.mod(fd, EPOLLIN | EPOLLOUT | EPOLLONESHOT);
@@ -46,7 +46,7 @@ void EchoHandler::handle_write(shared_ptr<Socket> sock) {
     try {
         auto it = send_queue.find(sock.get());
         if (it == send_queue.end()) {
-            // 没有待发送数据，应确保取消监听 EPOLLOUT
+            // No pending data; make sure EPOLLOUT is no longer monitored
             update_event(fd, EPOLLIN);
             return;
         }
@@ -56,21 +56,21 @@ void EchoHandler::handle_write(shared_ptr<Socket> sock) {
             int n = sock->send(front.data(), front.size(), 0);
             if (n > 0) {
                 if (n == front.size()) {
-                    queue.pop_front();  // 整块发送完毕
+                    queue.pop_front();  // Whole block sent
                 } else {
-                    // 只发了一部分，去掉已发送的前缀
+                    // Partial send: drop the already-sent prefix
                     front.erase(front.begin(), front.begin() + n);
-                    break; // 内核缓冲区满，等下次 EPOLLOUT
+                    break; // Kernel buffer full, wait for next EPOLLOUT
                 }
             } else if (n == -1) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break; // 发送缓冲区满，等待下次 EPOLLOUT
+                    break; // Send buffer full, wait for next EPOLLOUT
                 } else {
                     throw_system_error("send in handle_write");
                 }
             }
         }
-        // 如果队列已空，则取消监听 EPOLLOUT，只保留 EPOLLIN
+        // If the queue is empty, stop monitoring EPOLLOUT and keep only EPOLLIN
         if (queue.empty()) {
             update_event(fd, EPOLLIN);
         }
@@ -90,7 +90,7 @@ void EchoHandler::handle_write(shared_ptr<Socket> sock) {
 void EchoHandler::on_connect(Socket* s){
     send_queue[s] = {};
     int fd = s->getFd();
-    fd_events_[fd] = EPOLLIN;   // 假设 Tcpserver 只注册了 EPOLLIN
+    fd_events_[fd] = EPOLLIN;   // Assume Tcpserver only registered EPOLLIN
     Logger::get()->debug("EchoHandler: fd {} connected, initial events = EPOLLIN", fd);
 }
 
@@ -105,7 +105,7 @@ void EchoHandler::cleanup(std::shared_ptr<Socket> sock){
 void EchoHandler::update_event(int fd, uint32_t new_events){
     uint32_t old_events = current_events(fd);
     if (old_events == new_events) {
-        return; // 无变化，避免系统调用
+        return; // No change, avoid the syscall
     }
     myepoll.mod(fd, new_events);
     fd_events_[fd] = new_events;

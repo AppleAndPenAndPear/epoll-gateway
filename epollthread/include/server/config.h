@@ -12,49 +12,49 @@ struct RateLimitConfig {
 
 struct ApiKeyConfig {
     std::string key;
-    std::string name;       //  API Key 的备注名称,描述这个 Key 的用途
-    RateLimitConfig rate_limit{200, 100};   // 每个 key 的差异化限流额度
+    std::string name;       // Display name of the API key describing its purpose
+    RateLimitConfig rate_limit{200, 100};   // Per-key rate limit quota
     std::vector<std::string> allowed_hosts;
     std::vector<std::string> allowed_tenants;
 };
 
-// 上游服务器
+// Upstream server
 struct UpstreamServer {
     std::string host;
     int port;
-    bool healthy = true;          // 当前是否健康
-    int consecutive_failures = 0; // 连续失败次数
+    bool healthy = true;          // Whether currently healthy
+    int consecutive_failures = 0; // Consecutive failure count
 };
 
-// 一组上游服务器（一个后端服务）
+// A group of upstream servers (one backend service)
 struct Upstream {
     std::vector<UpstreamServer> servers;
-    std::string algorithm;  //实现负载均衡
+    std::string algorithm;  // Load balancing algorithm
 };
 
-//描述某条路由要使用哪个 upstream，以及该路由的执行参数
+// Describes which upstream a route uses, plus the route's execution parameters
 struct UpstreamTarget {
     std::string name;
-    int timeout_ms = 5000;      //请求后端时最多允许等待多久
-    int max_retries = 1;        //单次请求允许的额外重试次数
+    int timeout_ms = 5000;      // Max wait time when requesting the backend
+    int max_retries = 1;        // Extra retries allowed per request
     int circuit_failure_threshold = 5;
-    // 熔断打开后至少等待这么久，之后允许一次半开探测请求。
+    // Minimum wait after the circuit opens before allowing one half-open probe request.
     int circuit_recovery_timeout_ms = 10000;
 };
 
-// 网关路由规则：不仅匹配路径，还携带安全策略和执行目标
+// Gateway route rule: matches the path and carries security policy and execution target
 struct GatewayRoute {
     std::string name;
     std::string method = "GET";
     std::string path = "/";
-    std::string host = "*";               // 允许的 Host，例如 "api.example.com"
-    std::string tenant = "*";             // 允许的 tenant，例如 "team-a"
+    std::string host = "*";               // Allowed Host, e.g. "api.example.com"
+    std::string tenant = "*";             // Allowed tenant, e.g. "team-a"
     std::string target_type = "upstream";  // local | upstream | static
     std::string handler_name;
     UpstreamTarget upstream_target;
     std::string static_root;
 
-    bool enabled = true;        //是否启用
+    bool enabled = true;        // Whether enabled
     bool auth_required = true;
     bool allow_anonymous = false;
 
@@ -71,20 +71,20 @@ struct UpstreamConfig {
 };
 
 struct Config {
-    // 服务器端口
+    // Server port
     unsigned short port = 5005;
     // listen backlog
     int backlog = 1024;
-    // Worker 线程数（0 表示使用 hardware_concurrency）
+    // Number of worker threads (0 means use hardware_concurrency)
     unsigned int num_workers = 0;
-    // 静态文件根目录
+    // Static file root directory
     std::string www_root = "./www";
 
-    size_t cache_max_entries = 1024;  // 线程内缓存最大条目数
-    size_t cache_max_file_size_mb = 1; // 可缓存的最大文件大小（MB）
+    size_t cache_max_entries = 1024;  // Max entries in the per-thread cache
+    size_t cache_max_file_size_mb = 1; // Max cacheable file size (MB)
 
-    int keepalive_timeout = 60; // keep-alive 超时时间（秒）
-    // 动态线程池配置
+    int keepalive_timeout = 60; // Keep-alive timeout (seconds)
+    // Dynamic thread pool configuration
     struct ThreadPoolConfig {
         size_t min_threads = 2;
         size_t max_threads = 10;
@@ -96,7 +96,7 @@ struct Config {
 
     RateLimitConfig rate_limit_config;
 
-    std::vector<ApiKeyConfig> api_keys;      // API Key 列表
+    std::vector<ApiKeyConfig> api_keys;      // API key list
 
     static bool is_valid_file(const std::string& path) {
         std::ifstream ifs(path);
@@ -112,22 +112,22 @@ struct Config {
         }
     }
 
-    // 从 JSON 文件加载配置，如果文件不存在或解析失败，保持默认值
+    // Load config from a JSON file; keeps defaults if the file is missing or parsing fails
     static Config from_file(const std::string& path) {
         Config config;
         std::ifstream ifs(path);
         if (!ifs.is_open()) {
-            // 文件不存在，使用默认值
+            // File missing; use defaults
             return config;
         }
         nlohmann::json j;
         try {
             ifs >> j;
         } catch (...) {
-            // 解析失败，使用默认值
+            // Parse failed; use defaults
             return config;
         }
-        // 逐字段读取，如果存在就覆盖默认值
+        // Read field by field, overriding defaults when present
         if (j.contains("port")) config.port = j["port"];
         if (j.contains("backlog")) config.backlog = j["backlog"];
         if (j.contains("num_workers")) config.num_workers = j["num_workers"];
@@ -150,7 +150,7 @@ struct Config {
             config.keepalive_timeout = j["keepalive_timeout"];
         }
 
-        // 解析 upstreams
+        // Parse upstreams
         if (j.contains("upstreams")) {
             for (auto& [name, val] : j["upstreams"].items()) {
                 Upstream up;
@@ -171,7 +171,7 @@ struct Config {
                 j.value("upstream_health_check_timeout_ms", 500);
         }
 
-        // 解析 routes
+        // Parse routes
         if (j.contains("routes")) {
             for (auto& item : j["routes"]) {
                 GatewayRoute r;
@@ -220,7 +220,7 @@ struct Config {
             }
         }
 
-        // 解析 rate limit 配置
+        // Parse rate limit config
         if (j.contains("rate_limit")){
             auto& rl = j["rate_limit"];
             if (rl.contains("capacity")) {

@@ -8,7 +8,7 @@ struct HttpRequest {
     std::string path;
     std::string version;
     std::string query;
-    std::string trace_id;       //记录请求的 trace_id，便于日志追踪
+    std::string trace_id;       // records the request's trace_id for log correlation
     std::string host;
     std::string tenant;
     std::unordered_map<std::string, std::string> headers;
@@ -32,9 +32,9 @@ struct HttpResponse {
     std::string status_message = "OK";
     std::unordered_map<std::string, std::string> headers;
     std::string body;
-    bool chunked = false;   // 新增,标记是否使用分块传输编码
+    bool chunked = false;   // set when chunked transfer encoding is used
 
-    std::string to_string() const {     //职责分离，to_string() 变成只读的序列化函数，符合 const 语义;保持 const，但调用前在外部先设置好 Content-Length
+    std::string to_string() const {     // serialization only: to_string() is a read-only serializer matching const semantics; keep const, but set Content-Length externally before calling
         std::ostringstream oss;
         oss << "HTTP/1.1 " << status_code << " " << status_message << "\r\n";
         for (const auto& [key, value] : headers) {
@@ -52,24 +52,24 @@ public:
 
     enum class ChunkState { SIZE, DATA, TRAILER, DONE } chunk_state_ = ChunkState::SIZE;
 
-    static constexpr size_t MAX_BODY_SIZE = 1024 * 1024; // 1MB 上限
+    static constexpr size_t MAX_BODY_SIZE = 1024 * 1024; // 1MB cap
 
     HttpParser();
 
-    // 喂入数据，返回 true 表示解析完成（请求头结束）
+    // Feed data; returns true when parsing is complete (end of request headers)
     bool parse(const char* data, size_t len, HttpRequest& request,size_t& consumed);
 
-    // 检查 body 是否超出大小限制
+    // Check whether the body exceeded the size limit
     bool is_body_too_large() const { return body_too_large_; }
 
     void reset();
 private:
     State state_;
     std::string buffer_;
-    size_t content_length_;     //body 长度
-    size_t body_read_;          //已读取的字节数
-    bool body_too_large_ = false;  //body 超出限制标记
+    size_t content_length_;     // body length
+    size_t body_read_;          // bytes read so far
+    bool body_too_large_ = false;  // set when the body exceeds the limit
     std::string chunk_size_hex_buffer_;
     size_t chunk_data_remaining_ = 0;
-    bool expecting_final_lf_ = false;   // 用于 TRAILER 状态等待最后的 \n
+    bool expecting_final_lf_ = false;   // used to wait for the final \n in the TRAILER state
 };

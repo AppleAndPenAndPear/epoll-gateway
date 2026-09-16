@@ -25,14 +25,14 @@ private:
 
   UpstreamManager upstream_manager_;
   ApiKeyManager api_key_manager_;
-  std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // 跨 worker 共享
-  
+  std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // Shared across workers
+
   HttpHandler handler_;
-  std::unordered_map<int, time_t> last_active_; // 记录每个连接的最后活跃时间（秒级）
-  int keepalive_timeout_; // keep-alive 超时时间（秒）
-  time_t last_timeout_check_ = 0; // 上次执行超时检查的时间
-  time_t last_limiter_cleanup_ = 0; // 上次清理限流器的时间
-  std::unordered_map<int, std::string> client_ips_; // 记录客户端 IP 地址，便于日志输出
+  std::unordered_map<int, time_t> last_active_; // Last active time per connection (second granularity)
+  int keepalive_timeout_; // Keep-alive timeout (seconds)
+  time_t last_timeout_check_ = 0; // Time of the last timeout check
+  time_t last_limiter_cleanup_ = 0; // Time of the last limiter cleanup
+  std::unordered_map<int, std::string> client_ips_; // Client IP per connection for logging
   std::string config_path_;
   uint64_t applied_reload_generation_ = 0;
 

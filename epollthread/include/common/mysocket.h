@@ -10,11 +10,11 @@
 
 using namespace std;
 
-//管理socket
+// socket wrapper
 class Socket{
 private:
   int fd_;
-  SSL* ssl_ = nullptr;                  // SSL 对象
+  SSL* ssl_ = nullptr;                  // SSL object
   bool is_ssl_ = false;
 public:
   explicit Socket(int domain, int type, int protocol);
@@ -32,22 +32,22 @@ public:
   template<typename T>
   bool setOption(int level, int optname, const T& value) {
     if (setsockopt(fd_, level, optname, &value, sizeof(T)) == -1) {
-      // 可以选择抛出异常或返回 false
+      // Choose to throw on failure
       throw_system_error("setsockopt() failed");
     }
     Logger::get()->debug("setsockopt() optname {} success, fd = {}",optname,fd_);
     return true;
   }
 
-  // 针对 SO_REUSEADDR 的便捷函数
+  // Convenience wrapper for SO_REUSEADDR
   bool setReuseAddr(bool enable);
 
-  // 针对 SO_KEEPALIVE 的便捷函数
+  // Convenience wrapper for SO_KEEPALIVE
   bool setKeepAlive(bool enable);
 
   bool setReusePort(bool enable);
   
-  //设置socket非阻塞
+  // Set the socket to non-blocking mode
   void setnonblocking();
 
   void setblocking();
@@ -69,12 +69,12 @@ public:
 
   void closefd();
 
-  // SSL 相关
-  bool initSSL(SSL_CTX* ctx);          // 关联 SSL 上下文
-  bool sslAccept();                     // 执行 SSL 握手（服务端 accept）
-  void closeSSL();                      // 优雅关闭 SSL 连接
-  ssize_t sslRead(char* buf, size_t size);  // SSL 读
-  ssize_t sslWrite(char* buf, size_t size); // SSL 写
+  // SSL support
+  bool initSSL(SSL_CTX* ctx);          // attach the SSL context
+  bool sslAccept();                     // perform the SSL handshake (server-side accept)
+  void closeSSL();                      // gracefully shut down the SSL connection
+  ssize_t sslRead(char* buf, size_t size);  // SSL read
+  ssize_t sslWrite(char* buf, size_t size); // SSL write
 
   bool get_is_ssl_();
 };

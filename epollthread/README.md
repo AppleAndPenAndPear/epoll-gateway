@@ -1,48 +1,62 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 # epollthread
 
-基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、TLS、Keep-Alive、零拷贝文件传输、LRU/FD 缓存、配置驱动路由、反向代理与上游健康检查、幂等重试与基础熔断、API Key 鉴权、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 30/30 通过）及 AddressSanitizer 支持。
+> Lightweight, self-contained API gateway in C++17 — a single binary built on epoll, with auth, rate limiting, circuit breaking and Prometheus metrics built in.
 
-## 特性
-- **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡，无锁竞争。
-- **HTTP/1.1 协议支持**：内置状态机 HTTP 解析器，支持 GET / HEAD / POST / PUT / DELETE 方法，解析请求行、头部、查询字符串、消息体，含 Chunked 传输编码解析。
-- **HTTPS/TLS 加密传输**：基于 OpenSSL 集成 TLS 加密，通过 `certs/server.crt` 与 `certs/server.key` 实现安全连接，握手与加密数据传输均运行在非阻塞 epoll 事件循环中。
-- **RESTful 路由系统**：可注册任意方法+路径模式（如 `/users/{id}`）的处理函数，支持动态路由参数提取与分发，轻松构建 JSON API。
-- **配置驱动网关路由**：通过 `routes` 配置 method、path、host、tenant、鉴权、限流和执行目标；路由注册与执行分离，支持 `local`、`upstream`、`static` 三类目标。
-- **反向代理与上游负载均衡**：通过 `UpstreamTarget` 引用 upstream 服务组，由 `UpstreamManager` 进行轮询选路和主动 TCP 健康检查，自动摘除故障节点。
-- **上游访问控制与超时**：支持 route/API Key 的 host、tenant 绑定；连接、发送、读取阶段均具备超时控制，区分 502 与 504。
-- **上游错误分类**：区分连接失败、连接超时、发送失败、发送超时、读取失败、读取超时和非法响应，并通过 Prometheus 暴露错误计数，映射到 502/503/504。
-- **幂等重试**：仅对幂等方法（GET/HEAD 等）和可重试的临时错误发起重试，路由可通过 `max_retries` 配置额外重试次数，避免非幂等请求重复执行。
-- **基础熔断器**：按 upstream/backend 维度维护熔断状态，连续失败达到阈值后进入 OPEN，超时后进入恢复探测（half-open），探测成功自动关闭熔断，防止故障后端持续拖垮网关。
-- **Trace-Id 请求追踪**：统一返回 `X-Trace-Id`，客户端携带时沿用并回传，否则由网关生成，贯穿请求日志与审计日志。
-- **静态文件服务**：根据 URL 路径映射本地文件，使用 `sendfile` 系统调用实现**零拷贝**传输；自动设置 `Content-Type`（支持 HTML、CSS、JS、JSON、图片、字体等常见格式）。
-- **双层缓存机制**：
-  - **LRU 内存文件缓存**：每个 Worker 维护独立的文件内容缓存，对频繁访问的小文件进行内存缓存，减少磁盘 I/O，大幅提升重复请求吞吐量。
-  - **FD 文件描述符缓存**：基于 TTL 的文件描述符缓存，避免每次请求都执行 `open()`/`stat()` 系统调用，进一步降低文件服务延迟。
-- **Gzip 压缩**：支持对文本类响应进行 Gzip 压缩传输，根据客户端 `Accept-Encoding` 头自动协商。
-- **Chunked 传输编码**：支持 `Transfer-Encoding: chunked` 响应，适用于动态生成或流式输出的内容。
-- **连接复用**：正确处理 `Connection: keep-alive`，支持在同一条 TCP 连接上串行处理多个请求（HTTP Pipelining），保证响应顺序。
-- **空闲连接超时**：可配置的超时时间，自动关闭长时间无活动的连接，防止资源泄漏。
-- **错误处理与状态码**：支持 200、400、403、404、405、413、429、500、502、503、504 等状态码，区分后端不可达与后端超时，并防御路径穿越攻击；路径匹配但方法不支持时返回 405 并携带 `Allow` Header。
-- **令牌桶限流**：基于令牌桶算法的全局限流器，跨 Worker 共享计数，按客户端 IP 精确控制请求速率，超限返回 `429 Too Many Requests`，令牌补充采用小数累积避免截断误差。
-- **API Key 认证**：提供 API Key 校验与提取工具（支持 `X-API-Key` 请求头与 `Authorization: Bearer` 两种方式），支持 route allow/deny 以及 API Key 的 host/tenant 范围和差异化限流额度。
-- **非阻塞 I/O + 边缘触发**：所有套接字使用非阻塞模式，结合 `EPOLLET` 和 `EPOLLONESHOT`，精细控制事件通知，避免惊群和重复触发。
-- **动态线程池**：可配置最小/最大线程数，依据任务负载自动扩缩容（目前预留接口，用于未来异步业务处理）。
-- **异步日志系统**：基于 `spdlog` 的全局线程池，支持控制台彩色输出与文件滚动存储，可分别控制各级别日志输出，性能开销低。
-- **AUDIT + CLF 双通道日志**：CLF 访问日志记录所有完成请求的 IP、方法、路径、状态码、响应大小与耗时；AUDIT 日志在响应完成时统一记录失败和安全策略事件（含 trace_id、route、Host/Tenant、失败原因和脱敏后的 API Key），避免重复写入。
-- **请求/响应日志**：记录每个请求的方法、路径、状态码、User-Agent、客户端 IP 及响应大小，便于监控与分析。
-- **RAII 资源管理**：`Socket`、`Epoll` 等资源封装为 RAII 类，支持移动语义，杜绝描述符泄漏。
-- **等待器职责分离**：`Socket` 只负责 fd 生命周期和 I/O，`Poller` 封装单 fd 的 poll 等待，`Epoll` 负责长期管理大量连接。
-- **优雅关闭**：捕获 `SIGINT`/`SIGTERM` 信号，安全通知所有 Worker 线程退出，保证日志完整、资源正确回收。
-- **外部配置驱动**：通过 JSON 配置文件指定端口、线程数、Web 根目录、线程池参数、缓存大小、超时时间等，方便部署和调整。
-- **Runtime Reload**：`SIGHUP` 触发热更新，信号处理器仅递增 generation，Worker 在安全检查点读取并应用新配置；reload 更新路由、upstream、API Key、限流与 Keep-Alive 超时，且在文件无效时拒绝覆盖当前配置。
-- **配套非阻塞客户端**：独立的状态机客户端，支持连接、发送、接收全流程，展示 epoll 在客户端的使用方法。
-- **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
-- **单元测试**：基于 Google Test，当前 CTest 30/30 通过，覆盖 HTTP 解析器、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略、限流隔离、HTTP client 超时、幂等重试、upstream 健康检查和熔断等核心模块。
-- **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
-- **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
-- **Grafana 可视化监控**：集成 Grafana + Prometheus 监控栈，通过 `docker-compose` 一键部署，开箱即用的指标采集与仪表盘展示。
+epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, TLS, keep-alive, zero-copy file serving, LRU/FD caching, config-driven routing, reverse proxying with upstream health checks, idempotent retries and circuit breaking, API-key authentication, host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (30/30 passing on CTest) and AddressSanitizer support.
 
-## 架构概览
+## Features
+
+### Networking & concurrency
+- **Multi-threaded Reactor model** — each worker thread runs its own epoll event loop with its own listen socket (`SO_REUSEPORT`), so the kernel load-balances connections and there is no lock contention.
+- **Non-blocking I/O + edge triggering** — every socket is non-blocking, combined with `EPOLLET` and `EPOLLONESHOT` for precise event control, avoiding thundering herds and duplicate events.
+- **Connection reuse** — correct `Connection: keep-alive` handling; multiple requests are processed serially on a single TCP connection (HTTP pipelining) with strict response ordering.
+- **Idle connection timeout** — configurable timeout that automatically closes inactive connections to prevent resource leaks.
+- **Graceful shutdown** — `SIGINT`/`SIGTERM` are caught, all worker threads are safely asked to exit, and logs and resources are reclaimed intact.
+- **RAII resource management** — `Socket`, `Epoll` and friends are RAII wrappers with move semantics; descriptor leaks are eliminated by construction.
+- **Clean waiter separation** — `Socket` owns fd lifetime and I/O only, `Poller` wraps a single-fd `poll` wait, and `Epoll` manages large numbers of long-lived connections.
+- **Dynamic thread pool** — configurable min/max threads with load-based scaling (interface reserved for future async business logic).
+
+### Protocol support
+- **HTTP/1.1** — built-in state-machine parser covering the request line, headers, query string and body, supporting `GET / HEAD / POST / PUT / DELETE` and chunked transfer encoding.
+- **HTTPS/TLS** — OpenSSL-based TLS using `certs/server.crt` and `certs/server.key`; handshake and encrypted I/O both run inside the non-blocking epoll loop.
+- **Gzip compression** — text-like responses are gzip-compressed when negotiated via the client's `Accept-Encoding` header.
+- **Chunked responses** — `Transfer-Encoding: chunked` support for dynamically generated or streamed content.
+- **Status codes & error handling** — 200, 400, 403, 404, 405, 413, 429, 500, 502, 503, 504 and more; unreachable backends are distinguished from backend timeouts, path-traversal attacks are deflected, and a matched path with an unsupported method returns 405 with an `Allow` header.
+
+### Gateway routing, auth & rate limiting
+- **RESTful routing** — register handlers for any method + path pattern (e.g. `/users/{id}`) with dynamic parameter extraction and dispatch; build JSON APIs with ease.
+- **Config-driven gateway routes** — `routes` entries declare method, path, host, tenant, auth, rate limiting and execution target; registration and dispatch are decoupled, with `local`, `upstream` and `static` target types.
+- **API-key authentication** — keys are accepted via the `X-API-Key` header or `Authorization: Bearer`; supports route-level allow/deny lists and per-key host/tenant scopes with differentiated rate-limit quotas.
+- **Token-bucket rate limiting** — a global limiter shared across workers (totals stay accurate under `SO_REUSEPORT` multi-worker mode), counted per client IP and returning `429 Too Many Requests`; fractional token refill avoids truncation errors.
+
+### Reverse proxy & reliability
+- **Reverse proxy & load balancing** — routes reference upstream groups via `UpstreamTarget`; `UpstreamManager` round-robins across healthy backends and probes them with active TCP health checks, automatically ejecting failed nodes.
+- **Upstream access control & timeouts** — host and tenant binding per route/API key; connect, send and read phases each have timeout control, with distinct 502 vs 504 semantics.
+- **Upstream error classification** — connect failure/timeout, send failure/timeout, read failure/timeout and invalid responses are distinguished, exposed as Prometheus error counters and mapped to 502/503/504.
+- **Idempotent retries** — only idempotent methods (GET/HEAD, etc.) and retryable transient errors are retried; routes can add extra attempts via `max_retries`, so non-idempotent requests are never duplicated.
+- **Circuit breaker** — per-upstream/per-backend state: consecutive failures past a threshold open the circuit, half-open probes run after a recovery timeout and auto-close it on success, keeping a failing backend from dragging the whole gateway down.
+
+### Static files & caching
+- **Static file serving** — URL-to-file mapping with **zero-copy** `sendfile` transfer and automatic `Content-Type` detection (HTML, CSS, JS, JSON, images, fonts and other common formats).
+- **Two-layer caching** — a per-worker LRU in-memory file cache for hot small files (less disk I/O, dramatically higher repeat-request throughput) and a TTL-based file-descriptor cache that avoids repeated `open()`/`stat()` syscalls.
+
+### Observability
+- **`X-Trace-Id` tracing** — echoed back when the client sends one, otherwise generated by the gateway; flows through request logs and audit logs.
+- **AUDIT + CLF dual-channel logging** — the CLF access log captures IP, method, path, status code, response size and latency for every completed request; the AUDIT log records failures and security-policy events once per completed response (trace_id, route, Host/Tenant, failure reason, masked API key) without duplicate writes.
+- **Prometheus metrics** — built-in `/metrics` endpoint covering request counts by status class, a request-latency histogram, cache hit ratios and upstream error-type counters.
+- **Grafana dashboards** — bundled Grafana + Prometheus monitoring stack, deployed with a single `docker-compose` command for out-of-the-box dashboards.
+
+### Operations & engineering
+- **External JSON configuration** — port, thread count, web root, thread-pool parameters, cache sizes, timeouts and more, making deployment and tuning easy.
+- **Runtime reload** — `SIGHUP` triggers a hot reload: the signal handler only increments a generation counter, and workers read and apply the new config at safe checkpoints. Reload updates routes, upstreams, API keys, rate limiting and the keep-alive timeout, and an invalid file never overwrites the running config.
+- **Companion non-blocking client** — an independent state-machine client covering connect/send/receive, demonstrating epoll from the client side.
+- **Unit tests** — Google Test, currently 30/30 via CTest, covering the HTTP parser, LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy, rate-limit isolation, HTTP client timeouts, idempotent retries, upstream health checks and the circuit breaker.
+- **AddressSanitizer** — enabled automatically in Debug builds to catch memory leaks and out-of-bounds accesses.
+- **Docker** — multi-stage `Dockerfile` builds a lean image for one-command deployment anywhere.
+
+## Architecture
 
 ```
                     Master Thread
@@ -55,195 +69,109 @@
     listen fd 1     listen fd 2      listen fd N   (SO_REUSEPORT)
          │               │               │
     ┌────┴────┐    ┌────┴────┐      ┌────┴────┐
-    │ 客户端连接 │    │ 客户端连接 │      │ 客户端连接 │
+    │ client  │    │ client  │      │ client  │
+    │ conns   │    │ conns   │      │ conns   │
     └────┬────┘    └────┬────┘      └────┬────┘
          │               │               │
     HttpHandler    HttpHandler      HttpHandler
-    (解析+路由+策略) (解析+路由+策略)  (解析+路由+策略)
-    (文件服务+缓存)  (文件服务+缓存)    (文件服务+缓存)
+    (parse, route, (parse, route,   (parse, route,
+     policy)        policy)          policy)
+    (files, cache)  (files, cache)   (files, cache)
          │               │               │
          └───────────────┼───────────────┘
                          │
               UpstreamManager + HttpClient
-              (健康检查、选路、超时、代理)
+              (health checks, backend
+               selection, timeouts, proxying)
          │               │               │
          └───────────────┴───────────────┘
                          │
-              DynamicThreadPool (共享线程池)
+              DynamicThreadPool (shared pool)
                          │
               ┌──────────┴──────────┐
               │                     │
          Prometheus              Grafana
-    (每5s刮取 /metrics)    (可视化仪表盘 @ :3000)
-         @ :9090
+      (scrapes /metrics     (dashboards
+       every 5s) @ :9090      @ :3000)
 ```
 
-- **Tcpserver**：负责创建 N 个 listen socket，启动对应数量的 `TcpWorker` 线程。
-- **TcpWorker**：每个 Worker 持有独立的 epoll 实例、连接表、`HttpHandler` 与 SSL 上下文，全权处理归属连接的所有 I/O 事件（含 TLS 握手），并负责超时连接清理与上游健康检查。
-- **HttpHandler**：HTTP/1.1 协议核心实现，包含请求解析、配置路由匹配、host/tenant 策略、API Key 鉴权、限流、Keep-Alive、文件服务和错误响应。
-- **UpstreamManager**：管理上游服务器集群，使用非阻塞 Socket + Poller 执行带超时的 TCP 健康检查，并负责轮询选路。
-- **HttpClient**：执行同步的单后端 HTTP 转发，使用 `Socket + Poller` 实现连接、发送和读取超时，并返回结构化 `BackendError`。
-- **Poller**：封装单次 `poll` 等待；它与 `Epoll` 分工不同，前者用于单个后端连接等待，后者用于 worker 事件循环。
-- **Metrics**：线程安全的指标收集器（单例），记录请求总数、状态码分布、延迟直方图、多级缓存命中率，通过 `/metrics` 端点以 Prometheus 文本格式暴露。
-- **Prometheus**：定期从 `server:5005/metrics` 刮取指标数据，存储时序数据。
-- **Grafana**：连接 Prometheus 作为数据源，提供实时可视化仪表盘。
-- **DynamicThreadPool**：可选的共享线程池，用于将耗时任务从 I/O 线程卸载到工作线程（预留扩展）。
-- **Logger**：全局异步日志器，通过 spdlog 全局线程池实现高性能日志记录。
+- **TcpServer** — creates the N listen sockets and starts the matching `TcpWorker` threads.
+- **TcpWorker** — each worker owns an epoll instance, a connection table, an `HttpHandler` and an SSL context, and handles all I/O events for its connections (including TLS handshakes), plus idle-connection cleanup and upstream health checks.
+- **HttpHandler** — the HTTP/1.1 core: request parsing, config-driven route matching, host/tenant policies, API-key auth, rate limiting, keep-alive, static file serving and error responses.
+- **UpstreamManager** — manages upstream server groups; performs TCP health checks with timeouts using non-blocking `Socket + Poller`, and round-robin backend selection.
+- **HttpClient** — performs synchronous single-backend HTTP forwarding with connect, send and read timeouts via `Socket + Poller`, returning a structured `BackendError`.
+- **Poller** — wraps a single `poll` wait; unlike `Epoll` it waits on individual backend connections rather than serving as the worker event loop.
+- **Metrics** — thread-safe singleton collector recording request totals, status-code distribution, latency histograms and multi-layer cache hit rates, exposed in Prometheus text format at `/metrics`.
+- **Prometheus** — periodically scrapes `server:5005/metrics` and stores the time series.
+- **Grafana** — uses Prometheus as a data source to provide live visualization dashboards.
+- **DynamicThreadPool** — optional shared pool for offloading slow tasks from I/O threads (reserved for extension).
+- **Logger** — global asynchronous logger running on the spdlog global thread pool for high-performance logging.
 
-## 项目结构
+## Quick Start
 
-```
-epollthread/
-├── include/                  # 头文件
-│   ├── server/               # 服务端头文件
-│   │   ├── server.h          # Tcpserver 服务端主类
-│   │   ├── tcpworker.h       # TcpWorker 工作线程（含 SSL 状态机）
-│   │   ├── http_handler.h    # HTTP 请求处理与路由
-│   │   ├── http_client.h     # 反向代理转发与 BackendError
-│   │   ├── upstream_manager.h# 上游服务器管理与健康检查
-│   │   ├── rate_limiter.h    # 令牌桶限流器
-│   │   ├── rate_limiter_manager.h # 限流器管理器
-│   │   ├── api_key_manager.h # API Key 校验
-│   │   ├── metrics.h         # Prometheus 指标收集器（单例，线程安全）
-│   │   ├── pool.h            # DynamicThreadPool 动态线程池
-│   │   ├── config.h          # JSON 配置加载
-│   │   ├── gzip_utils.h      # Gzip 压缩工具
-│   │   ├── content_type.h    # Content-Type 映射
-│   │   ├── route_utils.h     # 路由匹配与参数提取
-│   │   └── echohandler.h     # Echo 处理器（早期演示）
-│   ├── client/               # 客户端头文件
-│   │   ├── client.h          # 非阻塞客户端
-│   │   └── clienthandler.h   # 客户端处理器
-│   └── common/               # 公共头文件
-│       ├── mysocket.h        # Socket RAII 封装（含 SSL 支持）
-│       ├── poller.h          # 单 fd poll 等待封装
-│       ├── myepoll.h         # Epoll RAII 封装
-│       ├── mylogger.h        # 异步日志封装
-│       ├── http_parser.h     # HTTP/1.1 协议解析器（状态机）
-│       ├── file_cache.h      # LRU 内存文件缓存
-│       ├── fd_cache.h        # FD 文件描述符缓存（TTL）
-│       └── error_utils.h     # 错误处理工具
-├── src/                      # 源文件
-│   ├── server/               # 服务端源码
-│   │   ├── main.cpp          # 服务端入口
-│   │   ├── server.cpp        # Tcpserver 实现
-│   │   ├── tcpworker.cpp     # TcpWorker 实现（含 TLS 握手）
-│   │   ├── http_handler.cpp  # HttpHandler 实现（含路由注册、限流）
-│   │   ├── http_client.cpp   # 反向代理转发实现
-│   │   ├── upstream_manager.cpp # 上游管理与健康检查实现
-│   │   ├── rate_limiter.cpp  # 令牌桶限流器实现
-│   │   ├── metrics.cpp       # Metrics 指标收集实现
-│   │   ├── pool.cpp          # 动态线程池实现
-│   │   ├── content_type.cpp  # Content-Type 实现
-│   │   └── gzip_utils.cpp    # Gzip 压缩实现
-│   ├── client/               # 客户端源码
-│   │   ├── main.cpp          # 客户端入口
-│   │   ├── client.cpp        # Client 实现
-│   │   └── clienthandler.cpp # ClientHandler 实现
-│   └── common/               # 公共模块源码
-│       ├── poller.cpp        # Poller 实现
-│       ├── mysocket.cpp      # Socket 实现（含 SSL）
-│       ├── myepoll.cpp       # Epoll 实现
-│       ├── mylogger.cpp      # Logger 实现
-│       ├── error_utils.cpp   # 错误处理实现
-│       ├── fd_cache.cpp      # FD 缓存实现
-│       ├── file_cache.cpp    # 文件缓存实现
-│       └── http_parser.cpp   # HTTP 解析器实现
-├── certs/                    # TLS 证书与私钥
-│   ├── server.crt
-│   └── server.key
-├── tests/                    # 单元测试
-│   ├── CMakeLists.txt
-│   ├── test_http_parser.cpp  # HTTP 解析器测试
-│   ├── test_file_cache.cpp   # LRU 缓存测试
-│   ├── test_http_response.cpp# HTTP 响应测试
-│   ├── test_route_utils.cpp  # 路由匹配测试
-│   ├── test_auth_and_rate_limit.cpp # API Key 和限流测试
-│   ├── test_http_client.cpp  # upstream 超时和错误分类测试
-│   └── test_upstream_manager.cpp # upstream 健康检查测试
-├── www/                      # 静态文件根目录
-│   ├── index.html
-│   └── big.html
-├── logs/                     # 日志输出目录
-├── build/                    # 构建输出目录（cmake 生成）
-├── CMakeLists.txt            # CMake 构建配置
-├── build.sh                  # 一键构建脚本
-├── start.sh                  # 快速启动脚本
-├── config.json               # 服务器配置文件
-├── vcpkg.json                # vcpkg 依赖清单
-├── Dockerfile                # Docker 多阶段构建
-├── docker-compose.yml        # Docker Compose 编排（server + Prometheus + Grafana）
-├── prometheus.yml            # Prometheus 抓取配置
-├── docs/
-│   └── PROJECT_STATUS.md     # 项目现状快照（当前能力、限制与下一步）
-├── CHANGELOG.md              # 变更记录（按日期回溯）
-└── README.md
-```
-
-## 快速开始
-
-### 环境要求
-- Linux (内核 3.9+，支持 `SO_REUSEPORT`)
-- GCC 7+ 或 Clang 5+（需要 C++17 支持）
+### Requirements
+- Linux (kernel 3.9+, for `SO_REUSEPORT`)
+- GCC 7+ or Clang 5+ (C++17 required)
 - CMake 3.20+
-- [vcpkg](https://github.com/microsoft/vcpkg)（推荐）或手动安装依赖
+- [vcpkg](https://github.com/microsoft/vcpkg) (recommended) or manually installed dependencies
 
-### 依赖库
-| 库 | 用途 | 安装方式 |
+### Dependencies
+
+| Library | Purpose | Install |
 |---|---|---|
-| [spdlog](https://github.com/gabime/spdlog) | 异步日志 | vcpkg / apt |
-| [nlohmann/json](https://github.com/nlohmann/json) | JSON 配置与 API | vcpkg / apt |
-| [OpenSSL](https://www.openssl.org/) | TLS/SSL 加密传输 | 系统自带 / apt |
-| [zlib](https://zlib.net/) | Gzip 压缩 | 系统自带 / apt |
-| [Google Test](https://github.com/google/googletest) | 单元测试 | vcpkg / apt |
+| [spdlog](https://github.com/gabime/spdlog) | Async logging | vcpkg / apt |
+| [nlohmann/json](https://github.com/nlohmann/json) | JSON config & API | vcpkg / apt |
+| [OpenSSL](https://www.openssl.org/) | TLS/SSL encrypted transport | system / apt |
+| [zlib](https://zlib.net/) | Gzip compression | system / apt |
+| [Google Test](https://github.com/google/googletest) | Unit tests | vcpkg / apt |
 
-### 本地构建与运行
+### Build
 
-#### 方式一：使用 build.sh 一键构建（推荐）
+Option 1 — one-command build script (recommended):
 
 ```bash
-# Release 构建
+# Release build
 ./build.sh
 
-# Debug 构建（启用 AddressSanitizer）
+# Debug build (enables AddressSanitizer)
 ./build.sh Debug
 ```
 
-#### 方式二：手动 CMake 构建
+Option 2 — plain CMake:
 
 ```bash
-# 使用 vcpkg 工具链（推荐）
+# Using the vcpkg toolchain (recommended)
 cmake -B build -S . \
     -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
     -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# 或使用系统包管理器安装依赖后直接构建
+# Or install dependencies with the system package manager and build directly
 sudo apt install g++ cmake make libspdlog-dev nlohmann-json3-dev zlib1g-dev
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-### 配置文件
+### Configure
 
-编辑 `config.json` 进行个性化配置（所有字段均有默认值，文件不存在时自动使用默认值）：
+Edit `config.json` to suit your deployment (every field has a default; if the file is missing, defaults apply):
 
 ```json
 {
-    "port": 5005,                   // 监听端口
-    "backlog": 1024,                // listen backlog 大小
-    "num_workers": 2,               // Worker 线程数（0=自动取 CPU 核数）
-    "www_root": "./www",            // 静态文件根目录
+    "port": 5005,                   // Listen port
+    "backlog": 1024,                // listen backlog size
+    "num_workers": 2,               // Worker thread count (0 = auto, CPU core count)
+    "www_root": "./www",            // Static file root directory
     "thread_pool": {
-        "min": 2,                   // 最小线程数
-        "max": 10,                  // 最大线程数
-        "scale_up": 2,              // 扩容触发阈值（任务数/线程数）
-        "scale_down": 1             // 缩容触发阈值
+        "min": 2,                   // Min threads
+        "max": 10,                  // Max threads
+        "scale_up": 2,              // Scale-up threshold (tasks per thread)
+        "scale_down": 1             // Scale-down threshold
     },
-    "cache_max_entries": 1024,      // LRU 文件缓存最大条目数
-    "cache_max_file_size_mb": 1,    // 可缓存的最大文件大小（MB）
-    "keepalive_timeout": 60,        // Keep-Alive 空闲超时（秒）
-    "upstreams": {                  // 上游服务定义
+    "cache_max_entries": 1024,      // Max LRU file-cache entries
+    "cache_max_file_size_mb": 1,    // Max cacheable file size (MB)
+    "keepalive_timeout": 60,        // Keep-Alive idle timeout (seconds)
+    "upstreams": {                  // Upstream service definitions
         "test-service": {
             "servers": [
                 {"host": "127.0.0.1", "port": 8081},
@@ -252,58 +180,67 @@ cmake --build build -j$(nproc)
             "algorithm": "round_robin"
         }
     },
-    "upstream_health_check_timeout_ms": 500, // 上游 TCP 健康检查超时（毫秒）
-    "routes": [                     // 配置驱动路由
+    "upstream_health_check_timeout_ms": 500, // Upstream TCP health-check timeout (ms)
+    "routes": [                     // Config-driven routes
         {
             "name": "test-service-api",
             "method": "GET",
             "path": "/api/test/*",
-            "host": "*",            // 可选，默认 *
-            "tenant": "*",          // 可选，默认 *
+            "host": "*",            // Optional, defaults to *
+            "tenant": "*",          // Optional, defaults to *
             "target_type": "upstream",
             "upstream_target": {
                 "name": "test-service",
                 "timeout_ms": 5000,
-                "max_retries": 1,               // 额外重试次数（仅幂等方法）
-                "circuit_failure_threshold": 5, // 连续失败多少次打开熔断
-                "circuit_recovery_timeout_ms": 10000 // OPEN 后多久允许恢复探测
+                "max_retries": 1,               // Extra retries (idempotent methods only)
+                "circuit_failure_threshold": 5, // Consecutive failures that open the circuit
+                "circuit_recovery_timeout_ms": 10000 // Time before half-open probes are allowed
             },
             "auth_required": true,
             "allowed_api_keys": ["test-key-123", "premium-key-456"]
         }
     ],
-    "rate_limit": {                 // 默认限流（令牌桶）
+    "rate_limit": {                 // Default rate limit (token bucket)
         "capacity": 20,
         "refill_per_second": 5
     },
-    "api_keys": [                   // API Key、限流额度和 host/tenant 范围
+    "api_keys": [                   // API keys, rate-limit quotas and host/tenant scopes
         {
             "key": "test-key-123",
-            "name": "测试客户端",
+            "name": "Test Client",
             "rate_limit": {"capacity": 200, "refill_per_second": 100},
             "allowed_hosts": ["*"],
             "allowed_tenants": ["*"]
         },
         {
             "key": "premium-key-456",
-            "name": "高级客户端",
+            "name": "Premium Client",
             "rate_limit": {"capacity": 1000, "refill_per_second": 500}
         }
     ]
 }
 ```
 
-### 启动服务器
+### Run
 
 ```bash
-# 直接启动
+# Start directly
 ./build/server
 
-# 或使用启动脚本
+# Or use the start script
 ./start.sh
 ```
 
-### 运行单元测试
+Accessing the server:
+- HTTPS is enabled by default — open https://localhost:5005 for the default page (trust the self-signed certificate manually).
+- Inspect request/response headers with `curl -kv https://localhost:5005/`.
+- Try HEAD: `curl -kI https://localhost:5005/index.html`.
+- Server identification: responses carry `Server: EpollHTTP/0.2`.
+- Press `Ctrl+C` for a graceful shutdown; the full log is preserved in `logs/epollserver.log`.
+
+### Test
+
+Unit tests:
 
 ```bash
 cd build
@@ -311,286 +248,395 @@ cmake .. -DBUILD_TESTS=ON
 cmake --build . -j$(nproc)
 ./tests/runTests
 
-# 或使用 CTest
+# Or via CTest
 ctest --test-dir build --output-on-failure
 ```
 
-## Docker 构建与运行
-
-### 方式一：Docker Compose 一键部署（推荐，含监控栈）
+Integration tests — start the real server plus a mock upstream and verify end-to-end behavior (TLS, keep-alive, auth, rate limiting, failover, circuit breaking, reload, etc. — 14 scenario groups):
 
 ```bash
-# 启动所有服务（server + Prometheus + Grafana）
+python3 tests/integration/run_integration_tests.py
+```
+
+Only the Python 3 standard library is required — nothing extra to install.
+
+### One-command CI
+
+```bash
+./ci.sh              # Build + unit tests + integration tests
+./ci.sh build        # Build only
+./ci.sh integration  # Integration tests only
+```
+
+The GitHub Actions workflow lives in `.github/workflows/ci.yml` and runs build, unit and integration tests on every push and pull request.
+
+## Docker
+
+### Option 1 — Docker Compose (recommended, includes the monitoring stack)
+
+```bash
+# Start all services (server + Prometheus + Grafana)
 sudo docker-compose up -d
 
-# 查看服务状态
+# Check service status
 sudo docker ps -a
 
-# 查看日志
+# Tail logs
 sudo docker-compose logs -f
 
-# 停止所有服务
+# Stop all services
 sudo docker-compose down
 ```
 
-访问地址：
-- 服务主页：https://localhost:5005（自签名证书，需手动信任）
-- 服务指标：https://localhost:5005/metrics
-- Prometheus：http://localhost:9090
-- Grafana：http://localhost:3000（默认用户名/密码：`admin`/`admin`）
+Access points:
+- Web home: https://localhost:5005 (self-signed certificate; trust it manually)
+- Metrics: https://localhost:5005/metrics
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (default credentials: `admin`/`admin`)
 
-### 方式二：单独构建镜像
+### Option 2 — build the image standalone
 
 ```bash
-# 构建镜像
+# Build the image
 docker build -t epoll-server .
 
-# 运行容器
+# Run the container
 docker run -d -p 5005:5005 --name my-server epoll-server
 
-# 查看日志
+# View logs
 docker logs my-server
 
-# 停止与删除
+# Stop and remove
 docker stop my-server && docker rm my-server
 ```
 
-## API 路由示例
+## Routing & Reverse Proxy
 
-服务端默认注册了以下 RESTful API 路由：
+The server registers the following RESTful routes by default:
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/hello` | 返回 JSON `{"message": "Hello, World!"}` |
-| `POST` | `/api/echo` | 回显请求体中的 JSON |
-| `PUT` | `/api/echo` | 返回 `PUT received: <body>` |
-| `DELETE` | `/api/resource` | 返回 `{"status": "deleted", ...}` |
-| `GET` | `/users/{id}` | 动态路由，返回模拟用户数据 |
-| `GET` | `/chunked` | Chunked 分块传输演示 |
-| `GET` | `/metrics` | Prometheus 指标端点（文本格式） |
-| `GET` | `/api/test/*` | 配置驱动反向代理，通过 `upstream_target.name` 转发至 `test-service` |
-| `GET` | `/<path>` | 静态文件服务（默认行为） |
+| `GET` | `/api/hello` | Returns `{"message": "Hello, World!"}` |
+| `POST` | `/api/echo` | Echoes the JSON request body |
+| `PUT` | `/api/echo` | Returns `PUT received: <body>` |
+| `DELETE` | `/api/resource` | Returns `{"status": "deleted", ...}` |
+| `GET` | `/users/{id}` | Dynamic route returning mock user data |
+| `GET` | `/chunked` | Chunked transfer demo |
+| `GET` | `/metrics` | Prometheus metrics endpoint (text format) |
+| `GET` | `/api/test/*` | Config-driven reverse proxy, forwarded via `upstream_target.name` to `test-service` |
+| `GET` | `/<path>` | Static file serving (default behavior) |
 
-## Prometheus + Grafana 监控
+Reverse proxying is configured through the `upstreams` and `routes` sections of `config.json`, transparently forwarding requests to backend services:
 
-项目内置了 Prometheus 指标端点 `/metrics`，通过 `docker-compose` 一键集成完整监控栈。
+- **`upstreams`** — defines a group of backend servers and their load-balancing algorithm (`round_robin` is currently supported).
+- **`routes`** — forwards matching "method + path" pairs to a named upstream (paths support `*` wildcards).
+- **Health checks** — every worker actively probes upstream nodes over TCP once per second, ejecting failed nodes and re-admitting them after recovery.
+- **Load balancing** — `UpstreamManager` round-robins across healthy nodes; forwarding is implemented in `http_client::forward_request`.
+- **Timeouts & error classification** — connect, send and read phases each have timeout control; structured `BackendError` values distinguish failure types and map to 502/503/504.
+- **Retries** — only idempotent methods and retryable transient errors are retried; `max_retries` controls the extra attempts per route.
+- **Circuit breaking** — consecutive failures are tracked per upstream/backend; `circuit_failure_threshold` opens the circuit, half-open probes are allowed after `circuit_recovery_timeout_ms`, and success closes it.
 
-### 架构
+## Auth & Rate Limiting
+
+- **Token-bucket rate limiting** — `RateLimiter` implements a global limiter shared across workers (keeping totals accurate under `SO_REUSEPORT` multi-worker mode), counted per client IP; over-limit requests receive `429 Too Many Requests`.
+- **API-key authentication** — keys are extracted from the `X-API-Key` header or `Authorization: Bearer <key>`, and the `api_keys` config assigns differentiated rate-limit quotas per client.
+
+```bash
+# Returns 429 once the rate limit trips
+for i in $(seq 1 30); do curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:5005/api/hello; done
+```
+
+## Observability
+
+The gateway exposes Prometheus metrics at the built-in `/metrics` endpoint, and `docker-compose` wires up the complete monitoring stack in one step.
+
+### Monitoring architecture
 
 ```
 server:5005/metrics
        │
-       ▼ (每 5s scrape)
+       ▼ (scraped every 5s)
  Prometheus :9090 ─────▶ Grafana :3000
- (时序数据库)           (可视化仪表盘)
+ (time series)           (dashboards)
 ```
 
-### 暴露的指标
+### Exposed metrics
 
-| 指标名 | 类型 | 说明 |
+| Metric | Type | Description |
 |---|---|---|
-| `epoll_http_requests_total{code="2xx|3xx|4xx|5xx"}` | Counter | 按状态码分类的请求计数 |
-| `epoll_http_requests_total_total` | Counter | 请求总数 |
-| `epoll_http_request_duration_seconds_bucket{le="..."}` | Histogram | 请求延迟分布（11 个桶） |
-| `epoll_http_request_duration_seconds_sum/_count` | Histogram | 请求延迟累计值与请求数 |
-| `epoll_cache_hits_total` / `epoll_cache_misses_total` | Counter | LRU 文件缓存命中/未命中 |
-| `epoll_fd_cache_hits_total` / `epoll_fd_cache_misses_total` | Counter | FD 缓存命中/未命中 |
-| `epoll_gzip_cache_hits_total` / `epoll_gzip_cache_misses_total` | Counter | Gzip 压缩缓存命中/未命中 |
-| `epoll_upstream_errors_total{type="..."}` | Counter | upstream 错误分类计数（connect_failed、connect_timeout、write_failed、write_timeout、read_failed、read_timeout、invalid_response） |
-| `epoll_route_requests_total{route,host,tenant,code}` | Counter | route/host/tenant 维度的 2xx/4xx/5xx 请求数 |
-| `epoll_route_latency_seconds_sum/_count{route,host,tenant}` | - | route/host/tenant 维度的延迟 sum/count（尚未提供独立 histogram） |
+| `epoll_http_requests_total{code="2xx|3xx|4xx|5xx"}` | Counter | Requests by status class |
+| `epoll_http_requests_total_total` | Counter | Total requests |
+| `epoll_http_request_duration_seconds_bucket{le="..."}` | Histogram | Request latency distribution (11 buckets) |
+| `epoll_http_request_duration_seconds_sum/_count` | Histogram | Cumulative latency and request count |
+| `epoll_cache_hits_total` / `epoll_cache_misses_total` | Counter | LRU file-cache hits/misses |
+| `epoll_fd_cache_hits_total` / `epoll_fd_cache_misses_total` | Counter | FD-cache hits/misses |
+| `epoll_gzip_cache_hits_total` / `epoll_gzip_cache_misses_total` | Counter | Gzip compression-cache hits/misses |
+| `epoll_upstream_errors_total{type="..."}` | Counter | Upstream error counts (connect_failed, connect_timeout, write_failed, write_timeout, read_failed, read_timeout, invalid_response) |
+| `epoll_route_requests_total{route,host,tenant,code}` | Counter | 2xx/4xx/5xx requests per route/host/tenant |
+| `epoll_route_latency_seconds_sum/_count{route,host,tenant}` | - | Latency sum/count per route/host/tenant (no dedicated histogram yet) |
 
-### 在 Grafana 中添加数据源
+### Adding the Grafana data source
 
-1. 浏览器打开 http://localhost:3000，使用 `admin`/`admin` 登录
-2. 左侧菜单 → **Connections** → **Data sources** → **Add data source**
-3. 选择 **Prometheus**
-4. 在 **Prometheus server URL** 填入 `http://prometheus:9090`（容器间通过 Docker 网络通信）
-5. 点击 **Save & test**，确认显示 "Successfully queried the Prometheus API"
+1. Open http://localhost:3000 in a browser and sign in with `admin`/`admin`
+2. Left sidebar → **Connections** → **Data sources** → **Add data source**
+3. Choose **Prometheus**
+4. Set **Prometheus server URL** to `http://prometheus:9090` (containers communicate over the Docker network)
+5. Click **Save & test**; you should see "Successfully queried the Prometheus API"
 
-### 常用 PromQL 查询
+### Useful PromQL
 
 ```promql
-# QPS（每秒请求数）
+# QPS (requests per second)
 rate(epoll_http_requests_total_total[1m])
 
-# 错误率
+# Error rate
 sum(rate(epoll_http_requests_total{code="4xx"}[1m]) + rate(epoll_http_requests_total{code="5xx"}[1m])) /
 sum(rate(epoll_http_requests_total_total[1m]))
 
-# P99 延迟
+# P99 latency
 histogram_quantile(0.99, rate(epoll_http_request_duration_seconds_bucket[1m]))
 
-# 文件缓存命中率
+# File-cache hit ratio
 sum(rate(epoll_cache_hits_total[1m])) /
 sum(rate(epoll_cache_hits_total[1m]) + rate(epoll_cache_misses_total[1m]))
 
-# route 维度平均延迟
+# Per-route average latency
 rate(epoll_route_latency_seconds_sum[1m]) / rate(epoll_route_latency_seconds_count[1m])
 
-# upstream 连接超时错误速率
+# Upstream connect-timeout error rate
 rate(epoll_upstream_errors_total{type="connect_timeout"}[1m])
 ```
 
-## HTTPS 加密传输
+### Logging
 
-服务端集成 OpenSSL，在 TCP 连接建立后自动执行 TLS 握手，使用 `certs/server.crt` 与 `certs/server.key` 作为证书与私钥。客户端需以 HTTPS 方式访问：
-
-```bash
-# 使用 -k 忽略自签名证书校验
-curl -kv https://localhost:5005/
-
-# 或使用 openssl 客户端直接测试 TLS 握手
-openssl s_client -connect localhost:5005
-```
-
-> 注意：证书为演示用途的自签名证书，生产环境请替换为受信任机构签发的证书。
-
-## 反向代理
-
-通过 `config.json` 中的 `upstreams` 与 `routes` 配置，可将请求透明转发到后端服务：
-
-- **`upstreams`**：定义一组后端服务器及其负载均衡算法（当前支持 `round_robin`）。
-- **`routes`**：将匹配的「方法 + 路径」转发到指定的上游（路径支持 `*` 通配符）。
-- **健康检查**：每个 Worker 每秒主动对上游节点执行 TCP 连接探测，自动摘除故障节点并在恢复后重新加入。
-- **负载均衡**：`UpstreamManager` 采用轮询策略在健康节点间分发请求，转发逻辑由 `http_client::forward_request` 实现。
-- **超时与错误分类**：连接、发送、读取阶段均具备超时控制，通过结构化 `BackendError` 区分失败类型，映射到 502/503/504。
-- **重试**：仅幂等方法与可重试的临时错误会重试，路由可通过 `max_retries` 控制额外重试次数。
-- **熔断**：按 upstream/backend 维度统计连续失败，达到 `circuit_failure_threshold` 打开熔断，`circuit_recovery_timeout_ms` 后允许半开探测，成功后关闭熔断。
-
-## 可观测性日志
-
-- **X-Trace-Id**：客户端携带 `X-Trace-Id` 时沿用并回传，否则网关生成，贯穿请求日志和 AUDIT 日志。
-- **CLF 访问日志**：记录所有完成请求的客户端 IP、方法、路径、状态码、响应大小和耗时。
-- **AUDIT 审计日志**：仅在响应完成时记录失败和安全策略事件，包含 trace_id、method/path、Host/Tenant、route、status、failure reason、脱敏后的 API Key 和 User-Agent，避免鉴权/限流/路由分支重复写入。
+- **`X-Trace-Id`** — echoed back when the client provides it, otherwise generated by the gateway; present in both request and AUDIT logs.
+- **CLF access log** — client IP, method, path, status code, response size and latency for every completed request.
+- **AUDIT log** — records failures and security-policy events once when the response completes: trace_id, method/path, Host/Tenant, route, status, failure reason, masked API key and User-Agent — no duplicate writes from the auth/rate-limit/routing branches.
 
 ## Runtime Reload
 
-向服务进程发送 `SIGHUP` 即可触发热更新：
+Send `SIGHUP` to the server process to trigger a hot reload:
 
 ```bash
 kill -HUP $(pgrep server)
 ```
 
-- 信号处理器只递增 reload generation，不做文件 I/O 和 JSON 解析。
-- Worker 在安全检查点检查 generation 并应用新配置，各 Worker 不保证同一时刻切换。
-- reload 更新路由、upstream、API Key、默认限流配置和 Keep-Alive 超时。
-- reload 前校验 JSON 文件存在且可解析，无效配置不会覆盖当前生效配置。
+- The signal handler only increments the reload generation — no file I/O or JSON parsing happens there.
+- Workers check the generation at safe checkpoints and apply the new config; workers do not switch at the exact same instant.
+- Reload updates routes, upstreams, API keys, default rate limiting and the keep-alive timeout.
+- The JSON file is validated (exists and parses) before reload; an invalid config never replaces the currently active one.
 
-## 限流与 API Key 认证
+## HTTPS
 
-- **令牌桶限流**：基于 `RateLimiter` 令牌桶算法，全局限流器跨 Worker 共享（配合 `SO_REUSEPORT` 多 Worker 场景保证总量准确），按客户端 IP 计数，超限返回 `429 Too Many Requests`。
-- **API Key 认证**：支持从 `X-API-Key` 请求头或 `Authorization: Bearer <key>` 提取 API Key，配合 `api_keys` 配置为不同客户端分配差异化的限流额度。
+The server integrates OpenSSL and performs the TLS handshake automatically once the TCP connection is established, using `certs/server.crt` and `certs/server.key` as the certificate and private key. Clients must connect over HTTPS:
 
 ```bash
-# 触发限流后返回 429
-for i in $(seq 1 30); do curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:5005/api/hello; done
+# -k skips self-signed certificate verification
+curl -kv https://localhost:5005/
+
+# Or test the TLS handshake directly with the openssl client
+openssl s_client -connect localhost:5005
 ```
 
-## 客户端
+> The bundled certificate is a self-signed demo certificate — replace it with a CA-issued certificate in production.
 
-配套的非阻塞 TCP 客户端位于 `src/client/`，可独立编译运行：
+## Companion Client
+
+A standalone non-blocking TCP client lives in `src/client/` and builds alongside the server:
 
 ```bash
 ./build/client
 ```
 
-> 注意：客户端默认连接 `192.168.189.138:5005`，如需修改请在 `src/client/main.cpp` 中调整目标地址。
+> The client connects to `192.168.189.138:5005` by default; adjust the target address in `src/client/main.cpp` if needed.
 
-## 调试与诊断
+## Debugging & Diagnostics
 
 ### AddressSanitizer (ASAN)
 
-Debug 构建模式自动启用 AddressSanitizer，可检测：
-- 堆/栈缓冲区溢出
-- 使用已释放的内存（use-after-free）
-- 内存泄漏
+Debug builds enable AddressSanitizer automatically, detecting:
+- Heap/stack buffer overflows
+- Use-after-free
+- Memory leaks
 
 ```bash
 ./build.sh Debug
-./build/server   # ASAN 检测报告会输出到 stderr
+./build/server   # ASAN reports are printed to stderr
 ```
 
-### 日志
+### Logs
 
-- 服务端日志：`logs/epollserver.log`
-- 客户端日志：`logs/client.log`
-- 控制台同步输出带颜色的日志（开发调试用）
+- Server log: `logs/epollserver.log`
+- Client log: `logs/client.log`
+- Colored console output synchronized with the log (handy during development)
 
+## Design Notes
 
-## 访问服务
+1. **HTTP parsing & pipelining** — a state machine parses the request line and headers incrementally as fragments arrive, without needing the full message; `Connection: keep-alive`/`close` are handled correctly, and pipelined requests on the same connection are processed strictly in request order.
+2. **Zero-copy file sending & LRU cache** — static files first hit the in-memory LRU cache; on a miss they are sent via zero-copy `open + fstat + sendfile`; small files (≤ 1 MB by default) are read into the cache after their first send, and cache entries expire automatically based on the file's modification time.
+3. **Send queue + EPOLLONESHOT cooperation** — the send queue is a `std::deque<std::vector<char>>` to keep front-deletion cheap; after each event the worker re-arms EPOLLIN/EPOLLOUT according to queue state and re-applies `EPOLLET | EPOLLONESHOT`, ensuring only one thread ever touches an fd at a time.
+4. **Errors & path safety** — requests containing `..` are rejected with 403; unsupported methods on matched paths return 405 with an `Allow` header; missing files return 404 and internal errors 500; error responses automatically set Content-Length and Content-Type and close the connection.
+5. **Logging & monitoring** — the CLF access log records every completed request and the AUDIT log records failures and security-policy events, both correlated by trace_id; timeouts and debug output can be lowered to trace level so normal runs stay quiet.
+6. **Signals & graceful shutdown** — `SIGINT`/`SIGTERM` set a global atomic flag; workers check it on every epoll_wait timeout and exit their event loop; `SIGHUP` triggers runtime reload; destruction order guarantees Tcpserver → DynamicThreadPool → Logger::Guard, with logs closed last.
+7. **Routing** — built-in routes are registered by `register_default_routes()` and config-driven routes by `register_configured_routes()`; each request is matched exactly once and the `ResolvedRoute` is reused across auth, rate limiting and dispatch; matching covers method/path/Host/Tenant with `local`/`upstream`/`static` targets, and GET/HEAD fall back to static file serving when no gateway route matches.
+8. **Idle timeout** — each connection tracks its last-active time; when epoll_wait times out, expired connections are swept and closed, with a configurable threshold.
+9. **Unit tests** — Google Test, currently 30/30 passing, covering parsing, caching, routing, auth, rate limiting, upstream timeouts/retries/health checks and the circuit breaker; one command via `ctest`.
 
-- 服务器默认启用 HTTPS，浏览器访问 https://localhost:5005 查看默认页面（自签名证书需手动信任）。
-- 使用 `curl -kv https://localhost:5005/` 查看详细请求/响应头。
-- 测试 HEAD 方法：`curl -kI https://localhost:5005/index.html`
-- 检查服务器标识：响应头中可见 `Server: EpollHTTP/0.2`。
-- 按下 `Ctrl+C` 优雅关闭服务器，日志完整保存在 `logs/epollserver.log`。
+## Tech Stack
 
-## 技术栈
-
-| 技术 | 说明 |
+| Technology | Role |
 |---|---|
-| C++17 | 核心语言，使用 RAII、移动语义、std::atomic、std::call_once 等 |
-| epoll | Linux I/O 多路复用，边缘触发（ET）+ ONESHOT |
-| SO_REUSEPORT | 多 Worker 负载均衡 |
-| spdlog | 高性能异步日志库 |
-| CMake | 跨平台构建系统 |
-| sendfile | 零拷贝文件传输 |
-| nlohmann/json | JSON 解析（单头文件） |
-| Google Test | 单元测试框架 |
-| Docker | 容器化部署 |
-| Docker Compose | 多容器服务编排 |
-| Prometheus | 指标采集与时序数据库 |
-| Grafana | 指标可视化仪表盘 |
-| zlib | Gzip 压缩 |
-| OpenSSL | TLS/SSL 加密传输 |
+| C++17 | Core language: RAII, move semantics, std::atomic, std::call_once, etc. |
+| epoll | Linux I/O multiplexing, edge-triggered (ET) + ONESHOT |
+| SO_REUSEPORT | Multi-worker load balancing |
+| spdlog | High-performance async logging |
+| CMake | Cross-platform build system |
+| sendfile | Zero-copy file transfer |
+| nlohmann/json | JSON parsing (header-only) |
+| Google Test | Unit test framework |
+| Docker | Containerized deployment |
+| Docker Compose | Multi-container service orchestration |
+| Prometheus | Metrics collection & time-series storage |
+| Grafana | Metrics visualization dashboards |
+| zlib | Gzip compression |
+| OpenSSL | TLS/SSL encrypted transport |
 
-## 核心设计细节
+## Performance
 
-1. **HTTP 协议解析与管线化**：状态机解析请求行和头部，支持分片接收，无需完整报文；正确处理 `Connection: keep-alive`/`close`；管线化（Pipelining）按顺序处理同一连接上的多个请求，响应顺序与请求严格一致。
-2. **零拷贝文件发送与 LRU 缓存**：静态文件优先尝试内存缓存（LRU），未命中则使用 `open + fstat + sendfile` 零拷贝传输；小文件（默认 ≤ 1MB）首次发送后读入缓存；缓存基于文件修改时间自动失效。
-3. **发送队列与 EPOLLONESHOT 协作**：发送队列采用 `std::deque<std::vector<char>>` 减少头删开销；每次事件处理完成后根据队列状态重新设置 EPOLLIN/EPOLLOUT，并重新应用 `EPOLLET | EPOLLONESHOT`，确保同一时间只有一个线程处理该 fd。
-4. **错误处理与路径安全**：拦截包含 `..` 的请求返回 403；不支持的 HTTP 方法返回 405（带 `Allow` Header）；文件不存在返回 404，内部错误返回 500；错误响应自动设置 Content-Length 和 Content-Type 并关闭连接。
-5. **日志与监控**：CLF 访问日志记录所有完成请求，AUDIT 日志记录失败和安全策略事件，均带 trace_id 关联；超时、调试日志可配置为 trace 级别，日常运行不会刷屏。
-6. **信号处理与优雅关闭**：`SIGINT`/`SIGTERM` 置位全局原子标志，Worker 在每次超时返回时检查并主动退出事件循环；`SIGHUP` 触发 runtime reload；析构顺序保证 Tcpserver → DynamicThreadPool → Logger::Guard，日志最后关闭。
-7. **路由系统**：内置路由通过 `register_default_routes()` 注册，配置路由通过 `register_configured_routes()` 注册；一次请求只匹配一次，`ResolvedRoute` 在鉴权、限流和分发之间复用；支持 method/path/Host/Tenant 四维匹配和 `local`/`upstream`/`static` 三类目标，未命中网关路由时 GET/HEAD 回退到静态文件服务。
-8. **空闲超时**：每个连接维护最后活跃时间，epoll_wait 超时时扫描并清理过期连接，支持配置超时阈值。
-9. **单元测试**：使用 Google Test，当前 30/30 通过，覆盖解析、缓存、路由、鉴权、限流、上游超时/重试/健康检查/熔断等模块，`ctest` 一键运行。
+- Concurrency: handles 10,000+ concurrent connections with ease (subject to the system fd limit).
+- Throughput: with caching enabled, repeated requests for small static files (e.g. index.html) reach several times the baseline QPS — tens of thousands of QPS per worker.
+- Latency: request processing sits in the microsecond range; zero-copy + in-memory caching keeps CPU usage very low.
+- Detailed benchmark reports are forthcoming.
 
-## 性能指标
+## Known Limitations
 
-- 并发连接数：轻松应对 10,000+ 并发连接（受系统 fd 限制）。
-- 吞吐量：静态小文件（如 index.html）在启用缓存后，重复请求的 QPS 可提升数倍，单 Worker 可达数万 QPS。
-- 延迟：请求处理在微秒级，零拷贝 + 内存缓存极低 CPU 占用。
-- 具体压测数据请参见后续压测报告。
+- Circuit-breaker state is maintained independently by each worker — it is not a global, cross-worker shared state.
+- Route/host/tenant dimensions currently expose latency sum/count only, without a dedicated histogram (so per-dimension P95/P99 cannot be derived directly).
+- Runtime reload is polled by workers at checkpoints; workers do not switch config at the exact same instant.
+- Config validation currently amounts to "the JSON parses"; field types, ranges and route-conflict checks are not yet covered.
+- Route matching is a linear scan — fine at the current scale, with no Trie/index structure yet.
+- Connection pooling, async upstream, multi-algorithm load balancing and distributed rate limiting are not implemented yet.
+- OpenTelemetry `traceparent`, distributed tracing and external audit storage are not integrated yet.
 
-## 已知限制
+## Roadmap
 
-- 熔断状态由每个 Worker 独立维护，不是跨 Worker 共享的全局状态。
-- route/host/tenant 维度目前只有 latency sum/count，暂无独立 histogram（无法直接得到维度级 P95/P99）。
-- runtime reload 采用 Worker 周期检查，各 Worker 不保证同一时刻切换配置。
-- 配置校验目前以 JSON 可解析为主，尚未覆盖字段类型、范围和路由冲突检查。
-- 路由匹配为线性遍历，适合当前规模，未引入 Trie/索引。
-- 尚未实现连接池、异步 upstream、多级负载均衡算法和分布式限流。
-- 尚未接入 OpenTelemetry `traceparent`、分布式 Trace 和外部审计存储。
+1. Add runtime-reload and real-HTTP end-to-end integration tests.
+2. Add config field/range validation, route-conflict checks and reload-failure auditing.
+3. Complete route/host/tenant latency histograms and failure-rate metrics.
+4. Evaluate a cross-worker shared circuit-breaker implementation.
+5. Decide on a route index, connection pooling or async upstream based on real route counts and benchmark results.
+6. HTTP/2 and WebSocket support.
+7. Stress testing and performance profiling reports.
+8. Extend CI/CD: GitHub Actions releases and image publishing, plus Gitee CI.
 
-## 后续计划
+## Documentation
 
-1. 补充 runtime reload 和真实 HTTP 端到端集成测试。
-2. 增加配置字段范围校验、路由冲突检查和 reload 失败审计。
-3. 完善 route/host/tenant 维度的 latency histogram 和失败率指标。
-4. 评估跨 Worker 共享熔断状态的实现方式。
-5. 根据真实路由规模和压测结果，决定是否引入路由索引、连接池或异步 upstream。
-6. 支持 HTTP/2、WebSocket。
-7. 压力测试与性能剖析报告。
-8. CI/CD (GitHub Actions / Gitee CI)。
+- [Project status](docs/PROJECT_STATUS.md) — snapshot of current capabilities, limitations and next steps
+- [Changelog](docs/CHANGELOG.md) — dated change history
+- [Roadmap](docs/ROADMAP.md) — commercialization positioning, technical evolution and validation plan
 
-## 许可
+## Project Structure
 
-本项目采用 MIT License。
+```
+epollthread/
+├── include/                  # Header files
+│   ├── server/               # Server headers
+│   │   ├── server.h          # TcpServer main class
+│   │   ├── tcpworker.h       # TcpWorker thread (with SSL state machine)
+│   │   ├── http_handler.h    # HTTP request handling & routing
+│   │   ├── http_client.h     # Reverse-proxy forwarding & BackendError
+│   │   ├── upstream_manager.h# Upstream management & health checks
+│   │   ├── rate_limiter.h    # Token-bucket rate limiter
+│   │   ├── rate_limiter_manager.h # Rate-limiter manager
+│   │   ├── api_key_manager.h # API key validation
+│   │   ├── metrics.h         # Prometheus metrics collector (singleton, thread-safe)
+│   │   ├── pool.h            # DynamicThreadPool
+│   │   ├── config.h          # JSON config loading
+│   │   ├── gzip_utils.h      # Gzip compression utilities
+│   │   ├── content_type.h    # Content-Type mapping
+│   │   ├── route_utils.h     # Route matching & parameter extraction
+│   │   └── echohandler.h     # Echo handler (early demo)
+│   ├── client/               # Client headers
+│   │   ├── client.h          # Non-blocking client
+│   │   └── clienthandler.h   # Client handler
+│   └── common/               # Shared headers
+│       ├── mysocket.h        # Socket RAII wrapper (with SSL support)
+│       ├── poller.h          # Single-fd poll wait wrapper
+│       ├── myepoll.h         # Epoll RAII wrapper
+│       ├── mylogger.h        # Async logging wrapper
+│       ├── http_parser.h     # HTTP/1.1 protocol parser (state machine)
+│       ├── file_cache.h      # LRU in-memory file cache
+│       ├── fd_cache.h        # FD cache (TTL-based)
+│       └── error_utils.h     # Error handling utilities
+├── src/                      # Source files
+│   ├── server/               # Server sources
+│   │   ├── main.cpp          # Server entry point
+│   │   ├── server.cpp        # TcpServer implementation
+│   │   ├── tcpworker.cpp     # TcpWorker implementation (incl. TLS handshake)
+│   │   ├── http_handler.cpp  # HttpHandler implementation (route registration, rate limiting)
+│   │   ├── http_client.cpp   # Reverse-proxy forwarding
+│   │   ├── upstream_manager.cpp # Upstream management & health checks
+│   │   ├── rate_limiter.cpp  # Token-bucket rate limiter
+│   │   ├── metrics.cpp       # Metrics collector implementation
+│   │   ├── pool.cpp          # Dynamic thread pool
+│   │   ├── content_type.cpp  # Content-Type implementation
+│   │   └── gzip_utils.cpp    # Gzip compression
+│   ├── client/               # Client sources
+│   │   ├── main.cpp          # Client entry point
+│   │   ├── client.cpp        # Client implementation
+│   │   └── clienthandler.cpp # ClientHandler implementation
+│   └── common/               # Shared module sources
+│       ├── poller.cpp        # Poller implementation
+│       ├── mysocket.cpp      # Socket implementation (with SSL)
+│       ├── myepoll.cpp       # Epoll implementation
+│       ├── mylogger.cpp      # Logger implementation
+│       ├── error_utils.cpp   # Error handling implementation
+│       ├── fd_cache.cpp      # FD cache implementation
+│       ├── file_cache.cpp    # File cache implementation
+│       └── http_parser.cpp   # HTTP parser implementation
+├── certs/                    # TLS certificate & private key
+│   ├── server.crt
+│   └── server.key
+├── tests/                    # Unit tests
+│   ├── CMakeLists.txt
+│   ├── test_http_parser.cpp  # HTTP parser tests
+│   ├── test_file_cache.cpp   # LRU cache tests
+│   ├── test_http_response.cpp# HTTP response tests
+│   ├── test_route_utils.cpp  # Route matching tests
+│   ├── test_auth_and_rate_limit.cpp # API key & rate limiting tests
+│   ├── test_http_client.cpp  # Upstream timeout & error classification tests
+│   ├── test_upstream_manager.cpp # Upstream health-check tests
+│   └── integration/          # Integration tests (real server + mock upstream)
+│       ├── run_integration_tests.py
+│       └── mock_backend.py
+├── www/                      # Static file root
+│   ├── index.html
+│   └── big.html
+├── logs/                     # Log output directory
+├── build/                    # Build output directory (generated by cmake)
+├── CMakeLists.txt            # CMake build configuration
+├── build.sh                  # One-command build script
+├── ci.sh                     # One-command CI (build + unit + integration tests)
+├── start.sh                  # Quick start script
+├── config.json               # Server configuration file
+├── vcpkg.json                # vcpkg dependency manifest
+├── Dockerfile                # Docker multi-stage build
+├── docker-compose.yml        # Docker Compose stack (server + Prometheus + Grafana)
+├── prometheus.yml            # Prometheus scrape configuration
+├── docs/
+│   ├── PROJECT_STATUS.md     # Project status snapshot (capabilities, limits, next steps)
+│   ├── CHANGELOG.md          # Change history (reverse-chronological)
+│   └── ROADMAP.md            # Commercialization roadmap (positioning, evolution, validation)
+├── README.md                 # Documentation (English)
+└── README.zh-CN.md           # Documentation (Simplified Chinese)
+```
 
-## 致谢
+## License
 
-感谢 spdlog、nlohmann/json、Google Test 等优秀开源项目，以及 Nginx 的架构启示。
+Released under the MIT License.
 
-欢迎 Star 和 PR！
+## Acknowledgements
+
+Thanks to spdlog, nlohmann/json, Google Test and the other excellent open-source projects this gateway builds on — and to Nginx for the architectural inspiration.
+
+Stars and PRs welcome!

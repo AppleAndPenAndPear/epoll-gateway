@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include "http_parser.h"  // 包含 HttpResponse（可能需调整路径）
+#include "http_parser.h"  // Includes HttpResponse (path may need adjusting)
 
-// 如果你的 HttpResponse 定义在单独头文件，请包含相应头文件
+// If HttpResponse is defined in a separate header, include that header here
 TEST(HttpResponseTest, Serialization) {
     HttpResponse resp;
     resp.status_code = 200;

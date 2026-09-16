@@ -21,7 +21,7 @@ inline std::string normalize_header_value(const std::string& value) {
     return normalized;
 }
 
-// 分割路径，如 "/users/123" -> {"users", "123"}
+// Split a path, e.g. "/users/123" -> {"users", "123"}
 inline std::vector<std::string> splitPath(const std::string& path, char delimiter = '/') {
     std::vector<std::string> tokens;
     std::string token;
@@ -32,9 +32,9 @@ inline std::vector<std::string> splitPath(const std::string& path, char delimite
     return tokens;
 }
 
-// 匹配路由模式，提取参数
+// Match a route pattern and extract parameters
 inline bool matchRoute(const std::string& pattern, const std::string& path,std::map<std::string, std::string>& params) {
-    // 通配符前缀匹配：如 "/api/users/*" 可匹配 "/api/users/123"、"/api/users/123/orders"
+    // Wildcard prefix match: e.g. "/api/users/*" matches "/api/users/123" and "/api/users/123/orders"
     if (!pattern.empty() && pattern.back() == '*') {
         std::string prefix = pattern.substr(0, pattern.size() - 1);
         return path.compare(0, prefix.size(), prefix) == 0;
@@ -93,10 +93,10 @@ inline bool routeMatchesRequest(const GatewayRoute& route,
     return route.method.empty() || route.method == "*" || route.method == method;
 }
 
-inline bool is_safe_static_path(const std::string& mount_path,      //mount_path：挂载点，例如 /static
+inline bool is_safe_static_path(const std::string& mount_path,      // mount_path: mount point, e.g. /static
                                 const std::string& request_path,
-                                const std::string& root_dir,        //root_dir：静态文件根目录，例如 /var/www
-                                std::string& resolved_path) {       //resolved_path：如果合法，输出最终安全文件路径
+                                const std::string& root_dir,        // root_dir: static file root, e.g. /var/www
+                                std::string& resolved_path) {       // resolved_path: outputs the final safe file path if valid
     std::error_code ec;
     std::filesystem::path root = std::filesystem::weakly_canonical(root_dir, ec);
     if (ec) {
@@ -114,7 +114,7 @@ inline bool is_safe_static_path(const std::string& mount_path,      //mount_path
         suffix = "/index.html";
     }
 
-    //防止路径穿越
+    // Prevent path traversal
     while (!suffix.empty() && suffix[0] == '/') {
         suffix.erase(0, 1);
     }

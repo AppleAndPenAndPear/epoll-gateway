@@ -22,9 +22,9 @@ Client::Client(const std::string& ip, uint16_t port) : sock_(AF_INET, SOCK_STREA
     }
     bool connected = sock_.connect((struct sockaddr*)&servaddr, sizeof(servaddr));
     if (!connected) {
-        // 一定是 EINPROGRESS（因为其他错误已抛出）
+        // Must be EINPROGRESS (other errors already threw)
         connected_ = false;
-        // 异步连接中，这里可以记录日志，后续由上层通过 epoll 监听 EPOLLOUT 事件确认连接完成
+        // Connection in progress; log here and let the upper layer watch EPOLLOUT via epoll to confirm completion
         Logger::get()->info("Client connection to {}:{} is in progress", ip, port);
         epoll_.add(sock_.getFd(), EPOLLOUT | EPOLLET | EPOLLONESHOT);
     } else {
@@ -36,7 +36,7 @@ Client::Client(const std::string& ip, uint16_t port) : sock_(AF_INET, SOCK_STREA
 void Client::run(){
     handler_.set_request("Hello, server!");
 
-    // 如果连接已立刻完成，直接模拟一次可写事件
+    // If the connection completed immediately, simulate a writable event
     if (connected_) {
         handler_.handle_event(sock_, epoll_, EPOLLOUT);
     }
@@ -44,27 +44,27 @@ void Client::run(){
     const int MAX_EVENTS = 4;
     epoll_event evs[MAX_EVENTS];
 
-    int idle = 0;   //增加空闲计数，防止服务端无响应导致无限等待
+    int idle = 0;   // Idle counter to avoid waiting forever when the server is unresponsive
     while (!handler_.is_done() && !client_stop_flag.load()) {
         auto wait_result = epoll_.wait(evs, MAX_EVENTS, 1000);
         if (!wait_result) {
-            // 没有就绪事件（超时或中断）
+            // No ready events (timeout or interrupt)
             if (wait_result.interrupted) {
-                // 你可以在这里做特殊处理，例如检查是否需要重载配置;超时期间执行定时任务
-                // 目前我们只是继续循环
+                // Special handling could go here, e.g. checking for a config reload; run periodic tasks during timeouts
+                // For now we just continue the loop
                 continue;
             }
             if (wait_result.timeout) {
-                // 每次超时检查一下是否被通知停止
+                // On each timeout, check whether a stop was requested
                 if (client_stop_flag.load()) break;
-                if (++idle > 10) {   // 10 秒无响应
+                if (++idle > 10) {   // No response for 10 seconds
                     Logger::get()->error("Receive timeout");
                     break;
                 }
                 continue;
             }
             idle = 0;
-            // 无论是超时还是中断，都继续下一轮循环
+            // Continue with the next loop iteration on timeout or interrupt
             continue;
         }
         for (int i = 0; i < wait_result.event_count; ++i) {

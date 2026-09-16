@@ -40,7 +40,7 @@ void DynamicThreadPool::workerLoop() {
             if (cv_.wait_for(lock, std::chrono::seconds(1), [this] {
                 return stop_ || !tasks_.empty();
             })) {
-                // 被唤醒是因为有任务或停止
+                // Woken up because there is a task or the pool is stopping
                 if (stop_ && tasks_.empty()){
                     --current_threads_;
                     Logger::get()->info("pool stop && task queue is empty, thread exists,id = {}",std::hash<std::thread::id>{}(std::this_thread::get_id()));
@@ -50,14 +50,14 @@ void DynamicThreadPool::workerLoop() {
                     task = std::move(tasks_.front());
                     tasks_.pop();
                 } else {
-                    continue; // 可能是虚假唤醒
+                    continue; // Possible spurious wakeup
                 }
             } else {
-                // 超时，检查是否需要缩容
+                // Timed out, check whether to scale down
                 if (shouldScaleDown()) {
                     Logger::get()->info("scale down: thread exiting, id = {}, remaining threads = {}",std::hash<std::thread::id>{}(std::this_thread::get_id()), current_threads_ - 1);
                     --current_threads_;
-                    return; // 线程退出
+                    return; // Thread exits
                 }
                 continue;
             }

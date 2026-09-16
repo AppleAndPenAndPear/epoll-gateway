@@ -1,3 +1,3 @@
 #!/bin/bash
-echo "==> 启动服务器 (监听 5005)..."
+echo "==> Starting server (listening on 5005)..."
 ./build/server

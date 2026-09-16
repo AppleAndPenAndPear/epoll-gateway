@@ -4,7 +4,7 @@
 #include "mysocket.h"
 #include "myepoll.h"
 #include <memory>
-//#include "echohandler.h"    //只做回显,现在使用httphandler
+//#include "echohandler.h"    // Echo only; replaced by httphandler
 #include "http_handler.h"
 #include "mylogger.h"
 #include "error_utils.h"
@@ -15,12 +15,12 @@
 using namespace std;
 
 
-// TCP通讯的服务端类。
+// TCP communication server class.
 class Tcpserver
 {
 private:
   int backlog_;
-  unsigned short m_port;    // 服务端用于通讯的端口。
+  unsigned short m_port;    // Port used by the server for communication.
   atomic<bool> closed;
   unique_ptr<DynamicThreadPool> m_threadpool;
   std::vector<std::unique_ptr<TcpWorker>> workers_;

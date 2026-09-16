@@ -1,0 +1,37 @@
+name: CI
+
+# This workflow takes effect automatically when the repository is mirrored to GitHub;
+# when using Gitee only, you can use Gitee Go to invoke the same ci.sh instead.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++ cmake \
+            libspdlog-dev \
+            nlohmann-json3-dev \
+            zlib1g-dev \
+            libssl-dev \
+            libgtest-dev \
+            python3
+
+      - name: Build
+        run: ./ci.sh build
+
+      - name: Unit tests
+        run: ./ci.sh unit
+
+      - name: Integration tests
+        run: ./ci.sh integration

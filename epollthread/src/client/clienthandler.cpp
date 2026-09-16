@@ -10,17 +10,17 @@ void ClientHandler::handle_event(Socket& sock, Epoll& epoll, uint32_t events){
     switch (state_) {
     case CONNECTING:
         if (events & EPOLLOUT) {
-            // 检查 SO_ERROR 确认连接成功
+            // Check SO_ERROR to confirm the connection succeeded
             int err = 0; socklen_t len = sizeof(err);
             getsockopt(sock.getFd(), SOL_SOCKET, SO_ERROR, &err, &len);
             if (err != 0) { state_ = ERROR; done_ = true; return; }
             state_ = SENDING;
-            // 立即尝试发送（或等待下一次 EPOLLOUT）
+            // Try sending immediately (or wait for the next EPOLLOUT)
             [[fallthrough]];
         }else break;
     case SENDING:
-        // 发送 send_buf_，若发完则转为 RECEIVING
-        try {       //使用状态机解决封装send的错误
+        // Send send_buf_; switch to RECEIVING once fully sent
+        try {       // The state machine handles errors thrown by the send wrapper
             while (!send_buf_.empty()) {
                 int n = sock.send(send_buf_.data(), send_buf_.size(), MSG_NOSIGNAL);
                 if (n > 0) {
@@ -31,15 +31,15 @@ void ClientHandler::handle_event(Socket& sock, Epoll& epoll, uint32_t events){
                     return;
                 }
                 else {
-                    // n == -1 且非 EAGAIN 的情况被封装直接抛出异常，不会走到这里
+                    // n == -1 with a non-EAGAIN error throws from the wrapper and never reaches here
                 }
             }
-            // ★ 发送完毕，半关闭写端
+            // Send complete; half-close the write end
             if (::shutdown(sock.getFd(), SHUT_WR) == -1) {
                 Logger::get()->error("shutdown SHUT_WR failed: {}", strerror(errno));
                 state_ = ERROR; done_ = true; return;
             }
-            // 改为监听读
+            // Switch to watching reads
             epoll.mod(sock.getFd(), EPOLLIN | EPOLLET | EPOLLONESHOT);
             state_ = RECEIVING;
         }catch (const std::exception& e) {
@@ -61,7 +61,7 @@ void ClientHandler::handle_event(Socket& sock, Epoll& epoll, uint32_t events){
                         return;
                     }
                     else {
-                        // n == -1 且非 EAGAIN 的情况被封装直接抛出异常，不会走到这里
+                        // n == -1 with a non-EAGAIN error throws from the wrapper and never reaches here
                     }
                 }
             }catch (const std::exception& e) {
@@ -77,7 +77,7 @@ void ClientHandler::set_request(const std::string& req){
     send_buf_ = req;
 }
 
-// 获取收到的响应
+// Get the received response
 std::string ClientHandler::get_response() const { 
     return recv_buf_;
 }

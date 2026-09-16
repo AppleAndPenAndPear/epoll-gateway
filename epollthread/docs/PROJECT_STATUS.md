@@ -2,196 +2,199 @@
 
 ## Current Stage
 
-商用 API 网关基础能力建设。当前已经完成从 epoll HTTP 服务器向配置驱动网关的核心演进，正在进行可维护性、协议语义和生产运维能力的收口。
+Building the core capability set of a commercial API gateway. The evolution from an epoll HTTP server to a configuration-driven gateway is complete; work is now closing out maintainability, protocol semantics, and production operations.
 
 ## Current Validation
 
-- C++17 Release 构建通过。
-- CTest：30/30 通过。
-- 已覆盖 HTTP parser、文件缓存、响应序列化、路由、安全策略、上游超时、重试、健康检查和熔断基础行为。
-- Debug 构建支持 AddressSanitizer。
+- C++17 Release build passes.
+- CTest: 30/30 passing.
+- Integration tests: 32/32 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Covered: HTTP parser, file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, and circuit breaker basics.
+- Integration layer covers TLS, Keep-Alive, Trace-Id, 405+Allow, authentication, rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, and Chunked.
+- Debug builds support AddressSanitizer.
 
 ## Completed
 
-### 1. 网络与并发基础
+### 1. Network and Concurrency Foundation
 
-- 基于 Linux `epoll` 的非阻塞 Reactor。
-- `SO_REUSEPORT + One Loop Per Worker`：每个 `TcpWorker` 持有独立 listen socket 和 epoll loop。
-- `EPOLLET + EPOLLONESHOT` 事件管理，避免重复触发和惊群。
-- Socket、Epoll 等资源使用 RAII 封装。
-- 支持优雅关闭：`SIGINT`/`SIGTERM` 通知 Worker 退出并清理连接。
-- 支持 Keep-Alive、连接空闲超时和同一连接上的串行多请求处理。
+- Non-blocking Reactor based on Linux `epoll`.
+- `SO_REUSEPORT + One Loop Per Worker`: each `TcpWorker` owns an independent listen socket and epoll loop.
+- `EPOLLET + EPOLLONESHOT` event management, avoiding redundant triggering and thundering herd.
+- Socket, Epoll, and other resources wrapped in RAII.
+- Graceful shutdown: `SIGINT`/`SIGTERM` notify workers to exit and drain connections.
+- Keep-Alive, idle connection timeout, and serial multi-request handling on a single connection.
 
-### 2. HTTP/HTTPS 协议能力
+### 2. HTTP/HTTPS Protocol Support
 
-- HTTP/1.1 请求状态机解析。
-- 支持请求行、Header、Query、Body 和 Chunked 传输解析。
-- 当前支持 `GET`、`HEAD`、`POST`、`PUT`、`DELETE`。
-- OpenSSL 非阻塞 TLS 握手和加密读写。
-- 响应支持 Content-Length、Chunked、Content-Type、Content-Encoding。
-- 支持 Gzip 响应压缩和 `Accept-Encoding` 协商。
-- 统一返回 `X-Trace-Id`，用于请求和日志关联。
+- HTTP/1.1 request state-machine parsing.
+- Request line, header, query, body, and Chunked transfer parsing.
+- Currently supports `GET`, `HEAD`, `POST`, `PUT`, `DELETE`.
+- OpenSSL non-blocking TLS handshake and encrypted read/write.
+- Responses support Content-Length, Chunked, Content-Type, and Content-Encoding.
+- Gzip response compression with `Accept-Encoding` negotiation.
+- Uniform `X-Trace-Id` for request and log correlation.
 
-### 3. 路由与请求分发
+### 3. Routing and Request Dispatch
 
-- 内置路由通过 `register_default_routes()` 注册。
-- 配置文件路由通过 `register_configured_routes()` 注册。
-- 路由配置来自 `config.json` 的 `routes` 字段。
-- 支持 method、path、Host、Tenant 四个匹配条件。
-- 支持精确路径、通配符路径和路径参数，例如 `/users/{id}`。
-- 一次请求只执行一次路由匹配，`ResolvedRoute` 在鉴权、限流和实际分发之间复用。
-- 支持三类目标：
-	- `local`：本地 Handler。
-	- `upstream`：反向代理到后端服务。
-	- `static`：从指定静态根目录读取文件。
-- 已区分：
-	- `404`：路径、Host 或 Tenant 没有匹配。
-	- `405`：路径匹配但方法不允许。
-- `405` 响应支持 `Allow` Header，返回允许的方法集合。
-- 未命中网关路由时，GET/HEAD 可以进入静态文件 fallback。
+- Built-in routes are registered via `register_default_routes()`.
+- Configured routes are registered via `register_configured_routes()`.
+- Route configuration comes from the `routes` field of `config.json`.
+- Four match conditions: method, path, Host, and Tenant.
+- Exact paths, wildcard paths, and path parameters, e.g. `/users/{id}`.
+- Route matching runs exactly once per request; the `ResolvedRoute` is reused across authentication, rate limiting, and actual dispatch.
+- Three target types:
+	- `local`: local handler.
+	- `upstream`: reverse proxy to a backend service.
+	- `static`: serve files from a configured static root.
+- Distinguished:
+	- `404`: no match on path, Host, or Tenant.
+	- `405`: path matches but method not allowed.
+- `405` responses include an `Allow` header listing the permitted methods.
+- When no gateway route matches, GET/HEAD can fall back to static file serving.
 
-### 4. 鉴权、租户与限流
+### 4. Authentication, Tenancy, and Rate Limiting
 
-- 支持 `X-API-Key` 和 `Authorization: Bearer` 两种 API Key 提取方式。
-- 支持路由级 API Key allow/deny 列表。
-- 支持 API Key 的 Host 范围和 Tenant 范围绑定。
-- 支持路由级鉴权开关和匿名访问配置。
-- 基于 Token Bucket 实现限流。
-- 支持按客户端 IP、API Key 或路由维度限流。
-- RateLimiterManager 跨 Worker 共享，并定期清理长期未使用的 limiter。
-- API Key 可拥有独立的限流容量和补充速率。
+- Two API key extraction styles: `X-API-Key` and `Authorization: Bearer`.
+- Route-level API key allow/deny lists.
+- Host-scope and Tenant-scope binding for API keys.
+- Route-level auth toggle and anonymous access configuration.
+- Token Bucket based rate limiting.
+- Rate limiting by client IP, API key, or route.
+- RateLimiterManager is shared across workers, with periodic eviction of long-unused limiters.
+- Each API key can have its own rate-limit capacity and refill rate.
 
-### 5. 上游代理与可靠性
+### 5. Upstream Proxying and Reliability
 
-- `UpstreamManager` 维护 upstream 服务组和后端节点。
-- 支持轮询选择后端节点。
-- 支持主动 TCP 健康检查，并标记不健康节点。
-- 支持连接、写入和读取阶段的超时控制。
-- 使用结构化 `BackendError` 区分：
-	- 连接失败
-	- 连接超时
-	- 写入失败
-	- 写入超时
-	- 读取失败
-	- 读取超时
-	- 非法上游响应
-- 重试策略只允许幂等方法和可重试的临时错误。
-- 路由可配置额外重试次数 `max_retries`。
-- 已实现按 upstream/backend 维度的基础熔断器：
-	- 连续失败达到 `circuit_failure_threshold` 后进入 OPEN。
-	- `circuit_recovery_timeout_ms` 后允许恢复探测。
-	- `half_open_probe` 防止多个请求同时冲击正在恢复的后端。
-	- 探测成功关闭熔断，失败则继续保持熔断。
-- 上游错误映射到 502、503、504，并写入 Metrics 和审计分类。
+- `UpstreamManager` maintains upstream service groups and backend nodes.
+- Round-robin backend selection.
+- Active TCP health checks that mark unhealthy nodes.
+- Timeout control across connect, write, and read phases.
+- Structured `BackendError` distinguishes:
+	- Connection failure
+	- Connection timeout
+	- Write failure
+	- Write timeout
+	- Read failure
+	- Read timeout
+	- Invalid upstream response
+- The retry policy only allows idempotent methods and retryable transient errors.
+- Routes can configure extra retries via `max_retries`.
+- A basic circuit breaker per upstream/backend:
+	- Enters OPEN after consecutive failures reach `circuit_failure_threshold`.
+	- Allows recovery probing after `circuit_recovery_timeout_ms`.
+	- `half_open_probe` prevents multiple requests from hitting a recovering backend at once.
+	- A successful probe closes the breaker; a failure keeps it open.
+- Upstream errors map to 502/503/504 and are recorded in Metrics and audit categories.
 
-### 6. 静态文件与缓存
+### 6. Static Files and Caching
 
-- 支持静态文件服务和常见 Content-Type 推断。
-- 大文件使用 `sendfile` 零拷贝。
-- 小文件支持 Worker 内独立 LRU 内容缓存。
-- 支持基于 TTL 和 mtime 的 FD 缓存。
-- Gzip 内容可以进入独立压缩缓存。
-- 静态文件路径经过安全检查，防止 `..` 路径穿越。
-- 未匹配路由的静态 fallback 只允许 GET/HEAD，避免使用 POST 等方法读取静态资源。
+- Static file serving with common Content-Type inference.
+- `sendfile` zero-copy for large files.
+- Per-worker LRU content cache for small files.
+- FD cache based on TTL and mtime.
+- Gzip content goes into a dedicated compressed cache.
+- Static file paths go through security checks to prevent `..` path traversal.
+- Static fallback for unmatched routes only allows GET/HEAD, preventing methods like POST from reading static resources.
 
-### 7. 可观测性与日志
+### 7. Observability and Logging
 
-- 请求没有外部 Trace ID 时由网关生成 `trace_id`。
-- 客户端携带 `X-Trace-Id` 时会沿用并回传。
-- AUDIT 日志记录失败和安全策略事件，包括：
+- When a request carries no external trace ID, the gateway generates `trace_id`.
+- A client-provided `X-Trace-Id` is preserved and echoed back.
+- AUDIT logs record failures and security policy events, including:
 	- trace_id
 	- method/path
 	- Host/Tenant
 	- route
 	- status
 	- failure reason
-	- 脱敏后的 API Key
+	- masked API key
 	- User-Agent
-- AUDIT 在响应完成时统一记录，避免鉴权、限流、路由分支重复写入。
-- CLF 访问日志记录所有完成请求的客户端 IP、方法、路径、状态码、响应大小和耗时。
-- 普通 `Request:` 入口日志已经降为 debug，避免与 CLF 在生产 info 级别重复。
-- Prometheus `/metrics` 端点已提供：
-	- 全局 2xx/3xx/4xx/5xx 计数
-	- 全局延迟 histogram
-	- 文件缓存、FD 缓存、Gzip 缓存统计
-	- upstream 错误类型统计
-	- route/host/tenant 维度的请求数和延迟 sum/count
+- AUDIT is written once at response completion, avoiding duplicate writes across auth, rate-limit, and routing branches.
+- CLF access logs record client IP, method, path, status code, response size, and duration for every completed request.
+- Plain `Request:` entry logs are downgraded to debug, avoiding duplication with CLF at production info level.
+- The Prometheus `/metrics` endpoint provides:
+	- Global 2xx/3xx/4xx/5xx counters
+	- Global latency histogram
+	- File cache, FD cache, and Gzip cache statistics
+	- Upstream error type statistics
+	- Request counts and latency sum/count per route/host/tenant
 
-### 8. 配置与运行时运维
+### 8. Configuration and Runtime Operations
 
-- `Config::from_file()` 统一解析 JSON 配置。
-- 路由、upstream、API Key、限流、超时和静态根目录均可配置。
-- 支持 `SIGHUP` 触发 runtime reload。
-- 信号处理器只递增 reload generation，不执行文件 IO 和 JSON 解析。
-- Worker 在安全检查点读取并应用新配置。
-- reload 会更新路由、upstream、API Key、默认限流配置和 Keep-Alive 超时。
-- reload 前检查 JSON 文件是否存在且格式有效，避免损坏配置覆盖当前有效配置。
-- 提供 Dockerfile、docker-compose、Prometheus 配置和启动脚本。
+- `Config::from_file()` parses JSON configuration in one place.
+- Routes, upstreams, API keys, rate limiting, timeouts, and static root are all configurable.
+- `SIGHUP` triggers runtime reload.
+- The signal handler only increments the reload generation; it performs no file IO or JSON parsing.
+- Workers read and apply the new configuration at safe checkpoints.
+- Reload updates routes, upstreams, API keys, default rate-limit settings, and Keep-Alive timeouts.
+- Before reload, the JSON file is checked for existence and validity, preventing a corrupted config from overwriting the currently working one.
+- Dockerfile, docker-compose, Prometheus configuration, and startup scripts are provided.
 
-### 9. 测试与工程能力
+### 9. Testing and Engineering
 
-- Google Test 测试集当前 30/30 通过。
-- 已覆盖：
-	- HTTP 请求解析
-	- Query 和 Body
-	- LRU 文件缓存
-	- FD/响应相关基础行为
-	- 路由参数与 Host/Tenant 匹配
-	- 404/405 路由语义基础
-	- 静态路径穿越防护
-	- API Key 授权
-	- 限流器和不同 Key 的隔离
-	- 上游超时、连接失败和幂等重试
-	- 上游健康检查
-	- 熔断打开、拒绝和恢复探测
+- Google Test suite currently 30/30 passing.
+- Covered:
+	- HTTP request parsing
+	- Query and body
+	- LRU file cache
+	- FD/response basics
+	- Route parameters and Host/Tenant matching
+	- 404/405 routing semantics basics
+	- Static path traversal protection
+	- API key authorization
+	- Rate limiter and per-key isolation
+	- Upstream timeouts, connection failures, and idempotent retries
+	- Upstream health checks
+	- Circuit breaker open/reject/recovery probing
 
 ## Request Flow
 
 ```text
-客户端连接
-	-> TLS 握手（HTTPS）
-	-> epoll 读取数据
-	-> HttpParser 解析完整请求
-	-> 生成或接收 trace_id
-	-> 提取 Host/Tenant
-	-> 一次路由匹配
-	-> 404/405 判断
-	-> API Key 鉴权
-	-> 限流
-	-> 本地 Handler / 静态文件 / 上游转发
-	-> 上游超时、重试和熔断
-	-> 构造响应
-	-> 写回客户端
-	-> Metrics 记录
-	-> 失败时写 AUDIT
-	-> 所有完成请求写 CLF
+Client connects
+	-> TLS handshake (HTTPS)
+	-> epoll reads data
+	-> HttpParser parses the full request
+	-> trace_id generated or received
+	-> Host/Tenant extracted
+	-> Single route match
+	-> 404/405 decision
+	-> API key authentication
+	-> Rate limiting
+	-> Local handler / static file / upstream forwarding
+	-> Upstream timeout, retry, and circuit breaking
+	-> Response built
+	-> Written back to client
+	-> Metrics recorded
+	-> AUDIT written on failure
+	-> CLF written for every completed request
 ```
 
 ## Known Limitations
 
-- 熔断状态目前由每个 Worker 独立维护，不是所有 Worker 共享的全局熔断状态。
-- route/host/tenant 维度当前提供 latency sum/count，还没有独立 histogram，因此不能直接得到每个维度的 P95/P99。
-- runtime reload 采用 Worker 周期检查，各 Worker 不保证在完全相同的时刻切换配置。
-- 当前配置合法性检查主要验证 JSON 可解析，尚未提供完整的字段类型、范围和路由冲突校验。
-- 路由匹配仍是线性遍历，当前规模下简单可靠，尚未针对大规模路由使用 Trie 或索引结构。
-- 尚未实现连接池、异步 upstream、多级负载均衡算法和分布式限流。
-- 尚未完整接入 OpenTelemetry `traceparent`、分布式 Trace 和外部审计存储。
-- 当前测试以单元测试为主，真实 TLS、HTTP/1.1 长连接、reload、端到端 upstream 场景仍需要补充集成测试。
-- 动态线程池接口存在，但当前 HTTP 主流程仍主要在 Worker 线程中执行。
+- Circuit breaker state is currently maintained independently per worker, not as a global state shared across all workers.
+- `forward_request` reads backend responses with `Connection: close` semantics (satisfied by Content-Length or EOF); forwarding of Chunked upstream responses is not handled yet.
+- The route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
+- Runtime reload uses periodic worker polling; workers are not guaranteed to switch configuration at exactly the same instant.
+- Current config validation mostly verifies that the JSON is parseable; full field type, range, and route-conflict validation is not yet provided.
+- Route matching is still a linear scan — simple and reliable at the current scale, with no Trie or index structure for large route sets yet.
+- Connection pooling, async upstream, multi-level load balancing algorithms, and distributed rate limiting are not implemented.
+- OpenTelemetry `traceparent`, distributed tracing, and external audit storage are not yet integrated.
+- Testing is mostly unit tests; real TLS, HTTP/1.1 long connections, reload, and end-to-end upstream scenarios still need integration tests.
+- A dynamic thread pool interface exists, but the main HTTP path still mostly runs on worker threads.
 
 ## Next Steps
 
-1. 补充 runtime reload 和真实 HTTP 端到端测试。
-2. 增加配置字段范围校验、路由冲突检查和 reload 失败审计。
-3. 完善 route/host/tenant 维度的 latency histogram 和失败率指标。
-4. 评估跨 Worker 共享熔断状态的实现方式。
-5. 根据真实路由规模和压测结果，再决定是否引入路由索引、连接池或异步 upstream。
+1. Add runtime reload and real HTTP end-to-end tests.
+2. Add config field range validation, route conflict checks, and reload failure auditing.
+3. Complete per-route/host/tenant latency histograms and failure-rate metrics.
+4. Evaluate an implementation for cross-worker shared circuit breaker state.
+5. Decide on route indexing, connection pooling, or async upstream based on real route scale and load test results.
 
 ## Recent Decisions
 
-- `register_default_routes()` 负责内置演示和基础端点；`register_configured_routes()` 负责从配置生成网关路由。
-- 路由结果只匹配一次，并在请求生命周期内复用。
-- CLF 记录所有访问，AUDIT 主要记录失败和安全策略事件。
-- `Request:` 普通入口日志降为 debug，避免与 CLF 重复占用生产 info 日志。
-- API Key 在 AUDIT 中只保留脱敏值，避免凭证泄露。
-- 路由存在但方法不支持返回 405，并带 `Allow` Header；路径不存在才进入 404 或静态 fallback。
+- `register_default_routes()` serves built-in demo and basic endpoints; `register_configured_routes()` generates gateway routes from configuration.
+- Route matching runs once, and the result is reused for the request lifetime.
+- CLF records all access; AUDIT focuses on failures and security policy events.
+- Plain `Request:` entry logs are downgraded to debug, avoiding duplicate production info logs alongside CLF.
+- Only masked API keys are kept in AUDIT to prevent credential leakage.
+- A matched route with an unsupported method returns 405 with an `Allow` header; only a nonexistent path falls into 404 or static fallback.

@@ -37,7 +37,7 @@
         "refill_per_second": 1
     },
     "api_keys": [
-        {"key": "test-key-123", "name": "测试客户端", "rate_limit": {"capacity": 10, "refill_per_second": 3}},
-        {"key": "premium-key-456", "name": "高级客户端", "rate_limit": {"capacity": 1000, "refill_per_second": 100}}
+        {"key": "test-key-123", "name": "Test Client", "rate_limit": {"capacity": 10, "refill_per_second": 3}},
+        {"key": "premium-key-456", "name": "Premium Client", "rate_limit": {"capacity": 1000, "refill_per_second": 100}}
     ]
 }

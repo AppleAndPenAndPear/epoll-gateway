@@ -11,7 +11,7 @@ void client_signal_handler(int sig) {
 }
 
 int main() {
-    // 初始化客户端日志（异步，输出到 logs/client.log）
+    // Initialize client logging (async, writes to logs/client.log)
     Logger::Guard g("logs/client.log");
     std::signal(SIGINT, client_signal_handler);
     auto logger = Logger::get();

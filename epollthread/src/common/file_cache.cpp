@@ -6,44 +6,44 @@ FileCache::FileCache(size_t max_entries, size_t max_file_size_mb) : max_entries_
 const std::string* FileCache::get(const std::string& path, time_t file_mtime) {
     auto it = map_.find(path);
     if (it != map_.end()) {
-        // 找到缓存项，检查是否过期
+        // cache hit; check whether it is stale
         auto& entry = *(it->second);
         if (file_mtime == 0 || entry.second.mtime == file_mtime) {
-            // 缓存有效（file_mtime==0 表示跳过检查），移动到链表头部并返回内容
+            // cache valid (file_mtime==0 skips the check); move to the front of the list and return the content
             list_.splice(list_.begin(), list_, it->second);
             return &entry.second.content;
         } else {
-            // 缓存过期，移除旧项
+            // cache stale; remove the old entry
             list_.erase(it->second);
             map_.erase(it);
         }
     }
-    // 缓存未命中或已过期
+    // cache miss or stale
     return nullptr;
 }
 
 
 void FileCache::put(const std::string& path, const std::string& content, size_t size, time_t mtime){
-    // 过滤超过最大限制的文件
+    // reject files larger than the size limit
     if (size > max_file_size_) {
         return;
     }
     auto it = map_.find(path);
     if (it != map_.end()) {
-        // 已存在，更新内容并移动到头部
+        // already present; update the content and move to the front
         it->second->second.content = content;
         it->second->second.size = size;
         it->second->second.mtime = mtime;
         list_.splice(list_.begin(), list_, it->second);
         return;
     }
-    // 如果缓存已满，淘汰最久未使用的（链表尾部）
+    // if the cache is full, evict the least recently used entry (list back)
     if (list_.size() >= max_entries_) {
         auto last = list_.back();
-        map_.erase(last.first);  // 需要 CacheEntry 存储 path，或通过迭代器删除
+        map_.erase(last.first);  // would need CacheEntry to store the path, or erase via the iterator
         list_.pop_back();
     }
-    // 插入新条目到链表头部
+    // insert the new entry at the front of the list
     list_.emplace_front(path,CacheEntry{content, size, mtime});
     map_[path] = list_.begin();
 }

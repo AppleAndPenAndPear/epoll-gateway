@@ -5,13 +5,13 @@
 #include <string>
 #include <chrono>
 #include "rate_limiter.h"
-#include "config.h"   // 引入 RateLimitConfig
+#include "config.h"   // Brings in RateLimitConfig
 
 class RateLimiterManager {
 public:
     RateLimiterManager() = default;
 
-    // 默认限流配置：当 key 不存在时用它创建限流器
+    // Default rate limit config: used to create a limiter when the key has none
     explicit RateLimiterManager(const RateLimitConfig& default_config)
         : default_config_(default_config) {}
 
@@ -20,13 +20,13 @@ public:
         default_config_ = config;
     }
 
-    // 使用默认配置尝试获取令牌
+    // Try to acquire a token using the default config
     bool try_acquire(const std::string& key) {
         return try_acquire(key, default_config_);
     }
 
-    // 使用指定配置尝试获取令牌，key 可以是 "ip:127.0.0.1" 或 "api_key:test-key-123"
-    // config 用于创建新的限流器（如果 key 不存在）
+    // Try to acquire a token with the given config; key can be "ip:127.0.0.1" or "api_key:test-key-123"
+    // config is used to create a new limiter (if the key does not exist yet)
     bool try_acquire(const std::string& key, const RateLimitConfig& config) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = limiters_.find(key);
@@ -40,7 +40,7 @@ public:
         return it->second->try_acquire();
     }
 
-    // 清理超过 idle 时间未使用的限流器，防止内存泄漏
+    // Remove limiters unused beyond the idle time to prevent memory leaks
     void cleanup(std::chrono::seconds idle = std::chrono::seconds(600)) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::steady_clock::now();

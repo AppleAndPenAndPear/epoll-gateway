@@ -13,20 +13,20 @@ namespace spdlog {
 
 class Logger {
 public:
-    // 禁止拷贝和移动
+    // Non-copyable and non-movable
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    // 初始化日志系统（必须在 main 函数开始时调用）
+    // Initialize the logging system (must be called at the start of main)
     static void init(const string& log_file_path = "logs/server.log");
 
-    // 获取全局 logger 实例
+    // Get the global logger instance
     static shared_ptr<spdlog::logger> get();
 
-    // 关闭日志系统（通常在 main 结束前调用）
+    // Shut down the logging system (usually called before main returns)
     static void shutdown();
 
-    //引入守卫类，实现异常情况也能释放logger，以及记录必要日志
+    // Guard class: releases the logger even when exceptions occur, and makes sure final logs are written
     class Guard {
     public:
         explicit Guard(const std::string& log_path = "logs/server.log") {
@@ -35,7 +35,7 @@ public:
         ~Guard() {
             Logger::shutdown();
         }
-        // 禁止拷贝
+        // Non-copyable
         Guard(const Guard&) = delete;
         Guard& operator=(const Guard&) = delete;
     };

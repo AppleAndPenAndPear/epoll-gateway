@@ -12,27 +12,27 @@ extern atomic<bool> client_stop_flag;
 class Client {
 private:
     bool connected_;
-    Socket sock_;                   // 客户端套接字
-    Epoll epoll_;                   // 每个 Client 自己的 epoll 实例
+    Socket sock_;                   // Client socket
+    Epoll epoll_;                   // Epoll instance owned by each Client
     ClientHandler handler_;
 public:
-    // 构造函数：连接指定IP和端口
+    // Constructor: connects to the given IP and port
     Client(const std::string& ip, uint16_t port);
 
-    // 析构函数默认，Socket自动关闭描述符
+    // Default destructor; Socket closes the descriptor automatically
     ~Client() = default;
 
-    // 禁止拷贝
+    // Non-copyable
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    // 允许移动
+    // Movable
     Client(Client&& other) noexcept = default;
     Client& operator=(Client&& other) noexcept = default;
 
-    // 获取套接字描述符
+    // Get the socket descriptor
     int getFd();
-    // 设置非阻塞模式
+    // Set non-blocking mode
     void setnonblocking();
 
     void run();

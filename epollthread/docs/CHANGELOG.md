@@ -1,84 +1,121 @@
 # Changelog
 
-记录项目的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，按日期倒序排列。
+Notable changes to the project. Format follows [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/), entries sorted newest first.
 
-> 详细的项目现状快照见 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)，本文件用于回溯「什么时候做了什么、为什么」。
+> For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
+
+## 2026-09-15
+
+### Changed
+
+- Full i18n conversion to English in preparation for open-sourcing on GitHub:
+  - All code comments, log/error messages, test descriptions, and build-script echoes translated to English across `include/`, `src/`, `tests/`, and build files (~45 files). No code semantics touched; verified by full CI (build + 30 unit tests + 32 integration assertions, all green).
+  - README split into bilingual versions: new English `README.md` (reorganized for open-source conventions: Features grouped by theme, Quick Start up front, Documentation section added) and the original Chinese preserved as `README.zh-CN.md`, with a language switcher at the top of both.
+  - `docs/PROJECT_STATUS.md`, `docs/ROADMAP.md`, `docs/CHANGELOG.md` translated in place to English; this changelog is written in English from now on.
+- Config: `api_keys.name` display values translated ("Test Client" / "Premium Client"); keys, ports, and structure unchanged.
+
+### Decisions
+
+- Wording correction: the slogan "zero-dependency" was replaced by "self-contained" — the project has library dependencies (spdlog, nlohmann/json, OpenSSL, zlib); "zero-dependency" now refers only to the absence of external services (no etcd/Postgres), matching the ROADMAP positioning.
+- Binary test fixtures (`www/big.html`, `test.gz`) intentionally left untouched — they are random-byte fixtures, not text.
+- Dual remote configured (environment, not repo content): `origin` = Gitee, `gh` = GitHub (`AppleAndPenAndPear/multithread_epoll`), with a `git pushall` alias pushing the current branch to both. GitHub repo was created manually (no CI token available in the dev environment).
+
+## 2026-09-12
+
+### Added
+
+- CI integration:
+  - Added a platform-agnostic `ci.sh` (build → CTest unit tests → integration tests in one command); the same entry point serves both local and CI environments, fully verified locally.
+  - Added a GitHub Actions workflow (`.github/workflows/ci.yml`, ubuntu-latest + apt dependency install), which activates automatically once the repo is mirrored to GitHub; the Gitee side is deferred — if needed, Gitee Go can invoke the same ci.sh.
+- P1 integration test framework (`tests/integration/`): launches a real server + Python mock upstream backends, covering 14 scenario categories — TLS, Keep-Alive, Trace-Id, 405+Allow, 404/403, reverse proxy, API key authentication, 429 rate limiting, failover, circuit breaker open/reject/recovery, SIGHUP reload, corrupted-config rejection, /metrics, and Chunked — with all 32 assertions passing.
+- The mock backend supports switching into a "close immediately after accepting" mode via a control file (the TCP health probe still passes but forwarding fails), used to drive circuit breaker counting.
+
+### Fixed
+
+- `forward_request` read the backend response with a single `recv()`; when headers and body arrived across multiple TCP segments it returned 200 with an empty body (or InvalidResponse) — caught on the very first integration test run. Fixed to loop until Content-Length is satisfied or the backend closes with `Connection: close`.
+
+### Decisions
+
+- Integration tests depend only on the Python3 standard library plus `http.client` outside curl scenarios — no third-party dependencies, preserving the "zero-dependency, auditable" positioning.
+- CI platform pending: the repo is hosted on Gitee; GitHub Actions requires solving mirroring first, so no workflow was created yet.
 
 ## 2026-09-11
 
-### 文档
+### Documentation
 
-- 根据 [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) 与实际代码核对，全面更新 README：
-  - 修正 `/metrics` 指标名为实际输出（`epoll_http_*` 系列，原文的 `epoll_server_*` 在代码中不存在）。
-  - 补充 route/host/tenant 维度指标（`epoll_route_requests_total`、`epoll_route_latency_seconds_*`）和 upstream 错误分类指标。
-  - 特性列表新增幂等重试、基础熔断器、`X-Trace-Id`、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload。
-  - 新增「可观测性日志」「Runtime Reload」「已知限制」章节。
-  - 配置示例补充 `max_retries`、`circuit_failure_threshold`、`circuit_recovery_timeout_ms`。
-  - 修复后半部分丢失的 markdown 格式（技术栈、核心设计细节等重构为标准表格/列表）。
+- Added [docs/ROADMAP.md](docs/ROADMAP.md): settled the commercialization positioning (three differentiators — lightweight/auditable/embeddable, see the doc for the competitor analysis) plus the P1~P5 technical evolution plan and the 6-month commercialization validation track. Licensing decision: stay MIT for now; evaluate dual licensing once paid intent appears.
+- Added [docs/CHANGELOG.md](docs/CHANGELOG.md): records changes and decision rationale by date, backfilling the project timeline since 2026-05-08.
+- Cross-checked [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) against the actual code and fully updated the README:
+  - Corrected `/metrics` metric names to the actual output (the `epoll_http_*` series; the `epoll_server_*` names in the previous text do not exist in code).
+  - Added route/host/tenant dimension metrics (`epoll_route_requests_total`, `epoll_route_latency_seconds_*`) and upstream error classification metrics.
+  - Feature list gained idempotent retries, the basic circuit breaker, `X-Trace-Id`, AUDIT/CLF dual-channel logging, and `SIGHUP` runtime reload.
+  - Added "Observability Logging", "Runtime Reload", and "Known Limitations" sections.
+  - Config examples gained `max_retries`, `circuit_failure_threshold`, `circuit_recovery_timeout_ms`.
+  - Fixed markdown formatting lost in the second half (tech stack, core design details, etc. restructured into proper tables/lists).
 
 ## 2026-09-08
 
-### 新增
+### Added
 
-- 熔断器：按 upstream/backend 维度维护，连续失败达 `circuit_failure_threshold` 进入 OPEN，`circuit_recovery_timeout_ms` 后允许半开探测，探测成功关闭熔断（决策：先做 per-Worker 独立熔断，跨 Worker 共享状态待评估）。
-- 幂等重试：仅幂等方法与可重试的临时错误重试，路由可配置 `max_retries`。
-- `X-Trace-Id` 请求追踪：客户端携带时沿用并回传，否则网关生成，贯穿请求与审计日志。
-- AUDIT/CLF 双通道日志：CLF 记录所有完成请求；AUDIT 在响应完成时统一记录失败与安全策略事件，API Key 只保留脱敏值。
-- 405 语义收口：路径匹配但方法不支持返回 405 并携带 `Allow` Header；未命中网关路由时仅 GET/HEAD 回退静态文件。
-- runtime reload：`SIGHUP` 触发，信号处理器只递增 generation，Worker 在安全检查点应用新配置；reload 前校验 JSON 有效性。
-- upstream 错误统一映射到 502/503/504，并写入 Metrics 与审计分类。
+- Circuit breaker: maintained per upstream/backend; enters OPEN after consecutive failures reach `circuit_failure_threshold`, allows half-open probing after `circuit_recovery_timeout_ms`, and closes on a successful probe (decision: per-worker independent breakers first; shared cross-worker state to be evaluated).
+- Idempotent retries: only idempotent methods and retryable transient errors are retried; routes can configure `max_retries`.
+- `X-Trace-Id` request tracing: reused and echoed back when provided by the client, otherwise generated by the gateway, spanning requests and audit logs.
+- AUDIT/CLF dual-channel logging: CLF records every completed request; AUDIT records failures and security policy events once at response completion, keeping only masked API key values.
+- 405 semantics finalized: a matched path with an unsupported method returns 405 with an `Allow` header; when no gateway route matches, only GET/HEAD fall back to static files.
+- Runtime reload: triggered by `SIGHUP`; the signal handler only increments the generation, and workers apply the new config at safe checkpoints; JSON validity is verified before reload.
+- Upstream errors are uniformly mapped to 502/503/504 and written to Metrics and audit categories.
 
-### 变更
+### Changed
 
-- 普通 `Request:` 入口日志降为 debug，避免与 CLF 在生产 info 级别重复。
-- 一次请求只匹配一次路由，`ResolvedRoute` 在鉴权、限流和分发之间复用。
+- Plain `Request:` entry logs downgraded to debug, avoiding duplication with CLF at production info level.
+- Route matching runs exactly once per request; `ResolvedRoute` is reused across authentication, rate limiting, and dispatch.
 
-### 测试
+### Tests
 
-- 单元测试扩充至 30/30 通过，新增熔断打开/拒绝/恢复探测、幂等重试、上游超时等用例。
+- Unit tests expanded to 30/30 passing, adding circuit breaker open/reject/recovery probing, idempotent retries, upstream timeouts, and related cases.
 
 ## 2026-08-30
 
-### 新增
+### Added
 
-- API Key 管理：支持 `X-API-Key` 与 `Authorization: Bearer` 提取，route allow/deny 列表，API Key 的 host/tenant 范围绑定和独立限流额度。
+- API key management: `X-API-Key` and `Authorization: Bearer` extraction, route allow/deny lists, host/tenant scope binding for API keys, and independent rate-limit quotas per API key.
 
 ## 2026-08-13 ~ 2026-08-14
 
-### 新增
+### Added
 
-- 反向代理核心功能：`UpstreamManager` 轮询选路 + 主动 TCP 健康检查（自动摘除/恢复故障节点），`HttpClient` 带超时的单后端转发，结构化 `BackendError` 错误分类。
+- Reverse proxy core: `UpstreamManager` round-robin selection + active TCP health checks (automatic removal/recovery of failed nodes), `HttpClient` single-backend forwarding with timeouts, structured `BackendError` classification.
 
 ## 2026-08-11
 
-### 新增
+### Added
 
-- HTTPS 支持：OpenSSL 非阻塞 TLS 握手与加密读写，运行在 epoll 事件循环内。
+- HTTPS support: OpenSSL non-blocking TLS handshake and encrypted read/write, running inside the epoll event loop.
 
 ## 2026-08-04
 
-### 新增
+### Added
 
-- Prometheus 指标端点 `/metrics`；docker-compose 集成 Prometheus + Grafana 监控栈。
+- Prometheus metrics endpoint `/metrics`; docker-compose integration with a Prometheus + Grafana monitoring stack.
 
 ## 2026-07-21 ~ 2026-07-23
 
-### 新增
+### Added
 
-- FD 文件描述符缓存（TTL）、多级缓存命中率指标、P99 延迟 histogram。
+- FD cache (TTL), multi-level cache hit-rate metrics, P99 latency histogram.
 
-### 变更
+### Changed
 
-- `http_parser` 移入 common 库；调整日志队列、异步线程数与滚动策略。
+- `http_parser` moved into the common library; adjusted the log queue, async thread count, and rotation policy.
 
 ## 2026-06-11
 
-### 新增
+### Added
 
-- Google Test 单元测试框架接入、Docker 多阶段构建、`build.sh`/`start.sh` 脚本、RESTful 路由与静态文件服务。
+- Google Test unit test framework integration, Docker multi-stage build, `build.sh`/`start.sh` scripts, RESTful routing, and static file serving.
 
 ## 2026-05-08 ~ 2026-05-27
 
-### 新增
+### Added
 
-- 项目初始化：SO_REUSEPORT + One Loop Per Thread 多线程 epoll 服务器、HTTP/1.1 状态机解析器、Keep-Alive、零拷贝 sendfile、LRU 文件缓存、spdlog 异步日志、MIT License。
+- Project init: SO_REUSEPORT + One Loop Per Thread multi-threaded epoll server, HTTP/1.1 state-machine parser, Keep-Alive, zero-copy sendfile, LRU file cache, spdlog async logging, MIT License.

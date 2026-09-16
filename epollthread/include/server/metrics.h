@@ -24,10 +24,10 @@ private:
         std::atomic<uint64_t> duration_count{0};
     };
 
-    std::array<double, 11> bucket_boundaries_;      //延迟桶边界（秒）
-    mutable std::array<std::atomic<uint64_t>, 12> duration_buckets_{}; // 最后一个为 +Inf，落入延迟桶的请求数
-    std::atomic<uint64_t> duration_count_{0};   // 从服务器启动到当前时刻，所有请求的总数量
-    std::atomic<double> duration_sum_{0.0};     // 延迟总和（秒）
+    std::array<double, 11> bucket_boundaries_;      // Latency bucket boundaries (seconds)
+    mutable std::array<std::atomic<uint64_t>, 12> duration_buckets_{}; // Request counts per latency bucket; the last one is +Inf
+    std::atomic<uint64_t> duration_count_{0};   // Total number of requests since server start
+    std::atomic<double> duration_sum_{0.0};     // Sum of latencies (seconds)
 
     std::atomic<uint64_t> total_requests_{0};
     std::atomic<uint64_t> requests_2xx_{0};
@@ -40,7 +40,7 @@ private:
     std::atomic<uint64_t> fd_cache_hits_{0};
     std::atomic<uint64_t> fd_cache_misses_{0};
 
-    // gzip 压缩缓存统计
+    // Gzip compression cache statistics
     std::atomic<uint64_t> gzip_cache_hits_{0};
     std::atomic<uint64_t> gzip_cache_misses_{0};
     std::array<std::atomic<uint64_t>, 8> upstream_error_counts_{};
@@ -53,28 +53,28 @@ public:
         return inst;
     }
 
-    // 记录总请求，即解析出的
+    // Record the total number of requests (parsed ones)
     void record_total_request();
 
-    // 记录全局维度的2/3/4/5xx请求及其延迟（秒）
+    // Record global 2/3/4/5xx requests and their latency (seconds)
     void record_request(int status_code, double duration_seconds);
 
-    //记录路由维度的请求及其延迟（秒）
+    // Record per-route requests and their latency (seconds)
     void record_route_request(const std::string& route_name,
                              const std::string& host,
                              const std::string& tenant,
                              int status_code,
                              double duration_seconds);
 
-    // 文件缓存统计
+    // File cache statistics
     void record_cache_hit();
     void record_cache_miss();
 
-    // FD 缓存统计
+    // FD cache statistics
     void record_fd_cache_hit();
     void record_fd_cache_miss();
 
-    // 生成 Prometheus 文本格式
+    // Generate Prometheus text format
     std::string to_string() const;
 
     void record_gzip_cache_hit();

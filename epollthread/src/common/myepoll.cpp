@@ -40,7 +40,7 @@ int Epoll::setepoll_ctl(int op,int fd,struct epoll_event* ev){
   return epoll_ctl(epollfd_, op, fd, ev);
 }
 
-// 添加文件描述符和事件
+// Add a file descriptor with its events
 void Epoll::add(int fd, uint32_t events) {
   struct epoll_event ev;
   ev.events = events;
@@ -51,7 +51,7 @@ void Epoll::add(int fd, uint32_t events) {
   Logger::get()->debug("epoll_ctl() ADD fd {},events {}",fd,events);
 }
 
-// 修改文件描述符的事件
+// Modify the events of a file descriptor
 void Epoll::mod(int fd, uint32_t events) {
   struct epoll_event ev;
   ev.events = events;
@@ -62,11 +62,11 @@ void Epoll::mod(int fd, uint32_t events) {
   Logger::get()->debug("epoll_ctl() mod fd {},events {}",fd,events);
 }
 
-// 删除文件描述符
+// Remove a file descriptor
 void Epoll::del(int fd) {
   if (setepoll_ctl(EPOLL_CTL_DEL, fd, nullptr) == -1) {
     if (errno == ENOENT || errno == EBADF) {
-      // fd 已经不在 epoll 中，忽略
+      // fd is no longer in the epoll set; ignore
       return;
     }
     throw_system_error("epoll_ctl() DEL failed");
@@ -78,20 +78,20 @@ EpollWaitResult Epoll::wait(struct epoll_event* events, int maxevents, int timeo
   EpollWaitResult result;
   int n = epoll_wait(epollfd_, events, maxevents, timeout);
   if (n > 0) {
-    // 正常情况：有事件发生
+    // normal case: events occurred
     Logger::get()->trace("epoll_wait returned {} events", n);
     result.event_count = n;
     return result;
   }
   if (n == 0) {
-    // 超时：没有事件发生，等待时间耗尽
+    // timeout: no events within the wait time
     Logger::get()->trace("epoll_wait() timeout");
     result.timeout = true;
     return result;
   }
   if (errno == EINTR) {
     result.interrupted = true;
-    // 可选：记录一条低级别日志
+    // optionally log at a low level
     Logger::get()->debug("epoll_wait() interrupted by signal");
     return result;
   }

@@ -16,30 +16,30 @@ void Logger::init(const string& log_file_path){
             auto console_sink = make_shared<spdlog::sinks::stdout_color_sink_mt>();
             console_sink->set_level(spdlog::level::warn);
 
-            // 生产环境：文件只记录 warn 及以上，减少磁盘 I/O
+            // production: the file sink logs warn and above to reduce disk I/O
             auto file_sink = make_shared<spdlog::sinks::rotating_file_sink_mt>(
-                log_file_path, 1024 * 1024 * 50, 5);  // 50MB, 5个文件
+                log_file_path, 1024 * 1024 * 50, 5);  // 50MB, 5 files
             file_sink->set_level(spdlog::level::info);
             
             vector<spdlog::sink_ptr> sinks {console_sink, file_sink};
 
-            // 队列加大，线程加到2，减少争用
+            // larger queue and 2 worker threads to reduce contention
             spdlog::init_thread_pool(32768, 2);
             
-            // 3. 创建异步 logger，使用全局线程池
+            // 3. create the async logger on the global thread pool
             auto logger = std::make_shared<spdlog::async_logger>(
                 "server", sinks.begin(), sinks.end(),
                 spdlog::thread_pool(),
                 spdlog::async_overflow_policy::overrun_oldest);
             
-            //生产环境：日志级别设置为 debug，方便调试
+            // production: level set to debug for easier troubleshooting
             logger->set_level(spdlog::level::debug);
-            // 每条 info 及以上日志写完后立即 flush，保证 tail -f 实时可见
-            // （否则异步 logger 会把内容缓冲在 FILE* 缓冲区里，后端挂掉等低频日志要等进程退出才落盘）
+            // flush immediately after every info-or-higher log so `tail -f` shows it in real time
+            // (otherwise the async logger buffers content in the FILE* buffer and low-frequency messages only hit disk at process exit)
             logger->flush_on(spdlog::level::info);
             logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 
-            // 4. 注册并设为默认
+            // 4. register and set as default
             spdlog::register_logger(logger);
             spdlog::set_default_logger(logger);
         }
@@ -54,7 +54,7 @@ shared_ptr<spdlog::logger> Logger::get(){
     auto logger = spdlog::get("server");
 
     if (!logger) {
-        // 极早期 fallback（同步控制台 logger)
+        // very early fallback (synchronous console logger)
         static auto fallback = spdlog::stdout_color_mt("fallback_sync");
         return fallback;
     }

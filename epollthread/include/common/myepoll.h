@@ -1,22 +1,22 @@
 #pragma once
 #include <iostream>
 #include <sys/socket.h>
-#include <cstdint>    //uint32_t需要
+#include <cstdint>    // needed for uint32_t
 
 
 using namespace std;
 
-// 封装 epoll_wait 的返回结果
+// Wrapper around the result of epoll_wait
 struct EpollWaitResult {
-    int event_count = 0;    // 就绪的事件数量 (>=0)
-    bool timeout = false;   // 是否因为超时而返回
-    bool interrupted = false; // 是否被信号中断 (EINTR)
+    int event_count = 0;    // number of ready events (>=0)
+    bool timeout = false;   // true if the call returned due to timeout
+    bool interrupted = false; // true if interrupted by a signal (EINTR)
 
-    // 方便在 if 语句中使用：判断是否有事件发生
+    // Handy for use in if statements: whether any event occurred
     explicit operator bool() const { return event_count > 0; }
 };
 
-//epoll类
+// epoll wrapper class
 class Epoll{
 private:
   int epollfd_;

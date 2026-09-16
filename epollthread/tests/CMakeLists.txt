@@ -11,11 +11,11 @@ add_executable(runTests
     ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp
 )
 
-# 链接你的公共库和 gtest
+# Link your common library and gtest
 target_link_libraries(runTests PRIVATE
     common
-    GTest::GTest      # 使用 find_package 导入的目标
-    GTest::Main       # 提供 main 入口
+    GTest::GTest      # Imported targets from find_package
+    GTest::Main       # Provides the main entry point
 )
 
 target_include_directories(runTests PRIVATE ${CMAKE_SOURCE_DIR}/include/server)

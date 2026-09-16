@@ -16,8 +16,8 @@ class DynamicThreadPool {
 private:
     const size_t min_threads_;
     const size_t max_threads_;
-    const size_t scale_up_threshold_;   // 扩容因子，任务数/线程数
-    const size_t scale_down_threshold_; // 缩容因子，目前简单使用队列空
+    const size_t scale_up_threshold_;   // Scale-up factor: tasks per thread
+    const size_t scale_down_threshold_; // Scale-down factor; currently simply an empty queue
 
     std::list<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
@@ -47,10 +47,10 @@ public:
             }
             tasks_.emplace([task]() { (*task)(); });
 
-            // 检查是否需要扩容
+            // Check whether to scale up
             if (shouldScaleUp()) {
                 Logger::get()->debug("scaling up: tasks = {}, current threads = {}, adding worker",tasks_.size(), current_threads_.load());
-                addWorker();  // 内部会加锁并增加 current_threads_
+                addWorker();  // Locks internally and increments current_threads_
             }
         }
         cv_.notify_one();

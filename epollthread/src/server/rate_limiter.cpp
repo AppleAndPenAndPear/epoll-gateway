@@ -9,7 +9,7 @@ bool RateLimiter::try_acquire() {
     double elapsed = std::chrono::duration<double>(now - last_refill_).count();
     last_refill_ = now;
 
-    // 补充令牌：累积小数部分，避免 static_cast 截断导致令牌补充丢失
+    // Refill tokens: accumulate the fractional part so token refills are not lost to static_cast truncation
     double new_tokens = elapsed * refill_per_second_ + tokens_fraction_;
     size_t whole = static_cast<size_t>(new_tokens);
     tokens_fraction_ = new_tokens - static_cast<double>(whole);

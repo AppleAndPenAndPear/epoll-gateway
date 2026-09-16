@@ -3,7 +3,7 @@
 #include <string_view>
 
 std::string get_content_type(const std::string& path) {
-    // 使用 string_view 避免 substr 的内存分配
+    // Use string_view to avoid the memory allocation from substr
     static const std::unordered_map<std::string_view, std::string_view> mime_map = {
         {".html", "text/html"},
         {".htm", "text/html"},
@@ -30,5 +30,5 @@ std::string get_content_type(const std::string& path) {
         auto it = mime_map.find(ext);
         if (it != mime_map.end()) return std::string(it->second);
     }
-    return "application/octet-stream"; // 默认二进制流
+    return "application/octet-stream"; // Default binary stream
 }

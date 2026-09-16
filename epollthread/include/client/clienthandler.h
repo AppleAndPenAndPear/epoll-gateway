@@ -6,13 +6,13 @@
 
 class ClientHandler {
 public:
-    // 处理 socket 上的事件，由 Client 事件循环调用
+    // Handle events on the socket; called by the Client event loop
     void handle_event(Socket& sock, Epoll& epoll, uint32_t events);
 
-    // 设置要发送的请求（可在构造函数或外部设置）
+    // Set the request to send (set in the constructor or externally)
     void set_request(const std::string& req);
 
-    // 获取收到的响应
+    // Get the received response
     std::string get_response() const;
 
     bool is_done() const;

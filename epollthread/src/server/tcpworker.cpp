@@ -49,30 +49,30 @@ void TcpWorker::check_timeout() {
   }
     for (auto it = last_active_.begin(); it != last_active_.end(); ) {
         int fd = it->first;
-        // 如果 fd 已经无效（被关闭），直接移除记录
+        // If the fd is already invalid (closed), remove the record directly
         if (fcntl(fd, F_GETFD) == -1 && errno == EBADF) {
             Logger::get()->debug("check_timeout: remove stale fd {} (already closed)", fd);
-            conns_.erase(fd);                    // 同步清理 conns_ 中的残留条目
+            conns_.erase(fd);                    // Also clean up the stale entry in conns_
             it = last_active_.erase(it);
             continue;
         }
         if (now - it->second > keepalive_timeout_) {
-            // 超时，关闭连接
+            // Timed out, close the connection
             Logger::get()->info("Idle timeout on fd {} (last active {}s ago), closing ...",fd, now - it->second);
             auto conn_it = conns_.find(fd);
             if (conn_it != conns_.end()) {
                 handler_.cleanup(conn_it->second.sock);
                 conns_.erase(conn_it);
             }
-            it = last_active_.erase(it);   // 移除定时器记录
+            it = last_active_.erase(it);   // Remove the timer record
         } else {
             ++it;
         }
     }
     
-    upstream_manager_.check_health();  // 每秒主动健康检查
+    upstream_manager_.check_health();  // Active health check every second
 
-    // 定期清理长期未使用的限流器，防止内存无限增长（跨 worker 共享，互斥锁保证安全）
+    // Periodically clean up long-unused rate limiters to prevent unbounded memory growth (shared across workers, protected by a mutex)
     if (now - last_limiter_cleanup_ >= 60) {
         rate_limiter_manager_->cleanup();
         last_limiter_cleanup_ = now;
@@ -84,15 +84,15 @@ void TcpWorker::run(){
   epoll_event evs[MAX_EVENTS];
 
   while (!closed_ && !stop_server_flag.load()) {
-    auto wait_result = epoll_.wait(evs, MAX_EVENTS, 1000);  // 1秒超时，可配置
+    auto wait_result = epoll_.wait(evs, MAX_EVENTS, 1000);  // 1s timeout, configurable
     if (!wait_result) {
-      // 没有就绪事件（超时或中断）
+      // No ready events (timeout or interrupted)
       if (wait_result.interrupted) {
         continue;
       }
       if (wait_result.timeout) {
           if (stop_server_flag.load()) break;
-          check_timeout();   // 定时清理过期连接
+          check_timeout();   // Periodic cleanup of expired connections
           continue;
       }
       continue;
@@ -102,11 +102,11 @@ void TcpWorker::run(){
       if (fd == listen_sock_.getFd()) {
         handle_accept();
       } else {
-        // update_active 已在 handle_client() 中调用，此处去除重复
+        // update_active is already called in handle_client(); avoid duplicating it here
         handle_client(fd, evs[i].events);
       }
     }
-    // 即使有事件到达，也定期检查超时（高负载下 epoll_wait 可能永不超时）
+    // Even when events keep arriving, check timeouts periodically (under high load epoll_wait may never time out)
     time_t now = time(nullptr);
     if (now - last_timeout_check_ >= 1) {
       check_timeout();
@@ -114,7 +114,7 @@ void TcpWorker::run(){
     }
   }
 
-  // 退出前清理所有残留连接
+  // Clean up all remaining connections before exiting
   for (auto& [fd, conn] : conns_) {
     handler_.cleanup(conn.sock);
   }
@@ -132,19 +132,19 @@ void TcpWorker::handle_accept() {
     if (!client_opt) {
       break;
     }
-    int clientsock = *client_opt; // 安全解引用
+    int clientsock = *client_opt; // Safe dereference
 
-    // 获取客户端 IP
+    // Get the client IP
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client.sin_addr, ip_str, sizeof(ip_str));
-    client_ips_[clientsock] = ip_str;   // 存储
+    client_ips_[clientsock] = ip_str;   // Store it
 
-    last_active_[clientsock] = time(nullptr);  // 记录活跃时间
+    last_active_[clientsock] = time(nullptr);  // Record the activity time
     auto client_sock = make_shared<Socket>(clientsock);
-    client_sock->setnonblocking();   // 设为非阻塞
+    client_sock->setnonblocking();   // Set non-blocking
     client_sock->setcloexec();
 
-    // 启用 SSL
+    // Set up SSL
     if (!client_sock->initSSL(ssl_ctx_)) {
       Logger::get()->error("SSL init failed for fd {}", clientsock);
       continue;
@@ -152,7 +152,7 @@ void TcpWorker::handle_accept() {
 
     epoll_.add(clientsock, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT);
     conns_[clientsock] = {client_sock, SSLState::HANDSHAKING};
-    handler_.on_connect(client_sock.get());   // 初始化队列
+    handler_.on_connect(client_sock.get());   // Initialize the queues
     Logger::get()->info("Worker accepted client fd {}", clientsock);
   }
 }
@@ -165,53 +165,53 @@ void TcpWorker::handle_client(int fd, uint32_t events) {
   if (conn.ssl_state == SSLState::HANDSHAKING) {
     if (conn.sock->sslAccept()) {
       conn.ssl_state = SSLState::READY;
-      epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);  // 只关注读
+      epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);  // Only watch reads
       Logger::get()->info("SSL handshake done on fd {}", fd);
     } else {
-      // 握手未完成，需要重新注册事件（包含 EPOLLOUT，因为 SSL 握手可能需要写数据）
-      // EPOLLONESHOT 要求每次事件后必须重新注册
+      // Handshake not finished, re-register the events (include EPOLLOUT, since the SSL handshake may need to write)
+      // EPOLLONESHOT requires re-registration after every event
       epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
     }
     return;
   }
 
-  // 1. 只要有事件到达，就刷新活跃时间（在事件处理之前）
+  // 1. Refresh the activity time whenever an event arrives (before handling it)
   update_active(fd);
 
   if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-    // 错误或挂断事件，直接清理
+    // Error or hangup event, clean up directly
     Logger::get()->info("Worker: EPOLLERR/EPOLLHUP on fd {}", fd);
-    handler_.cleanup(conn.sock);   // 清理 EchoHandler 内部状态和 epoll
-    conns_.erase(fd);         // 从自已的连接表移除
-    // sock 的 shared_ptr 引用计数递减，最后自动析构 Socket
-    last_active_.erase(fd);          // ★ 显式擦除
-    client_ips_.erase(fd); // 移除客户端 IP 记录
+    handler_.cleanup(conn.sock);   // Clean up the EchoHandler internal state and epoll
+    conns_.erase(fd);         // Remove it from our own connection table
+    // The sock shared_ptr refcount drops, and the Socket is finally destructed automatically
+    last_active_.erase(fd);          // ★ Explicitly erase
+    client_ips_.erase(fd); // Remove the client IP record
     return;
   }
 
   if (events & EPOLLIN) {
-    handler_.handle_read(conn.sock, client_ips_[fd]);  // 传入客户端 IP
+    handler_.handle_read(conn.sock, client_ips_[fd]);  // Pass in the client IP
   } else if (events & EPOLLOUT) {
     handler_.handle_write(conn.sock);
   } else {
     Logger::get()->warn("Unexpected event on fd {}: {}", fd, events);
     handler_.cleanup(conn.sock);
     conns_.erase(fd);
-    last_active_.erase(fd);          // ★ 显式擦除
-    client_ips_.erase(fd); // 移除客户端 IP 记录
+    last_active_.erase(fd);          // ★ Explicitly erase
+    client_ips_.erase(fd); // Remove the client IP record
     return;
   }
 
-  // 3. handle_read/handle_write 内部可能因为错误或对端关闭调用了 cleanup，
-  //    此时 conns_ 中已无该 fd，需同步移除定时器记录。
+  // 3. handle_read/handle_write may internally call cleanup due to errors or a peer close;
+  //    conns_ no longer holds the fd then, so the timer record must be removed as well.
   if (conns_.find(fd) == conns_.end()) {
-    last_active_.erase(fd);          // ★ 擦除残留记录
+    last_active_.erase(fd);          // ★ Erase the stale record
     Logger::get()->debug("Connection on fd {} closed during event handling", fd);
   }
 }
 
 void TcpWorker::close() {
   closed_ = true;
-  // 可选：关闭 listen_fd_ 以唤醒 epoll_wait （否则可能一直阻塞）
+  // Optionally close listen_fd_ to wake up epoll_wait (otherwise it may block forever)
   ::shutdown(listen_sock_.getFd(), SHUT_RD);
 }

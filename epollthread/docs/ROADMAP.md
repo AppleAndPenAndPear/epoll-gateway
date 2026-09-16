@@ -1,0 +1,137 @@
+# ROADMAP
+
+The execution plan for taking this project from a personal project to a commercial product. Three parts: positioning and differentiation, the technical evolution plan (P1~P5), and the commercialization validation track.
+
+> Companion documents: [PROJECT_STATUS.md](PROJECT_STATUS.md) records the current capability snapshot, [../CHANGELOG.md](../CHANGELOG.md) records completed changes, and this file plans what comes next.
+
+---
+
+## 1. Positioning and Differentiation
+
+### Competitive Landscape
+
+| Competitor | Stack | Deployment | Where its "heaviness" lies |
+|---|---|---|---|
+| Kong | Lua/OpenResty + Postgres | Requires a database | Postgres is a hard dependency; large memory footprint |
+| APISIX | OpenResty + etcd | Requires a config center | etcd cluster + LuaJIT runtime; does not run at the edge |
+| Envoy | C++ | Single binary but extremely heavy | Million-line codebase; unauditable, hard to embed |
+| Higress | Envoy + Go control plane | K8s ecosystem | Deeply coupled to cloud native; unfriendly to bare metal/edge |
+| Nginx | C | Very light | Not an API gateway — auth/rate limiting/tenancy/metrics all require custom extension |
+
+**Market gap**: no competitor combines "Nginx-grade resource footprint with out-of-the-box API gateway semantics". APISIX grows toward the ecosystem, Nginx spreads as a pure proxy — the middle is where this project sits.
+
+### Three Verifiable Differentiators (every action maps back to them)
+
+1. **Extremely lightweight** — targets: single binary < 10MB, idle memory < 30MB, zero external dependencies (no etcd/Postgres/runtime), runs on ARM out of the box.
+2. **Fully auditable** — targets: core code kept within tens of thousands of lines, readable end-to-end by one senior engineer in a week. Aimed at Xinchuang (domestic IT), classified intranets, and security-sensitive customers.
+3. **Embeddable** — targets: runs as a standalone process and embeds into third-party products as a static library (gateway built into device firmware).
+
+### One-line Positioning
+
+> For teams with no etcd, no K8s, and no ops department: one API gateway binary that runs lean, reads in a week, and embeds cleanly.
+
+### What We Deliberately Won't Do
+
+- No plugin marketplace, no sprawling dashboard, no all-protocol suite (competing on ecosystem is a losing game)
+- No show-off features like HTTP/3/QUIC (target customers don't care)
+- No contest over extreme benchmark numbers (we sell "good enough + light", not peak performance)
+
+### Licensing Strategy (current decision: stay MIT for now)
+
+- At this stage the bottleneck is users, not revenue; MIT has the least adoption friction
+- Revisit dual licensing (BSL/AGPL) or "MIT core + closed-source enterprise features" only once real paid intent appears
+- Candidate enterprise features (closed-source, paid, in the future): cluster control plane, multi-tenant quotas and billing, advanced plugins, certification and compliance support
+
+---
+
+## 2. Technical Evolution Plan (P1~P5)
+
+| Phase | Theme | Exit Criteria (DoD) |
+|---|---|---|
+| **P1** | Regression safety net | One-command integration tests, CI fully green |
+| **P2** | Config + security hardening | Config schema validation live; pass HTTP spec/TLS self-check checklist |
+| **P3** | Performance baseline | Load test report across three scenarios + connection pooling landed |
+| **P4** | Operations productization | Admin API + graceful shutdown + deployment docs |
+| **P5** | Commercial features | Shape branch decided by customer feedback |
+
+### P1: Integration Tests and the Regression Safety Net
+
+- Integration test harness: launch a real server + local mock upstreams, assert with curl or a C++ HTTP client
+- Scenarios covered: TLS handshake, keep-alive multi-request reuse, chunked, 405+Allow, 429 rate limiting, upstream failover, circuit breaker open/recovery, SIGHUP reload before/after behavior, reload rejection on corrupted config
+- Wire into CI (GitHub Actions): unit tests + integration tests + ASAN on every commit
+
+### P2: Configuration and Security Hardening
+
+- Config validation: field types/ranges (ports 1-65535, thresholds > 0), duplicate route name/path conflicts, upstream reference existence; a failed reload writes AUDIT and keeps the old config
+- Protocol security: reject duplicate `Content-Length`, CL/TE conflicts, and invalid header characters (request smuggling prevention); caps on request line/header lengths
+- TLS: minimum TLS 1.2, cipher suite whitelist, session ticket reuse, hot reload of certificate/private key
+- Secret management: api_keys loadable from environment variables or a separate file, not mixed into the main config
+
+### P3: Performance Baseline and Key Optimizations
+
+- wrk baseline across three scenarios: static small files (cache hits), reverse proxy (local backend), TLS handshake + request; output a P50/P99/QPS report (usable directly as marketing material)
+- Upstream connection pooling: per-request TCP connection → pooled + keep-alive; expected to be the single highest-yield optimization
+- Add a per-route latency histogram
+- Confirm hotspots with flame graphs before deciding on a route Trie/index (avoid premature optimization)
+
+### P4: Operations Productization
+
+- `/healthz` (liveness) and `/readyz` (readiness, checks upstream availability)
+- Admin API (separate listen address, authentication enforced): hot config updates, upstream/circuit breaker status, stats summary
+- Graceful shutdown: SIGTERM stops accepting first, waits for in-flight requests to finish, then exits (pairs with systemd `TimeoutStopSec`)
+- systemd unit, deployment/upgrade docs, `/version` endpoint
+
+### P5: Commercial Features (shape driven by customer signals)
+
+| Shape | Trigger Signal | What to Build First |
+|---|---|---|
+| Edge/OEM embedding | Device vendor outreach, concentrated ARM user feedback | C API/static library form, cross-compilation, offline activation |
+| Xinchuang compliance | Integrator/domestic-IT customer outreach | Kylin/UOS, Kunpeng/Phytium/Loongson adaptation and certification |
+| Self-hosting for small teams | Community growth, self-hosting issues clustering | Mini control plane (SQLite instead of etcd), multi-tenant quotas |
+
+---
+
+## 3. Commercialization Validation Track (6 months)
+
+### Core Principles
+
+- **No all-in**: keep existing income, set a validation window (6 months) and exit criteria (10 real users, 1 paid intent; otherwise downgrade to a portfolio project)
+- **The first goal is not making money — it is finding the first real user who is not yourself**
+- Customers before form factor, not the other way around
+
+### Phased Execution
+
+| Timeline | Goal | Measure |
+|---|---|---|
+| Month 1~2 | P1~P2 done (integration tests + config/security hardening) | CI fully green |
+| Month 2~3 | P3 done, load test report and competitor comparison table produced | Publicly shareable numbers |
+| Month 3 | English README + technical articles published (Juejin/Zhihu/V2EX/HN) | 100+ stars or steady external issues |
+| Month 4~6 | Collect feedback while building P4 | 10+ real users, ≥1 paid/customization intent |
+
+### How to Gather Market Signals
+
+- Proactively interview nearby companies doing backend/ops/embedded work (5 conversations give real signal)
+- Issue templates ask users about: deployment environment, device specs, most-wanted features
+- Watch user composition: many ARM/edge players → edge direction; many enterprise intranet ops → self-hosting direction
+
+### Review and Exit
+
+Review after 6 months: if the direction is clear, commit fully; otherwise gracefully convert it into a high-quality portfolio project (equally valuable for job hunting/contract work — not a failure).
+
+---
+
+## 4. Current Status and Next Steps
+
+- [x] P1: integration test framework (real server + mock upstreams), 32/32 passing (2026-09-12)
+  - Along the way, found and fixed a defect where `forward_request` reading the response with a single `recv` returned 200 with an empty body
+- [x] P1: CI wired up (2026-09-12)
+  - Added a platform-agnostic `ci.sh` (build → CTest unit tests → integration tests in one command), the single entry point shared by local and CI environments
+  - GitHub Actions workflow in place (`.github/workflows/ci.yml`), activates automatically once the repo is mirrored to GitHub
+  - The repo is currently hosted on Gitee: if Gitee-side CI is needed later, Gitee Go can invoke the same ci.sh
+- [ ] P2: config schema validation
+- [ ] P2: HTTP request smuggling protection
+- [ ] P3: wrk baseline load test report
+- [ ] P3: upstream connection pool
+- [ ] P4: /healthz + graceful shutdown
+- [ ] Outreach: English README, first architecture article
+- [ ] Signals: interview 5 potential users

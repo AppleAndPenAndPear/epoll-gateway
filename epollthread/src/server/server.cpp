@@ -9,7 +9,7 @@
 #include <fcntl.h>
 
 
-//构造函数只保存配置（端口、backlog、线程池等）
+// The constructor only stores configuration (port, backlog, thread pool, etc.)
 Tcpserver::Tcpserver(unsigned short port,int backlog,size_t min_threads, size_t max_threads,size_t scale_up_factor , size_t scale_down_factor): m_port(port),backlog_(backlog),closed(false){
   Logger::get()->info("Initializing Tcpserver on port {}", port);
 
@@ -22,20 +22,20 @@ Tcpserver::~Tcpserver(){
 void Tcpserver::start(unsigned int num_workers, const Config& config, const std::string& config_path) {
   if (num_workers == 0) {
     num_workers = std::thread::hardware_concurrency();
-    if (num_workers == 0) num_workers = 4; // 兜底
+    if (num_workers == 0) num_workers = 4; // Fallback
   }
   Logger::get()->info("Starting {} worker threads with SO_REUSEPORT", num_workers);
 
   auto shared_limiter = std::make_shared<RateLimiterManager>(config.rate_limit_config);
 
-  // 创建 N 个 listen socket 并启动 Worker 线程
+  // Create N listen sockets and start worker threads
   for (unsigned int i = 0; i < num_workers; ++i) {
     Socket listen_sock = create_listen_sock();
     workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config, shared_limiter, config_path));
     threads_.emplace_back(&TcpWorker::run, workers_.back().get());
   }
 
-   // 等待所有 Worker 退出（可通过 m_closed 原子变量触发优雅关闭）
+   // Wait for all workers to exit (graceful shutdown can be triggered via the closed atomic flag)
   for (auto& t : threads_) {
     if (t.joinable()) t.join();
   }
@@ -56,8 +56,8 @@ Socket Tcpserver::create_listen_sock(){
 
 void Tcpserver::stop(){
   closed = true;
-  // 通知所有 Worker 退出（例如关闭各自的 listen fd 或设置原子标志）
+  // Notify all workers to exit (e.g. close their listen fds or set the atomic flag)
   for (auto& worker : workers_) {
-    worker->close();  // 假设 TcpWorker 提供 close() 方法
+    worker->close();  // Assume TcpWorker provides a close() method
   }
 }

@@ -16,7 +16,7 @@ Socket::Socket(int domain, int type, int protocol){
 Socket::Socket(int fd) : fd_(fd) {}
 
 Socket::~Socket(){
-  closeSSL();  // 确保 SSL 资源被释放
+  closeSSL();  // make sure SSL resources are released
   if(fd_ != -1){
     Logger::get()->debug("socket fd {} closed", fd_);
     close(fd_);
@@ -49,7 +49,7 @@ int Socket::getFd() const {
 }
 
 
-// 针对 SO_REUSEADDR 的便捷函数
+// Convenience wrapper for SO_REUSEADDR
 bool Socket::setReuseAddr(bool enable) {
   int opt = enable ? 1 : 0;
   return setOption(SOL_SOCKET, SO_REUSEADDR, opt);
@@ -60,7 +60,7 @@ bool Socket::setReusePort(bool enable) {
   return setOption(SOL_SOCKET, SO_REUSEPORT, opt);
 }
 
-// 针对 SO_KEEPALIVE 的便捷函数
+// Convenience wrapper for SO_KEEPALIVE
 bool Socket::setKeepAlive(bool enable) {
   int opt = enable ? 1 : 0;
   return setOption(SOL_SOCKET, SO_KEEPALIVE, opt);
@@ -70,7 +70,7 @@ void Socket::setnonblocking()
 {
   int flags = fcntl(fd_,F_GETFL,0);
 
-  // 获取fd的状态。
+  // get the fd's current status flags.
   if  (flags == -1){
     throw_system_error("fcntl() F_GETFL failed,setnonblocking()");
   }
@@ -112,11 +112,11 @@ std::optional<int> Socket::accept(struct sockaddr* addr,socklen_t* addrlen){
   int clientsock = ::accept(fd_,addr,addrlen);
   if(clientsock == -1){
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // 可恢复错误：无新连接，返回空 optional
+      // recoverable: no pending connection; return an empty optional
       Logger::get()->trace("accept() would block on fd {}", fd_);
       return std::nullopt;
     }
-    // 不可恢复的错误：抛出异常，交由上层处理
+    // unrecoverable: throw and let the caller handle it
     throw_system_error("accept() failed");
   }
   Logger::get()->debug("Accepted new client fd {} on listen fd {}", clientsock, fd_);
@@ -128,7 +128,7 @@ ssize_t Socket::recv(char* data, size_t size, int flags) {
     if (n == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             Logger::get()->trace("recv() would block on fd {}", fd_);
-            return -1;   // 返回 -1 但 errno 为 EAGAIN，由上层判断
+            return -1;   // return -1 with errno == EAGAIN; the caller decides
         }
         throw_system_error("recv() failed");
     }
@@ -157,14 +157,14 @@ bool Socket::connect(const struct sockaddr* addr,socklen_t size){
   int ret = ::connect(fd_, addr, size);
   if (ret == 0) {
     Logger::get()->debug("Socket fd {} connected immediately", fd_);
-    return true;   // 立即连接成功
+    return true;   // connected immediately
   }
   // ret == -1
   if (errno == EINPROGRESS) {
     Logger::get()->debug("Socket fd {} connection in progress", fd_);
     return false;
   }
-  // 其他错误，抛出异常
+  // other errors: throw
   throw_system_error("connect() failed");
 }
 
@@ -199,10 +199,10 @@ bool Socket::sslAccept() {
   if (ret == 1) return true;
   int err = SSL_get_error(ssl_, ret);
   if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-    // 握手未完成，需要等待事件
+    // handshake not finished; wait for events
     return false;
   }
-  // 其他错误
+  // other errors
   Logger::get()->error("SSL_accept failed: {}", ERR_error_string(ERR_get_error(), nullptr));
   return false;
 }
@@ -225,9 +225,9 @@ ssize_t Socket::sslRead(char* buf, size_t size) {
         return -1;
     }
     if (err == SSL_ERROR_ZERO_RETURN) {
-        return 0;  // 对端关闭
+        return 0;  // peer closed
     }
-    // 其他错误
+    // other errors
     Logger::get()->error("SSL_read error: {}", ERR_error_string(ERR_get_error(), nullptr));
     errno = EIO;
     return -1;

@@ -86,12 +86,12 @@ BackendResponse forward_request(const std::string& host, int port,
         }
     }
 
-    // 构造 HTTP 请求
+    // Build the HTTP request
     current_phase_error = BackendError::WriteFailed;
     std::ostringstream req_stream;
     req_stream << method << " " << path << " HTTP/1.1\r\n";
     req_stream << "Host: " << host << ":" << port << "\r\n";
-    // 复制原始头部，但过滤掉 Host（已设）
+    // Copy the original headers, but filter out Host (already set)
     for (const auto& [k, v] : req_headers) {
         if (k == "host") continue;
         req_stream << k << ": " << v << "\r\n";
@@ -126,25 +126,49 @@ BackendResponse forward_request(const std::string& host, int port,
         sent += static_cast<size_t>(written);
     }
 
-    // 读取响应
+    // Read the response: headers and body may arrive across multiple TCP segments and a single recv would return an
+    // incomplete response, so read in a loop; the request uses Connection: close, so EOF or a full Content-Length finishes it.
     current_phase_error = BackendError::ReadFailed;
+    constexpr size_t kMaxResponseSize = 64 * 1024 * 1024;
     char buf[65536];
-    const auto wait_result = Poller::wait(upstream_socket.getFd(), Poller::Event::Read, timeout_ms);
-    if (wait_result == Poller::WaitResult::Timeout) {
-        return make_error_response(504, BackendError::ReadTimeout, "Gateway Timeout");
+    std::string response;
+    while (response.size() <= kMaxResponseSize) {
+        const auto wait_result = Poller::wait(upstream_socket.getFd(), Poller::Event::Read, timeout_ms);
+        if (wait_result == Poller::WaitResult::Timeout) {
+            return make_error_response(504, BackendError::ReadTimeout, "Gateway Timeout");
+        }
+        if (wait_result != Poller::WaitResult::Ready) {
+            resp.error = BackendError::ReadFailed;
+            return resp;
+        }
+        ssize_t n = upstream_socket.recv(buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            resp.error = BackendError::ReadFailed;
+            return resp;
+        }
+        if (n == 0) break; // Backend closed the connection per Connection: close
+        response.append(buf, static_cast<size_t>(n));
+
+        // Early completion: once headers are complete and the body reaches Content-Length, no need to wait for the peer to close
+        const size_t header_end = response.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            const size_t cl_pos = response.find("Content-Length: ");
+            if (cl_pos != std::string::npos && cl_pos < header_end) {
+                try {
+                    const size_t content_length =
+                        std::stoul(response.substr(cl_pos + sizeof("Content-Length: ") - 1));
+                    if (response.size() >= header_end + 4 + content_length) break;
+                } catch (const std::exception&) {
+                    // If Content-Length parsing fails, keep reading until EOF
+                }
+            }
+        }
     }
-    if (wait_result != Poller::WaitResult::Ready) {
+    if (response.empty()) {
         resp.error = BackendError::ReadFailed;
         return resp;
     }
-    ssize_t n = upstream_socket.recv(buf, sizeof(buf) - 1, 0);
-
-    if (n <= 0) {
-        resp.error = BackendError::ReadFailed;
-        return resp;
-    }
-
-    std::string response(buf, n);
     size_t pos = response.find(' ');
     if (pos == std::string::npos) {
         resp.error = BackendError::InvalidResponse;
@@ -162,20 +186,20 @@ BackendResponse forward_request(const std::string& host, int port,
         return resp;
     }
 
-    // 解析头部和 body
+    // Parse headers and body
     size_t header_end = response.find("\r\n\r\n");
     if (header_end != std::string::npos) {
         resp.body = response.substr(header_end + 4);
-        // 简单解析头部（可忽略）
+        // Simple header parsing (best-effort)
         std::string headers_part = response.substr(0, header_end);
-        size_t line_start = headers_part.find("\r\n") + 2; // 跳过状态行
+        size_t line_start = headers_part.find("\r\n") + 2; // Skip the status line
         while (line_start < headers_part.size()) {
             size_t line_end = headers_part.find("\r\n", line_start);
             std::string line = headers_part.substr(line_start, line_end - line_start);
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string key = line.substr(0, colon);
-                std::string value = line.substr(colon + 2); // 跳过 ": "
+                std::string value = line.substr(colon + 2); // Skip ": "
                 resp.headers[key] = value;
             }
             if (line_end == std::string::npos) break;

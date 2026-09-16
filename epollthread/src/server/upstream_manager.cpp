@@ -32,21 +32,21 @@ bool UpstreamManager::allow_request(const std::string& upstream_name,
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = circuit_states_[circuit_key(upstream_name, server)];
 
-    // CLOSED：当前没有达到失败阈值，正常放行请求。
+    // CLOSED: the failure threshold has not been reached; allow requests normally.
     if (!state.open) {
         return true;
     }
 
-    // OPEN：后端刚刚连续失败，先进入冷却窗口，不继续放大故障流量。
+    // OPEN: the backend just failed repeatedly; enter the cooldown window first instead of amplifying the failure traffic.
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - state.opened_at).count();
 
-    // 冷却未结束，或者已有其他请求占用了半开探测名额，直接拒绝。
+    // Reject if the cooldown is not over, or another request already holds the half-open probe slot.
     if (elapsed < recovery_timeout_ms || state.half_open_probe) {
         return false;
     }
 
-    // HALF-OPEN：冷却结束，只放行一个探测请求；结果由 record_success/failure 决定。
+    // HALF-OPEN: the cooldown is over; let exactly one probe request through, and record_success/failure decides the outcome.
     state.half_open_probe = true;
     return true;
 }
@@ -55,7 +55,7 @@ void UpstreamManager::record_success(const std::string& upstream_name,
                                      const UpstreamServer& server) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = circuit_states_[circuit_key(upstream_name, server)];
-    // 探测或普通请求成功，清空失败计数并关闭熔断，恢复正常放行。
+    // A probe or normal request succeeded: reset the failure count, close the circuit, and resume normal traffic.
     state.consecutive_failures = 0;
     state.open = false;
     state.half_open_probe = false;
@@ -67,11 +67,11 @@ void UpstreamManager::record_failure(const std::string& upstream_name,
                                      int recovery_timeout_ms) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = circuit_states_[circuit_key(upstream_name, server)];
-    // 最终失败结果（包括本次请求允许的重试都失败）才会累计熔断失败次数。
+    // Only a final failure (including all retries allowed for this request) counts toward the circuit failure count.
     state.half_open_probe = false;
     state.consecutive_failures++;
     if (state.consecutive_failures >= std::max(1, failure_threshold)) {
-        // OPEN：达到阈值，记录打开时间，后续请求进入恢复等待窗口。
+        // OPEN: threshold reached, record the open time; subsequent requests enter the recovery wait window.
         state.open = true;
         state.opened_at = std::chrono::steady_clock::now();
         Logger::get()->warn("Circuit opened for upstream {} server {}:{} for {} ms after {} failures",
@@ -92,7 +92,7 @@ const UpstreamServer& UpstreamManager::pick_server(const std::string& upstream_n
     size_t size = servers.size();
     size_t idx = round_robin_indices_[upstream_name]++ % size;
 
-    // 从 idx 开始寻找第一个健康的服务器
+    // Find the first healthy server starting from idx
     for (size_t i = 0; i < size; ++i) {
         size_t candidate = (idx + i) % size;
         if (servers[candidate].healthy) {
@@ -100,7 +100,7 @@ const UpstreamServer& UpstreamManager::pick_server(const std::string& upstream_n
         }
     }
 
-    // 所有服务器都不健康，仍然返回 idx 对应的（由调用者决定如何处理）
+    // All servers are unhealthy; still return the one at idx (the caller decides how to handle it)
     return servers[idx];
 }
 

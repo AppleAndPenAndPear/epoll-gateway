@@ -1,16 +1,16 @@
 #include "http_handler.h"
 #include <sys/epoll.h>
-#include <sys/stat.h>       // stat结构体需要
+#include <sys/stat.h>       // needed for struct stat
 #include "content_type.h"
-#include <sys/sendfile.h>       // sendfile 需要
-#include <fcntl.h>             // open 需要
-#include <unistd.h>            // close 需要
-#include <sstream>             // ostringstream 需要
-#include <algorithm>           // std::transform 需要
-#include <cctype>              // std::tolower 需要
-#include <stdexcept>           // std::runtime_error 需要
+#include <sys/sendfile.h>       // needed for sendfile
+#include <fcntl.h>             // needed for open
+#include <unistd.h>            // needed for close
+#include <sstream>             // needed for ostringstream
+#include <algorithm>           // needed for std::transform
+#include <cctype>              // needed for std::tolower
+#include <stdexcept>           // needed for std::runtime_error
 #include "mylogger.h"
-#include <iomanip>      // std::hex 需要
+#include <iomanip>      // needed for std::hex
 #include <nlohmann/json.hpp>
 #include "route_utils.h"
 #include "gzip_utils.h"
@@ -187,7 +187,7 @@ void HttpHandler::register_default_routes() {
         std::string user_id = params.at("id");
         json j;
         j["id"] = user_id;
-        j["name"] = "User_" + user_id;  // 模拟数据
+        j["name"] = "User_" + user_id;  // mock data
         resp.body = j.dump();
         resp.status_code = 200;
         resp.status_message = "OK";
@@ -201,7 +201,7 @@ void HttpHandler::register_default_routes() {
         resp.status_code = 200;
         resp.status_message = "OK";
         resp.headers["Content-Type"] = "text/plain";
-        resp.chunked = true;      // 关键：设置 chunked 标志
+        resp.chunked = true;      // Key: set the chunked flag
         resp.body = payload;
     });
 }
@@ -215,11 +215,11 @@ void HttpHandler::register_configured_routes() {
 }
 
 void HttpHandler::on_connect(Socket* sock){
-    read_bufs_[sock];          // 创建空读缓冲
-    send_queues_[sock];        // 创建空发送队列
+    read_bufs_[sock];          // Create an empty read buffer
+    send_queues_[sock];        // Create an empty send queue
     request_ready_[sock] = false;
     parsers_[sock] = HttpParser();
-    keep_alive_[sock] = true;  // 默认 keep-alive
+    keep_alive_[sock] = true;  // keep-alive by default
 }
 
 void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip){
@@ -236,16 +236,16 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                 auto& read_buf = read_bufs_[sock_ptr];
                 read_buf.append(buf, n);
 
-                // 反复解析缓冲区，直到解析不出完整请求
+                // Keep parsing the buffer until no complete request remains
                 while (true) {
                     size_t consumed = 0;
                     if (parsers_[sock_ptr].parse(read_buf.data(), read_buf.size(),requests_[sock_ptr], consumed)) {
-                        // 成功解析一个完整请求，记录总请求数
+                        // Parsed a complete request; record the total request count
                         Metrics::instance().record_total_request();
-                        // 从缓冲区移除已消费的数据
+                        // Remove the consumed data from the buffer
                         read_buf.erase(0, consumed);
 
-                        // 获取已解析好的请求引用
+                        // Get a reference to the parsed request
                         auto& req = requests_[sock_ptr];
 
                         const auto host_it = req.headers.find("host");
@@ -267,7 +267,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                                 parsers_[sock_ptr].reset();
                                 continue;
                             }
-                            // 未命中路由时仍交给 send_response 处理，允许静态文件 fallback 决定最终结果。
+                            // No route matched: still hand off to send_response, letting the static-file fallback decide the outcome.
                             Logger::get()->debug("No matching route for {} {} on fd {}", req.method, req.path, fd);
                             last_requests_[sock_ptr] = req;
                             send_response(sock_ptr, req, resolved);
@@ -279,7 +279,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         const std::string route_name = route_policy.name.empty() ? route_policy.path : route_policy.name;
                         req.headers["x-route-name"] = route_name;
 
-                        // ─── 鉴权检查：由路由策略决定是否需要 auth ───
+                        // ─── Auth check: the route policy decides whether auth is required ───
                         const ApiKeyConfig* api_key_cfg = nullptr;
                         if (route_policy.auth_required && !route_policy.allow_anonymous) {
                             std::string key = extract_api_key(req);
@@ -297,7 +297,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             api_key_cfg = api_key_manager_.get(key);
                         }
 
-                        // ─── 限流检查：按 route_policy 决定策略 ───
+                        // ─── Rate limit check: policy chosen per route_policy ───
                         if (should_rate_limit(req, route_policy, client_ip, api_key_cfg)) {
                             Logger::get()->debug("Rate limit exceeded for {} {} on fd {}", req.method, req.path, fd);
                             last_requests_[sock_ptr] = req;
@@ -306,7 +306,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             continue;
                         }
 
-                        // ─── 方法合法性检查（最后再决定是否允许进入路由处理） ───
+                        // ─── Method validation (final gate before route handling) ───
                         if (req.method != "GET" && req.method != "HEAD" && req.method != "POST" && req.method != "PUT" && req.method != "DELETE") {
                             Logger::get()->debug("HTTP method not allowed: {} on fd {}", req.method, fd);
                             last_requests_[sock_ptr] = req;
@@ -315,46 +315,46 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             continue;
                         }
                         
-                        //记录user-agent（key 已统一小写）
+                        // Record user-agent (keys are normalized to lowercase)
                         auto ua_it = req.headers.find("user-agent");
                         std::string user_agent = (ua_it != req.headers.end()) ? ua_it->second : "-";
-                        // CLF 在响应完成后记录完整访问结果；这里保留入口诊断，但避免生产 info 日志重复。
+                        // The CLF access log is written after the response completes; keep this entry-level diagnostic but avoid duplicate info logs in production.
                         Logger::get()->debug("Request: {} {} {} - UA: {}", req.method, req.path, req.version, user_agent);
 
-                        // 检查 connection 头，决定 keep-alive（key 已统一小写）
+                        // Check the connection header to decide keep-alive (keys are normalized to lowercase)
                         auto it = req.headers.find("connection");
                         if (it != req.headers.end()) {
                             std::string conn = it->second;
                             std::transform(conn.begin(), conn.end(), conn.begin(), ::tolower);
                             keep_alive_[sock_ptr] = (conn != "close");
                         } else {
-                            keep_alive_[sock_ptr] = true; // HTTP/1.1 默认 keep-alive
+                            keep_alive_[sock_ptr] = true; // HTTP/1.1 defaults to keep-alive
                         }
 
-                        // 准备响应（使用本次解析出的 request）
+                        // Prepare the response (using the request parsed above)
                         send_response(sock_ptr, req, resolved);
 
-                        // 重置解析器，为下一个请求做准备
+                        // Reset the parser for the next request
                         parsers_[sock_ptr].reset();
 
-                        // ★ 关键：跳出内层循环，等待发送完成再处理下一个请求
+                        // ★ Key: break out of the inner loop; handle the next request after sending completes
                         break;
                     }
-                    // ─── 检查 body 是否超出大小限制 ───
+                    // ─── Check whether the body exceeds the size limit ───
                     if (parsers_[sock_ptr].is_body_too_large()) {
                         Logger::get()->warn("Request body too large (>{}) on fd {}",
                             HttpParser::MAX_BODY_SIZE, fd);
                         last_requests_[sock_ptr] = requests_[sock_ptr];
                         send_error_response(sock_ptr, 413, "Payload Too Large");
-                        // 清除部分已消费的数据
+                        // Remove partially consumed data
                         if (consumed > 0) read_buf.erase(0, consumed);
                         parsers_[sock_ptr].reset();
                         requests_[sock_ptr].clear();
-                        continue;  // 继续检查缓冲区中是否还有后续请求
+                        continue;  // Keep checking the buffer for further requests
                     }
                     else {
                         Logger::get()->trace("Parser waiting for more data, buffer size: {}", read_buf.size());
-                        break; // 没有完整请求，等待更多数据
+                        break; // No complete request yet, wait for more data
                     }
                 }
             } else if (n == 0) {
@@ -365,7 +365,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                 else { throw_system_error("recv"); }
             }
         }
-        // 重新激活读事件（如果连接还活跃）
+        // Re-arm read events (if the connection is still alive)
         if (!send_queues_[sock_ptr].empty()) {
             epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
         } else {
@@ -382,19 +382,19 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
 
 void HttpHandler::process_request(Socket* sock_ptr){
     HttpRequest& req = requests_[sock_ptr];
-    // 检查 connection 头（key 已统一小写）
+    // Check the connection header (keys are normalized to lowercase)
     auto it = req.headers.find("connection");
     if (it != req.headers.end()) {
         std::string conn = it->second;
         std::transform(conn.begin(), conn.end(), conn.begin(), ::tolower);
         keep_alive_[sock_ptr] = (conn == "keep-alive");
     } else {
-        keep_alive_[sock_ptr] = true; // HTTP/1.1 默认 keep-alive
+        keep_alive_[sock_ptr] = true; // HTTP/1.1 defaults to keep-alive
     }
     auto matched = resolve_route(req);
-    send_response(sock_ptr, req, matched); // 准备响应
-    request_ready_[sock_ptr] = false; // 允许解析下一个请求
-    parsers_[sock_ptr].reset();       // 重置解析器状态
+    send_response(sock_ptr, req, matched); // Prepare the response
+    request_ready_[sock_ptr] = false; // Allow the next request to be parsed
+    parsers_[sock_ptr].reset();       // Reset the parser state
 }
 
 HttpResponse HttpHandler::make_error_response(int code, const std::string& status, const std::string& message) const {
@@ -462,7 +462,7 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         }
 
         const auto& server = upstream_manager_.pick_server(upstream_name);
-        // 熔断判断发生在连接后端之前；被熔断时不产生新的后端连接。
+        // The circuit-breaker check happens before connecting to the backend; no new backend connection is made while the circuit is open.
         if (!upstream_manager_.allow_request(upstream_name, server,route.upstream_target.circuit_recovery_timeout_ms)) {
             resp = make_error_response(503, "Service Unavailable", "Upstream circuit is open");
             return;
@@ -553,8 +553,8 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
     resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
     std::string path = req.path;
 
-    // 默认首页
-    if (path.empty() || path == "/") path = "/index.html"; // 默认首页
+    // Default index page
+    if (path.empty() || path == "/") path = "/index.html"; // Default index page
 
     bool path_handled = false;
 
@@ -567,7 +567,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
     bool already_compressed = false;
     
     if (!path_handled) {
-        // 未匹配路由时，静态 fallback 只允许 GET/HEAD，避免 POST 等方法读取静态资源。
+        // When no route matched, the static fallback only allows GET/HEAD, preventing methods like POST from reading static files.
         if (req.method != "GET" && req.method != "HEAD") {
             resp.status_code = 405;
             resp.status_message = "Method Not Allowed";
@@ -576,12 +576,12 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
             resp.headers["Content-Type"] = "text/html";
             resp.chunked = false;
         }
-        // 防止目录遍历攻击，简单处理：不允许 ".."
+        // Guard against path traversal attacks; simple approach: reject ".."
         else if (path.find("..") != std::string::npos) {
-            // 返回 403 Forbidden
+            // Return 403 Forbidden
             resp.status_code = 403;
             resp.status_message = "Forbidden";
-            resp.body = "<h1>403 Forbidden</h1>";       //<h1>:html标题标签，显示为大号字体
+            resp.body = "<h1>403 Forbidden</h1>";       //<h1>: HTML heading tag, rendered in large font
             resp.headers["Content-Length"] = std::to_string(resp.body.size());
             resp.headers["Content-Type"] = "text/html";
             resp.chunked = false;
@@ -589,24 +589,24 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
         else{
             Logger::get()->debug("Attempting to serve file: {}", path);
 
-            // 大文件：sendfile 零拷贝 + fd 缓存优化
+            // Large files: sendfile zero-copy + fd cache optimization
             int file_fd = -1;
 
-            // 快速路径：TTL 内直接返回，零系统调用
+            // Fast path: return directly within the TTL, zero syscalls
             struct stat st;
             off_t cached_size = 0;
             time_t cached_mtime = 0;
             time_t now = time(nullptr);
             file_fd = fd_cache_.try_get(path, now, &cached_size, &cached_mtime);
             if (file_fd != -1) {
-                // 缓存命中！直接使用，无 stat/open/fstat
-                Metrics::instance().record_fd_cache_hit();  // 记录缓存命中
+                // Cache hit! Use directly, no stat/open/fstat
+                Metrics::instance().record_fd_cache_hit();  // Record a cache hit
                 st.st_size = cached_size;
                 st.st_mtime = cached_mtime;
                 Logger::get()->debug("FdCache fast hit: {}", path);
             }
             else {
-                // TTL 过期或未缓存 → 需要 stat() 验证
+                // TTL expired or not cached → need stat() to verify
                 std::string file_path = www_root_ + path;
                 if (::stat(file_path.c_str(), &st) != 0) {
                     resp.status_code = 404;
@@ -618,14 +618,14 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                     goto after_file;
                 }
 
-                // 尝试验证已有缓存条目
+                // Try to validate an existing cache entry
                 file_fd = fd_cache_.validate(path, st.st_mtime);
                 if (file_fd != -1) {
-                    Metrics::instance().record_fd_cache_hit();  // 记录缓存命中
+                    Metrics::instance().record_fd_cache_hit();  // Record a cache hit
                     Logger::get()->debug("FdCache validated: {}", path);
                 }
                 else {
-                    // 缓存中无此条目，执行 open
+                    // Not in the cache, perform open
                     Metrics::instance().record_fd_cache_miss();
                     file_fd = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
                     if (file_fd >= 0) {
@@ -645,10 +645,10 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
             }
             
             if (file_fd >= 0) {
-                // st 已由 stat() 填充，无需 fstat
+                // st was already filled by stat(), no need for fstat
                 constexpr size_t MAX_INLINE = 1024 * 1024; // 1MB
 
-                // 判断客户端是否支持 gzip
+                // Check whether the client supports gzip
                 bool client_wants_gzip = false;
                 auto it = req.headers.find("accept-encoding");
                 if (it != req.headers.end() && it->second.find("gzip") != std::string::npos) {
@@ -656,28 +656,28 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                 }
 
                     if (client_wants_gzip && st.st_size <= MAX_INLINE) {
-                        // 尝试获取压缩缓存
+                        // Try to get the compressed cache entry
                         std::string gzip_key = path + "#gzip";
                         const std::string* compressed_cached = cache_.get(gzip_key, st.st_mtime);
                         if (compressed_cached) {
-                            // 命中压缩缓存
-                            Metrics::instance().record_gzip_cache_hit();   // ★ 使用 gzip 专用计数器
+                            // Compressed cache hit
+                            Metrics::instance().record_gzip_cache_hit();   // ★ Use the gzip-specific counter
                             resp.body = *compressed_cached;
                             resp.headers["Content-Encoding"] = "gzip";
                             already_compressed = true;
                             Logger::get()->debug("Cache hit (gzip): {}", path);
                         } else {
-                            // 未命中，获取原始内容，压缩，并缓存压缩结果
+                            // Cache miss: fetch the raw content, compress it, and cache the compressed result
                             const std::string* raw = cache_.get(path, st.st_mtime);
                             if (!raw) {
-                                // 原始也没缓存，读文件并存入原始缓存
+                                // Raw content not cached either: read the file and store it in the raw cache
                                 Metrics::instance().record_cache_miss();
                                 std::string file_content(st.st_size, '\0');
                                 ssize_t n = ::read(file_fd, &file_content[0], st.st_size);
                                 if (n == static_cast<ssize_t>(st.st_size)) {
                                     cache_.put(path, file_content, st.st_size, st.st_mtime);
                                     resp.body = std::move(file_content);
-                                    raw = &resp.body;  // ★ 修复：指向 resp.body 供后续压缩使用
+                                    raw = &resp.body;  // ★ Fix: point to resp.body for later compression
                                 }
                                 else{
                                     //close(file_fd);
@@ -688,7 +688,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                                     resp.headers["Content-Length"] = std::to_string(resp.body.size());
 
                                     resp.chunked = false;
-                                    goto after_file;  // 跳出文件处理
+                                    goto after_file;  // Jump out of file handling
                                 }
                             }
                             std::string compressed;
@@ -697,24 +697,24 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                                 resp.body = std::move(compressed);
                                 resp.headers["Content-Encoding"] = "gzip";
                                 already_compressed = true;
-                                Metrics::instance().record_gzip_cache_miss();  // ★ 使用 gzip 专用计数器
+                                Metrics::instance().record_gzip_cache_miss();  // ★ Use the gzip-specific counter
                             } else if (raw != &resp.body) {
-                                // 压缩失败，回退到原始内容（避免 self-copy）
+                                // Compression failed, fall back to the raw content (avoid self-copy)
                                 resp.body = *raw;
                             }
                             Logger::get()->debug("Gzip cache miss, compressed: {}", already_compressed);
                         }
-                        // 无论是否命中，小文件都已读入内存，可以关闭文件
+                        // Either way, the small file is already in memory, so the file can be closed
                         // close(file_fd);
-                        // file_fd = -1;  // 标记已关闭
+                        // file_fd = -1;  // mark as closed
                         resp.status_code = 200;
                         resp.status_message = "OK";
                         resp.headers["Content-Type"] = get_content_type(path);
                         resp.headers["Content-Length"] = std::to_string(resp.body.size());
                     }else{
-                        // ---------- 不支持 gzip 或大文件：走原有逻辑 ----------
+                        // ---------- No gzip support or large file: original path ----------
                         if (st.st_size <= MAX_INLINE) {
-                            // 小文件但不压缩：直接内存缓存（原来的缓存逻辑）
+                            // Small file without compression: direct in-memory cache (original cache logic)
                             const std::string* cached = cache_.get(path, st.st_mtime);
                             if (cached) {
                                 resp.body = *cached;
@@ -729,7 +729,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                                     Metrics::instance().record_cache_miss();
                                     Logger::get()->debug("Cache miss, stored (raw): {}", path);
                                 } else {
-                                    // fd 已缓存，由 FdCache 管理生命周期，不关闭
+                                    // fd is cached; FdCache owns its lifetime, do not close it
                                     resp.status_code = 500;
                                     resp.status_message = "Internal Server Error";
                                     resp.body = "<h1>500 Internal Server Error</h1>";
@@ -739,13 +739,13 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                                     goto after_file;
                                 }
                             }
-                            // fd 已缓存，由 FdCache 管理生命周期，不关闭
+                            // fd is cached; FdCache owns its lifetime, do not close it
                             resp.status_code = 200;
                             resp.status_message = "OK";
                             resp.headers["Content-Type"] = get_content_type(path);
                             resp.headers["Content-Length"] = std::to_string(resp.body.size());
                         } else {
-                            // 大文件：sendfile 零拷贝
+                            // Large file: sendfile zero-copy
                             resp.status_code = 200;
                             resp.status_message = "OK";
                             resp.headers["Content-Type"] = get_content_type(path);
@@ -775,7 +775,7 @@ after_file:
         resp.headers["Connection"] = "close";
     }
 
-    // ★ 统一添加 Server 头
+    // ★ Uniformly add the Server header
     resp.headers["Server"] = "EpollHTTP/0.2";
 
     if (req.method != "HEAD" && !already_compressed && should_compress(req, resp)) {
@@ -788,57 +788,57 @@ after_file:
     }
 
     if (resp.chunked) {
-        resp.headers.erase("Content-Length");               // 不能同时存在
+        resp.headers.erase("Content-Length");               // Must not coexist
         resp.headers["Transfer-Encoding"] = "chunked";
-        // 将原始 body 编码为 chunked 格式
+        // Encode the raw body into chunked format
         std::string chunked_body;
         if (!resp.body.empty()) {
             chunked_body += to_hex(resp.body.size()) + "\r\n";
             chunked_body += resp.body + "\r\n";
         }
-        chunked_body += "0\r\n\r\n";   // 结束块
+        chunked_body += "0\r\n\r\n";   // Terminating chunk
         resp.body = chunked_body;
     }
 
-    // 计算总发送字节数
+    // Compute the total number of bytes to send
     size_t total_bytes = 0;
-    // 将响应头序列化并放入发送队列
+    // Serialize the response headers and put them into the send queue
     std::string header_str = headers_to_string(resp);
     total_bytes += header_str.size();
 
     bool is_head = (req.method == "HEAD");
-    if (!is_head) {   // 非 HEAD 请求，才可能包含 body 或文件
+    if (!is_head) {   // Only non-HEAD requests may carry a body or a file
         if (!resp.body.empty()) {
             total_bytes += resp.body.size();
         } else if (resp.status_code == 200) {
-            // 文件响应：头部大小 + 文件大小
-            total_bytes += file_sizes_[sock];   // 此时文件大小已存入
+            // File response: header size + file size
+            total_bytes += file_sizes_[sock];   // The file size is stored by now
         }
     }
     else{
-        // HEAD 请求不允许有 body，fd 由 FdCache 管理，仅清理映射
+        // HEAD requests must not have a body; the fd is managed by FdCache, so just clean up the mappings
         auto file_it = file_fds_.find(sock);
         if (file_it != file_fds_.end()) {
             file_fds_.erase(sock);
             file_offsets_.erase(sock);
             file_sizes_.erase(sock);
         }
-        resp.body.clear();   // 确保内联 body 清空
+        resp.body.clear();   // Make sure the inline body is cleared
     }
 
-    // 存储状态码和总大小
+    // Store the status code and total size
     resp_status_[sock] = resp.status_code;
     resp_size_[sock] = total_bytes;
 
     auto& queue = send_queues_[sock];
     queue.emplace_back(header_str.begin(), header_str.end());
 
-    // 如果有内联 body（错误页面），也放入队列
+    // If there is an inline body (error page), put it in the queue as well
     if (!resp.body.empty()) {
         queue.emplace_back(resp.body.begin(), resp.body.end());
     }
 
-    // 激活写事件
+    // Enable write events
     int fd = sock->getFd();
     epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
 }
@@ -873,15 +873,15 @@ std::string HttpHandler::headers_to_string(const HttpResponse& resp) {
     for (const auto& [key, value] : resp.headers) {
         oss << key << ": " << value << "\r\n";
     }
-    oss << "\r\n";   // 空行分隔头部和主体
+    oss << "\r\n";   // Blank line separating headers and body
     return oss.str();
 }
 
 void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
     Socket* sock_ptr = sock.get();
     int fd = sock->getFd();
-    epoll_.del(fd);               // 显式从 epoll 移除，避免 fd 复用竞态
-    sock->closeSSL();             // SSL 优雅关闭（必须在 closefd 之前）
+    epoll_.del(fd);               // Explicitly remove from epoll to avoid fd-reuse races
+    sock->closeSSL();             // Graceful SSL shutdown (must precede closefd)
     sock->closefd();
     read_bufs_.erase(sock_ptr);
     send_queues_.erase(sock_ptr);
@@ -892,7 +892,7 @@ void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
 
     resp_status_.erase(sock_ptr);
     resp_size_.erase(sock_ptr);
-    // fd 由 FdCache 统一管理生命周期，这里只清理映射，不关闭
+    // fd lifetimes are managed centrally by FdCache; only clean up the mappings here, do not close
     auto fit = file_fds_.find(sock_ptr);
     if (fit != file_fds_.end()) {
         file_fds_.erase(fit);
@@ -909,11 +909,11 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
     int fd = sock->getFd();
     Socket* sock_ptr = sock.get();
     try {
-        // 持续处理，直到没有数据可发送且没有新请求可处理
+        // Keep processing until there is no data to send and no new request to handle
         while (true) {
             auto& queue = send_queues_[sock_ptr];
 
-            // ==================== 阶段1：发送用户态队列中的数据 ====================
+            // ==================== Phase 1: send data from the user-space queue ====================
             while (!queue.empty()) {
                 auto& front = queue.front();
                 bool is_ssl = sock_ptr->get_is_ssl_();
@@ -924,15 +924,15 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         queue.pop_front();
                     } else {
                         front.erase(front.begin(), front.begin() + n);
-                        // 没发完，等下次 EPOLLOUT
-                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);      //直接修改事件，保持 EPOLLOUT 监听，等待下次可写事件继续发送剩余数据
-                        break;  // 内核缓冲区满
+                        // Not fully sent, wait for the next EPOLLOUT
+                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);      // Modify events directly: keep monitoring EPOLLOUT and continue sending the remaining data on the next writable event
+                        break;  // Kernel buffer full
                     }
                 } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                     break;
                 } else if(n == -1 && errno == EPIPE){
-                    // 客户端已断开，这是正常现象，清理连接即可
+                    // The client has disconnected; this is normal, just clean up the connection
                     Logger::get()->debug("Client disconnected (EPIPE) on fd {}", fd);
                     cleanup(sock);
                     return;
@@ -941,8 +941,8 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                 }
             }
 
-            // ==================== 阶段2：发送静态文件（零拷贝） ====================
-            // 如果队列已空，判断是否需要关闭连接
+            // ==================== Phase 2: send static files (zero-copy) ====================
+            // If the queue is empty, decide whether to close the connection
             if (queue.empty()) {
                 auto file_it = file_fds_.find(sock_ptr);
                 if (file_it != file_fds_.end()) {
@@ -953,9 +953,9 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     bool is_ssl = sock_ptr->get_is_ssl_();
 
                     if (is_ssl) {
-                        // SSL 连接不能使用 sendfile（sendfile 绕过 OpenSSL 加密层）
-                        // 需要将文件内容读入用户态缓冲区，再通过 SSL_write 发送
-                        constexpr size_t SSL_SENDFILE_BUF = 65536;  // 64KB 缓冲区
+                        // SSL connections cannot use sendfile (sendfile bypasses the OpenSSL encryption layer)
+                        // The file content must be read into a user-space buffer and sent via SSL_write
+                        constexpr size_t SSL_SENDFILE_BUF = 65536;  // 64KB buffer
                         std::vector<char> filebuf(std::min(static_cast<off_t>(SSL_SENDFILE_BUF), remaining));
                         ssize_t read_n = ::pread(file_fd, filebuf.data(), filebuf.size(), offset);
                         if (read_n > 0) {
@@ -963,7 +963,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                             if (write_n > 0) {
                                 offset += write_n;
                                 remaining -= write_n;
-                                // 如果只写了部分，等待下次 EPOLLOUT
+                                // Partial write, wait for the next EPOLLOUT
                                 if (write_n < read_n) {
                                     file_offsets_[sock_ptr] = offset;
                                     epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
@@ -991,7 +991,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         }
                         // read_n == 0 means EOF, treat as done
                     } else {
-                        // 非 SSL：使用 sendfile 零拷贝
+                        // Non-SSL: use sendfile zero-copy
                         while (remaining > 0) {
                             ssize_t n = sendfile(fd, file_fd, &offset, remaining);
                             if (n > 0) {
@@ -1013,7 +1013,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         }
                     }
 
-                    // 文件发送完毕，清理文件描述符与映射
+                    // File fully sent, clean up the file descriptor and mappings
                     //close(file_fd);
                     file_fds_.erase(sock_ptr);
                     file_offsets_.erase(sock_ptr);
@@ -1037,10 +1037,10 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         }
                         Metrics::instance().record_route_request(route_name, req.host, req.tenant, status_it->second, duration);
                     }
-                    // 注意：这里我们不删除 start_time，因为后面 CLF 日志可能还要用，或者我们可以在记录完 CLF 后再删除
+                    // Note: we do not erase start_time here because the CLF log below may still need it; it could be erased after CLF logging instead.
                 }
 
-                // 响应真正发送完成后统一写审计日志，避免在鉴权/限流/路由分支重复记录。
+                // Write the audit log once after the response has actually been sent, avoiding duplicate records in the auth/rate-limit/routing branches.
                 auto audit_request_it = last_requests_.find(sock_ptr);
                 if (audit_request_it != last_requests_.end() && status_it != resp_status_.end() &&
                     status_it->second >= 400) {
@@ -1055,12 +1055,12 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                                    audit_request.tenant.empty() ? "-" : audit_request.tenant);
                 }
 
-                // ★ 新增：记录 CLF 格式的访问日志
+                // ★ New: record the access log in CLF format
                 {
                     auto ip_it = client_ip_map_.find(sock_ptr);
                     std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "-";
 
-                    // 安全获取请求耗时（防止 map 已被 cleanup 清空导致迭代器失效）
+                    // Safely fetch the request duration (guard against the map having been cleared by cleanup, which would invalidate iterators)
                     int64_t duration_us = 0;
                     auto start_it = request_start_time_.find(sock_ptr);
                     if (start_it != request_start_time_.end()) {
@@ -1083,7 +1083,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     time_t now = time(nullptr);
                     strftime(time_buf, sizeof(time_buf), "%d/%b/%Y:%H:%M:%S %z", localtime(&now));
 
-                    // 安全获取状态码和响应大小
+                    // Safely fetch the status code and response size
                     int status_code = 0;
                     size_t response_size = 0;
                     auto status_it = resp_status_.find(sock_ptr);
@@ -1097,29 +1097,29 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         user_agent, duration_us);
                 }
 
-                // 清理本次响应的临时记录
+                // Clean up the temporary records for this response
                 resp_status_.erase(sock_ptr);
                 resp_size_.erase(sock_ptr);
 
-                // 如果连接需要关闭，则清理并返回
+                // If the connection should be closed, clean up and return
                 if (!keep_alive_[sock_ptr]) {
                     cleanup(sock);
                     return;
                 }
 
-                // 检查读缓冲区中是否已有待处理的请求
+                // Check whether the read buffer already holds a pending request
                 if (!read_bufs_[sock_ptr].empty()) {
-                    std::string ip = client_ip_map_[sock_ptr]; // 复用 IP
+                    std::string ip = client_ip_map_[sock_ptr]; // Reuse the IP
                     handle_read(sock, ip);
-                    // 继续循环，尝试发送刚生成的数据
+                    // Loop again to try sending the newly generated data
                     continue;
                 }
 
-                // 没有待处理的请求了，转为监听读事件，跳出循环
+                // No pending requests left: switch to read events and break out of the loop
                 epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);
                 break;
             } else {
-                // 发送队列中仍有数据（EAGAIN 或部分发送），等待下次 EPOLLOUT
+                // The send queue still has data (EAGAIN or partial send), wait for the next EPOLLOUT
                 epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                 return;
             }
@@ -1171,7 +1171,7 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
 }
 
 bool HttpHandler::requires_auth(const HttpRequest& req) const {
-    // 仅对 /api/ 前缀的接口要求鉴权；静态文件与 /metrics 等公开路由无需鉴权
+    // Only /api/-prefixed endpoints require auth; static files and public routes like /metrics need none
     return req.path.rfind("/api/", 0) == 0;
 }
 
@@ -1186,12 +1186,12 @@ bool HttpHandler::should_rate_limit(const HttpRequest& req, const GatewayRoute& 
 }
 
 std::string HttpHandler::extract_api_key(const HttpRequest& req){
-    // 1. 优先从 X-API-Key 头
+    // 1. Prefer the X-API-Key header
     auto it = req.headers.find("x-api-key");
     if (it != req.headers.end()) {
         return it->second;
     }
-    // 2. 从 Authorization: Bearer <key>
+    // 2. Fall back to Authorization: Bearer <key>
     auto auth = req.headers.find("authorization");
     if (auth != req.headers.end()) {
         const std::string& val = auth->second;

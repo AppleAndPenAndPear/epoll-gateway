@@ -5,7 +5,7 @@
 #include <deque>
 #include <vector>
 #include <unordered_map>
-#include <sys/types.h>     //off_t需要，unistd.h也可
+#include <sys/types.h>     // needed for off_t; unistd.h also works
 #include "file_cache.h"
 #include <functional>
 #include <map>
@@ -29,31 +29,31 @@ private:
     struct ResolvedRoute {
         const RegisteredRoute* route = nullptr;
         RouteParams params;
-        // 路径、Host、Tenant 已匹配，但 HTTP method 不匹配时为 true，用于返回 405。
+        // True when path, Host and Tenant matched but the HTTP method did not; used to return 405.
         bool path_matched = false;
         std::string allow_methods;
     };
 
     Epoll& epoll_;
-    // 每个连接的读缓冲区（用于拼接头）
+    // Per-connection read buffer (for assembling headers)
     std::unordered_map<Socket*, std::string> read_bufs_;
-    // 每个连接的待发送数据（响应），使用 deque<vector<char>> 优化头删
+    // Per-connection pending response data; deque<vector<char>> optimizes front removal
     std::unordered_map<Socket*, std::deque<std::vector<char>>> send_queues_;
-    // 每个连接是否已解析出完整请求
+    // Whether a complete request has been parsed, per connection
     std::unordered_map<Socket*, bool> request_ready_;
-    // 解析器实例（每个连接一个）
+    // Parser instances (one per connection)
     std::unordered_map<Socket*, HttpParser> parsers_;
-    // 已解析的请求（仅当 request_ready_ 为真时有效）
+    // Parsed requests (valid only when request_ready_ is true)
     std::unordered_map<Socket*, HttpRequest> requests_;
-    // 是否保持连接
+    // Whether the connection is kept alive
     std::unordered_map<Socket*, bool> keep_alive_;
-    std::unordered_map<Socket*, int> file_fds_; //记录正在发送的文件 fd
-    std::unordered_map<Socket*, off_t> file_offsets_;    // 当前发送偏移
-    std::unordered_map<Socket*, off_t> file_sizes_;      // 文件总大小
-    std::unordered_map<Socket*, int> resp_status_;      // 状态码
-    std::unordered_map<Socket*, size_t> resp_size_;     // 将要发送的总字节数
-    std::string www_root_;      //文件路径
-    FileCache cache_;   // 新增缓存
+    std::unordered_map<Socket*, int> file_fds_; // fd of the file being sent
+    std::unordered_map<Socket*, off_t> file_offsets_;    // Current send offset
+    std::unordered_map<Socket*, off_t> file_sizes_;      // Total file size
+    std::unordered_map<Socket*, int> resp_status_;      // Status code
+    std::unordered_map<Socket*, size_t> resp_size_;     // Total bytes to send
+    std::string www_root_;      // Document root
+    FileCache cache_;   // File cache
 
     void send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched);
     void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) const;
@@ -65,35 +65,35 @@ private:
     void send_error_response(Socket* sock, int code, const std::string& message,
                              const std::string& allow_methods = "");
 
-    // 辅助：序列化响应头（不含 body）
+    // Helper: serialize response headers (without body)
     std::string headers_to_string(const HttpResponse& resp);
 
     std::vector<RegisteredRoute> routes_;
 
     std::unordered_map<Socket*, std::string> client_ip_map_;
     std::unordered_map<Socket*, std::chrono::steady_clock::time_point> request_start_time_;
-    std::unordered_map<Socket*, HttpRequest> last_requests_; // 记录上一个请求，用于日志输出
-    FdCache fd_cache_;   // 文件描述符缓存
-    Config config_;                      // 运行时配置快照，可通过 reload 更新
-    
-    UpstreamManager& upstream_manager_;  // 引用，用于选择后端
+    std::unordered_map<Socket*, HttpRequest> last_requests_; // Last request, kept for logging
+    FdCache fd_cache_;   // File descriptor cache
+    Config config_;                      // Runtime config snapshot, updatable via reload
 
-    std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // 跨 worker 共享的限流器
-    ApiKeyManager& api_key_manager_;                             // API Key 鉴权
+    UpstreamManager& upstream_manager_;  // Reference used to select backends
 
-    // 判断请求是否需要鉴权（公开路由如静态文件、/metrics 无需鉴权）
+    std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // Rate limiter shared across workers
+    ApiKeyManager& api_key_manager_;                             // API key authentication
+
+    // Whether the request requires auth (public routes like static files and /metrics need none)
     bool requires_auth(const HttpRequest& req) const;
     bool should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const;
 public:
     explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager,ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
     void reload_config(const Config& config);
-    void on_connect(Socket* sock);                          // 初始化
-    void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // 处理读事件
+    void on_connect(Socket* sock);                          // Initialize
+    void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // Handle read events
     void handle_write(std::shared_ptr<Socket> sock);
     void close_connection(std::shared_ptr<Socket> sock);
     void cleanup(std::shared_ptr<Socket> sock);
     void process_request(Socket* sock_ptr);
-    void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // 注册路由：method 为 "GET"、"POST" 等，path 如 "/api/hello"
+    void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // Register a route: method is "GET", "POST", etc.; path like "/api/hello"
     void addRoute(const GatewayRoute& route, RouteHandler handler);
     std::string extract_api_key(const HttpRequest& req);
 };
