@@ -1,6 +1,7 @@
 #pragma once
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,7 +30,7 @@ struct UpstreamServer {
 // A group of upstream servers (one backend service)
 struct Upstream {
     std::vector<UpstreamServer> servers;
-    std::string algorithm;  // Load balancing algorithm
+    std::string algorithm = "round_robin";  // Load balancing algorithm
 };
 
 // Describes which upstream a route uses, plus the route's execution parameters
@@ -112,9 +113,113 @@ struct Config {
         }
     }
 
-    // Load config from a JSON file; keeps defaults if the file is missing or parsing fails
-    static Config from_file(const std::string& path) {
+    // Semantic validation of a fully-parsed configuration. Returns human-readable
+    // problems; an empty list means the config is safe to apply.
+    static std::vector<std::string> validate(const Config& config) {
+        std::vector<std::string> errors;
+        if (config.port == 0) errors.push_back("port: must be in [1, 65535]");
+        if (config.backlog <= 0) errors.push_back("backlog: must be > 0");
+        if (config.keepalive_timeout <= 0) errors.push_back("keepalive_timeout: must be > 0");
+        if (config.cache_max_entries == 0) errors.push_back("cache_max_entries: must be > 0");
+        if (config.cache_max_file_size_mb == 0) errors.push_back("cache_max_file_size_mb: must be > 0");
+        if (config.thread_pool.min_threads == 0) errors.push_back("thread_pool.min: must be > 0");
+        if (config.thread_pool.max_threads < config.thread_pool.min_threads)
+            errors.push_back("thread_pool.max: must be >= thread_pool.min");
+        if (config.thread_pool.scale_up_threshold == 0) errors.push_back("thread_pool.scale_up: must be > 0");
+        if (config.thread_pool.scale_down_threshold == 0) errors.push_back("thread_pool.scale_down: must be > 0");
+        if (config.rate_limit_config.capacity == 0) errors.push_back("rate_limit.capacity: must be > 0");
+        if (config.rate_limit_config.refill_per_second == 0)
+            errors.push_back("rate_limit.refill_per_second: must be > 0");
+
+        for (const auto& [name, up] : config.upstream_config.upstreams) {
+            if (up.servers.empty())
+                errors.push_back("upstreams." + name + ": at least one server is required");
+            if (up.algorithm.empty())
+                errors.push_back("upstreams." + name + ".algorithm: must not be empty");
+            for (size_t i = 0; i < up.servers.size(); ++i) {
+                const auto& s = up.servers[i];
+                const std::string at = "upstreams." + name + ".servers[" + std::to_string(i) + "]";
+                if (s.host.empty()) errors.push_back(at + ".host: must not be empty");
+                if (s.port <= 0 || s.port > 65535)
+                    errors.push_back(at + ".port: must be in [1, 65535]");
+            }
+        }
+
+        std::set<std::string> route_names;
+        std::set<std::string> match_keys;
+        for (size_t i = 0; i < config.upstream_config.routes.size(); ++i) {
+            const auto& r = config.upstream_config.routes[i];
+            const std::string at = "routes[" + std::to_string(i) + "]" +
+                                   (r.name.empty() ? "" : " (" + r.name + ")");
+            if (r.name.empty()) {
+                errors.push_back(at + ".name: must not be empty");
+            } else if (!route_names.insert(r.name).second) {
+                errors.push_back(at + ".name: duplicate route name '" + r.name + "'");
+            }
+            if (r.method.empty()) errors.push_back(at + ".method: must not be empty");
+            if (r.path.empty() || r.path[0] != '/')
+                errors.push_back(at + ".path: must start with '/'");
+            if (r.target_type != "local" && r.target_type != "upstream" && r.target_type != "static") {
+                errors.push_back(at + ".target_type: unknown value '" + r.target_type +
+                                 "' (expected local|upstream|static)");
+            }
+            if (r.rate_limit_policy != "api_key" && r.rate_limit_policy != "ip" &&
+                r.rate_limit_policy != "route") {
+                errors.push_back(at + ".rate_limit_policy: unknown value '" + r.rate_limit_policy +
+                                 "' (expected api_key|ip|route)");
+            }
+            if (r.target_type == "upstream") {
+                if (r.upstream_target.name.empty()) {
+                    errors.push_back(at + ".upstream_target.name: required for target_type=upstream");
+                } else if (config.upstream_config.upstreams.find(r.upstream_target.name) ==
+                           config.upstream_config.upstreams.end()) {
+                    errors.push_back(at + ".upstream_target.name: references unknown upstream '" +
+                                     r.upstream_target.name + "'");
+                }
+            } else if (r.target_type == "static" && r.static_root.empty()) {
+                errors.push_back(at + ".static_root: required for target_type=static");
+            }
+            if (r.upstream_target.timeout_ms <= 0)
+                errors.push_back(at + ".upstream_target.timeout_ms: must be > 0");
+            if (r.upstream_target.max_retries < 0)
+                errors.push_back(at + ".upstream_target.max_retries: must be >= 0");
+            if (r.upstream_target.circuit_failure_threshold <= 0)
+                errors.push_back(at + ".upstream_target.circuit_failure_threshold: must be > 0");
+            if (r.upstream_target.circuit_recovery_timeout_ms <= 0)
+                errors.push_back(at + ".upstream_target.circuit_recovery_timeout_ms: must be > 0");
+
+            const std::string match_key = r.method + "|" + r.host + "|" + r.tenant + "|" + r.path;
+            if (!match_keys.insert(match_key).second)
+                errors.push_back(at + ": duplicate route match (method/host/tenant/path): " + match_key);
+        }
+
+        std::set<std::string> seen_keys;
+        for (size_t i = 0; i < config.api_keys.size(); ++i) {
+            const auto& ak = config.api_keys[i];
+            const std::string at = "api_keys[" + std::to_string(i) + "]";
+            if (ak.key.empty()) {
+                errors.push_back(at + ".key: must not be empty");
+            } else if (!seen_keys.insert(ak.key).second) {
+                errors.push_back(at + ".key: duplicate api key");
+            }
+            if (ak.rate_limit.capacity == 0)
+                errors.push_back(at + ".rate_limit.capacity: must be > 0");
+            if (ak.rate_limit.refill_per_second == 0)
+                errors.push_back(at + ".rate_limit.refill_per_second: must be > 0");
+        }
+        return errors;
+    }
+
+    // Load config from a JSON file; keeps defaults if the file is missing or parsing fails.
+    // When `errors` is provided it collects schema violations (wrong types, out-of-range
+    // values): the offending field keeps its default so the result is still a usable
+    // Config, and callers should reject it via validate() before applying.
+    static Config from_file(const std::string& path, std::vector<std::string>* errors = nullptr) {
         Config config;
+        std::vector<std::string> local_errors;
+        std::vector<std::string>& errs = errors ? *errors : local_errors;
+        errs.clear();
+
         std::ifstream ifs(path);
         if (!ifs.is_open()) {
             // File missing; use defaults
@@ -123,135 +228,269 @@ struct Config {
         nlohmann::json j;
         try {
             ifs >> j;
-        } catch (...) {
-            // Parse failed; use defaults
+        } catch (const std::exception& e) {
+            errs.push_back(std::string("invalid JSON: ") + e.what());
             return config;
         }
+        if (!j.is_object()) {
+            errs.push_back("top-level value must be a JSON object");
+            return config;
+        }
+
+        // Reads an integer field with type and range checks. Returns false (and
+        // records an error, leaving `out` untouched) when present but invalid.
+        auto read_int = [&errs](const nlohmann::json& obj, const char* key,
+                                long long min_value, long long max_value,
+                                long long& out, const std::string& context) {
+            const auto it = obj.find(key);
+            if (it == obj.end()) return true;
+            if (!it->is_number_integer()) {
+                errs.push_back(context + key + ": expected an integer");
+                return false;
+            }
+            long long value = 0;
+            try {
+                value = it->get<long long>();
+            } catch (...) {
+                errs.push_back(context + key + ": integer out of range");
+                return false;
+            }
+            if (value < min_value || value > max_value) {
+                errs.push_back(context + key + ": value " + std::to_string(value) +
+                               " out of range [" + std::to_string(min_value) + ", " +
+                               std::to_string(max_value) + "]");
+                return false;
+            }
+            out = value;
+            return true;
+        };
+        // Reads a string field with a type check.
+        auto read_str = [&errs](const nlohmann::json& obj, const char* key,
+                                std::string& out, const std::string& context) {
+            const auto it = obj.find(key);
+            if (it == obj.end()) return true;
+            if (!it->is_string()) {
+                errs.push_back(context + key + ": expected a string");
+                return false;
+            }
+            out = it->get<std::string>();
+            return true;
+        };
+        // Reads a boolean field with a type check.
+        auto read_bool = [&errs](const nlohmann::json& obj, const char* key,
+                                 bool& out, const std::string& context) {
+            const auto it = obj.find(key);
+            if (it == obj.end()) return true;
+            if (!it->is_boolean()) {
+                errs.push_back(context + key + ": expected a boolean");
+                return false;
+            }
+            out = it->get<bool>();
+            return true;
+        };
+
         // Read field by field, overriding defaults when present
-        if (j.contains("port")) config.port = j["port"];
-        if (j.contains("backlog")) config.backlog = j["backlog"];
-        if (j.contains("num_workers")) config.num_workers = j["num_workers"];
-        if (j.contains("www_root")) config.www_root = j["www_root"];
+        {
+            long long v = config.port;
+            if (read_int(j, "port", 1, 65535, v, "")) config.port = static_cast<unsigned short>(v);
+        }
+        {
+            long long v = config.backlog;
+            if (read_int(j, "backlog", 1, 65535, v, "")) config.backlog = static_cast<int>(v);
+        }
+        {
+            long long v = config.num_workers;
+            if (read_int(j, "num_workers", 0, 1024, v, "")) config.num_workers = static_cast<unsigned int>(v);
+        }
+        read_str(j, "www_root", config.www_root, "");
 
         if (j.contains("thread_pool")) {
             auto& tp = j["thread_pool"];
-            if (tp.contains("min")) config.thread_pool.min_threads = tp["min"];
-            if (tp.contains("max")) config.thread_pool.max_threads = tp["max"];
-            if (tp.contains("scale_up")) config.thread_pool.scale_up_threshold = tp["scale_up"];
-            if (tp.contains("scale_down")) config.thread_pool.scale_down_threshold = tp["scale_down"];
+            long long v = config.thread_pool.min_threads;
+            if (read_int(tp, "min", 1, 1000000, v, "thread_pool."))
+                config.thread_pool.min_threads = static_cast<size_t>(v);
+            v = config.thread_pool.max_threads;
+            if (read_int(tp, "max", 1, 1000000, v, "thread_pool."))
+                config.thread_pool.max_threads = static_cast<size_t>(v);
+            v = config.thread_pool.scale_up_threshold;
+            if (read_int(tp, "scale_up", 1, 1000000, v, "thread_pool."))
+                config.thread_pool.scale_up_threshold = static_cast<size_t>(v);
+            v = config.thread_pool.scale_down_threshold;
+            if (read_int(tp, "scale_down", 1, 1000000, v, "thread_pool."))
+                config.thread_pool.scale_down_threshold = static_cast<size_t>(v);
         }
-        if (j.contains("cache_max_entries")) {
-            config.cache_max_entries = j["cache_max_entries"];
+        {
+            long long v = config.cache_max_entries;
+            if (read_int(j, "cache_max_entries", 1, 1000000000, v, ""))
+                config.cache_max_entries = static_cast<size_t>(v);
         }
-        if (j.contains("cache_max_file_size_mb")) {
-            config.cache_max_file_size_mb = j["cache_max_file_size_mb"];
+        {
+            long long v = config.cache_max_file_size_mb;
+            if (read_int(j, "cache_max_file_size_mb", 1, 1000000, v, ""))
+                config.cache_max_file_size_mb = static_cast<size_t>(v);
         }
-        if (j.contains("keepalive_timeout")) {
-            config.keepalive_timeout = j["keepalive_timeout"];
+        {
+            long long v = config.keepalive_timeout;
+            if (read_int(j, "keepalive_timeout", 1, 86400, v, ""))
+                config.keepalive_timeout = static_cast<int>(v);
         }
 
         // Parse upstreams
         if (j.contains("upstreams")) {
-            for (auto& [name, val] : j["upstreams"].items()) {
-                Upstream up;
-                if (val.contains("servers")) {
-                    for (auto& srv : val["servers"]) {
-                        UpstreamServer s;
-                        s.host = srv.value("host", "127.0.0.1");
-                        s.port = srv.value("port", 80);
-                        up.servers.push_back(s);
+            if (!j["upstreams"].is_object()) {
+                errs.push_back("upstreams: expected an object");
+            } else {
+                for (auto& [name, val] : j["upstreams"].items()) {
+                    Upstream up;
+                    if (val.contains("servers")) {
+                        if (!val["servers"].is_array()) {
+                            errs.push_back("upstreams." + name + ".servers: expected an array");
+                        } else {
+                            int index = 0;
+                            for (auto& srv : val["servers"]) {
+                                const std::string ctx = "upstreams." + name +
+                                                        ".servers[" + std::to_string(index++) + "].";
+                                UpstreamServer s;
+                                read_str(srv, "host", s.host, ctx);
+                                long long p = 80;
+                                if (read_int(srv, "port", 1, 65535, p, ctx)) s.port = static_cast<int>(p);
+                                up.servers.push_back(s);
+                            }
+                        }
                     }
+                    read_str(val, "algorithm", up.algorithm, "upstreams." + name + ".");
+                    config.upstream_config.upstreams[name] = up;
                 }
-                up.algorithm = val.value("algorithm", "round_robin");
-                config.upstream_config.upstreams[name] = up;
             }
         }
-        if (j.contains("upstream_health_check_timeout_ms")) {
-            config.upstream_config.health_check_timeout_ms =
-                j.value("upstream_health_check_timeout_ms", 500);
+        {
+            long long v = config.upstream_config.health_check_timeout_ms;
+            if (read_int(j, "upstream_health_check_timeout_ms", 1, 600000, v, ""))
+                config.upstream_config.health_check_timeout_ms = static_cast<int>(v);
         }
 
         // Parse routes
         if (j.contains("routes")) {
-            for (auto& item : j["routes"]) {
-                GatewayRoute r;
-                r.name = item.value("name", "");
-                r.method = item.value("method", "GET");
-                r.path = item.value("path", "/");
-                r.host = item.value("host", "*");
-                r.tenant = item.value("tenant", "*");
-                r.target_type = item.value("target_type", "upstream");
-                r.handler_name = item.value("handler", "");
-                r.static_root = item.value("static_root", "");
+            if (!j["routes"].is_array()) {
+                errs.push_back("routes: expected an array");
+            } else {
+                for (auto& item : j["routes"]) {
+                    GatewayRoute r;
+                    read_str(item, "name", r.name, "route.");
+                    read_str(item, "method", r.method, "route.");
+                    read_str(item, "path", r.path, "route.");
+                    read_str(item, "host", r.host, "route.");
+                    read_str(item, "tenant", r.tenant, "route.");
+                    read_str(item, "target_type", r.target_type, "route.");
+                    read_str(item, "handler", r.handler_name, "route.");
+                    read_str(item, "static_root", r.static_root, "route.");
 
-                r.enabled = item.value("enabled", true);
-                r.auth_required = item.value("auth_required", true);
-                r.allow_anonymous = item.value("allow_anonymous", false);
-                r.rate_limit_policy = item.value("rate_limit_policy", "api_key");
-                const int legacy_timeout_ms = item.value("timeout_ms", 5000);
+                    read_bool(item, "enabled", r.enabled, "route.");
+                    read_bool(item, "auth_required", r.auth_required, "route.");
+                    read_bool(item, "allow_anonymous", r.allow_anonymous, "route.");
+                    read_str(item, "rate_limit_policy", r.rate_limit_policy, "route.");
+                    long long legacy_timeout_ms = 5000;
+                    read_int(item, "timeout_ms", 1, 600000, legacy_timeout_ms, "route.");
 
-                if (item.contains("upstream_target")) {
-                    const auto& target = item["upstream_target"];
-                    r.upstream_target.name = target.value("name", "");
-                    r.upstream_target.timeout_ms = target.value("timeout_ms", legacy_timeout_ms);
-                    r.upstream_target.max_retries = target.value("max_retries", 1);
-                    r.upstream_target.circuit_failure_threshold = target.value("circuit_failure_threshold", 5);
-                    r.upstream_target.circuit_recovery_timeout_ms = target.value("circuit_recovery_timeout_ms", 10000);
-                } else {
-                    r.upstream_target.name = "";
-                    r.upstream_target.timeout_ms = legacy_timeout_ms;
-                    r.upstream_target.max_retries = 1;
-                    r.upstream_target.circuit_failure_threshold = 5;
-                    r.upstream_target.circuit_recovery_timeout_ms = 10000;
-                }
-
-                if (item.contains("allowed_api_keys")) {
-                    for (const auto& k : item["allowed_api_keys"]) {
-                        r.allowed_api_keys.push_back(k.get<std::string>());
+                    if (item.contains("upstream_target")) {
+                        const auto& target = item["upstream_target"];
+                        read_str(target, "name", r.upstream_target.name, "route.upstream_target.");
+                        long long v = r.upstream_target.timeout_ms;
+                        if (read_int(target, "timeout_ms", 1, 600000, v, "route.upstream_target."))
+                            r.upstream_target.timeout_ms = static_cast<int>(v);
+                        v = r.upstream_target.max_retries;
+                        if (read_int(target, "max_retries", 0, 100, v, "route.upstream_target."))
+                            r.upstream_target.max_retries = static_cast<int>(v);
+                        v = r.upstream_target.circuit_failure_threshold;
+                        if (read_int(target, "circuit_failure_threshold", 1, 1000000, v, "route.upstream_target."))
+                            r.upstream_target.circuit_failure_threshold = static_cast<int>(v);
+                        v = r.upstream_target.circuit_recovery_timeout_ms;
+                        if (read_int(target, "circuit_recovery_timeout_ms", 1, 86400000, v, "route.upstream_target."))
+                            r.upstream_target.circuit_recovery_timeout_ms = static_cast<int>(v);
+                    } else {
+                        r.upstream_target.name = "";
+                        r.upstream_target.timeout_ms = static_cast<int>(legacy_timeout_ms);
+                        r.upstream_target.max_retries = 1;
+                        r.upstream_target.circuit_failure_threshold = 5;
+                        r.upstream_target.circuit_recovery_timeout_ms = 10000;
                     }
-                }
-                if (item.contains("denied_api_keys")) {
-                    for (const auto& k : item["denied_api_keys"]) {
-                        r.denied_api_keys.push_back(k.get<std::string>());
-                    }
-                }
 
-                config.upstream_config.routes.push_back(r);
+                    if (item.contains("allowed_api_keys")) {
+                        if (!item["allowed_api_keys"].is_array()) {
+                            errs.push_back("route.allowed_api_keys: expected an array");
+                        } else {
+                            for (const auto& k : item["allowed_api_keys"]) {
+                                if (k.is_string()) r.allowed_api_keys.push_back(k.get<std::string>());
+                                else errs.push_back("route.allowed_api_keys: entries must be strings");
+                            }
+                        }
+                    }
+                    if (item.contains("denied_api_keys")) {
+                        if (!item["denied_api_keys"].is_array()) {
+                            errs.push_back("route.denied_api_keys: expected an array");
+                        } else {
+                            for (const auto& k : item["denied_api_keys"]) {
+                                if (k.is_string()) r.denied_api_keys.push_back(k.get<std::string>());
+                                else errs.push_back("route.denied_api_keys: entries must be strings");
+                            }
+                        }
+                    }
+
+                    config.upstream_config.routes.push_back(r);
+                }
             }
         }
 
         // Parse rate limit config
-        if (j.contains("rate_limit")){
+        if (j.contains("rate_limit")) {
             auto& rl = j["rate_limit"];
-            if (rl.contains("capacity")) {
-                config.rate_limit_config.capacity = rl["capacity"];
-            }
-            if (rl.contains("refill_per_second")) {
-                config.rate_limit_config.refill_per_second = rl["refill_per_second"];
-            }
+            long long v = config.rate_limit_config.capacity;
+            if (read_int(rl, "capacity", 1, 1000000000, v, "rate_limit."))
+                config.rate_limit_config.capacity = static_cast<size_t>(v);
+            v = config.rate_limit_config.refill_per_second;
+            if (read_int(rl, "refill_per_second", 1, 1000000000, v, "rate_limit."))
+                config.rate_limit_config.refill_per_second = static_cast<size_t>(v);
         }
 
-        if(j.contains("api_keys")){
-            for (auto& item : j["api_keys"]) {
-                ApiKeyConfig ak;
-                ak.key = item.value("key", "");
-                ak.name = item.value("name", "");
-                if (item.contains("rate_limit")) {
-                    auto& rl = item["rate_limit"];
-                    ak.rate_limit.capacity = rl.value("capacity", 200);
-                    ak.rate_limit.refill_per_second = rl.value("refill_per_second", 100);
-                }
-                if (item.contains("allowed_hosts")) {
-                    for (const auto& host : item["allowed_hosts"]) {
-                        ak.allowed_hosts.push_back(host.get<std::string>());
+        if (j.contains("api_keys")) {
+            if (!j["api_keys"].is_array()) {
+                errs.push_back("api_keys: expected an array");
+            } else {
+                for (auto& item : j["api_keys"]) {
+                    ApiKeyConfig ak;
+                    read_str(item, "key", ak.key, "api_key.");
+                    read_str(item, "name", ak.name, "api_key.");
+                    if (item.contains("rate_limit")) {
+                        auto& rl = item["rate_limit"];
+                        long long v = ak.rate_limit.capacity;
+                        if (read_int(rl, "capacity", 1, 1000000000, v, "api_key.rate_limit."))
+                            ak.rate_limit.capacity = static_cast<size_t>(v);
+                        v = ak.rate_limit.refill_per_second;
+                        if (read_int(rl, "refill_per_second", 1, 1000000000, v, "api_key.rate_limit."))
+                            ak.rate_limit.refill_per_second = static_cast<size_t>(v);
                     }
-                }
-                if (item.contains("allowed_tenants")) {
-                    for (const auto& tenant : item["allowed_tenants"]) {
-                        ak.allowed_tenants.push_back(tenant.get<std::string>());
+                    if (item.contains("allowed_hosts")) {
+                        if (!item["allowed_hosts"].is_array()) {
+                            errs.push_back("api_key.allowed_hosts: expected an array");
+                        } else {
+                            for (const auto& host : item["allowed_hosts"]) {
+                                if (host.is_string()) ak.allowed_hosts.push_back(host.get<std::string>());
+                                else errs.push_back("api_key.allowed_hosts: entries must be strings");
+                            }
+                        }
                     }
+                    if (item.contains("allowed_tenants")) {
+                        if (!item["allowed_tenants"].is_array()) {
+                            errs.push_back("api_key.allowed_tenants: expected an array");
+                        } else {
+                            for (const auto& tenant : item["allowed_tenants"]) {
+                                if (tenant.is_string()) ak.allowed_tenants.push_back(tenant.get<std::string>());
+                                else errs.push_back("api_key.allowed_tenants: entries must be strings");
+                            }
+                        }
+                    }
+                    config.api_keys.push_back(ak);
                 }
-                config.api_keys.push_back(ak);
             }
         }
 

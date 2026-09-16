@@ -19,8 +19,21 @@ int main(){
     Logger::Guard g("logs/epollserver.log");
     auto logger = Logger::get();
 
-    // Load the config file (falls back to defaults if missing)
-    Config config = Config::from_file("config.json");
+    // Load the config file (falls back to defaults if missing), then validate it.
+    // A config that fails validation aborts startup instead of silently running
+    // on defaults (which could leave security policies unset).
+    std::vector<std::string> config_errors;
+    Config config = Config::from_file("config.json", &config_errors);
+    for (const std::string& e : Config::validate(config)) {
+        config_errors.push_back(e);
+    }
+    if (!config_errors.empty()) {
+        for (const std::string& e : config_errors) {
+            logger->error("Config validation failed: {}", e);
+            std::cerr << "Config error: " << e << '\n';
+        }
+        return 1;
+    }
 
     // Register signal handlers
     std::signal(SIGINT, signal_handler);

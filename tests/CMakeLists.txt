@@ -6,6 +6,7 @@ add_executable(runTests
     test_auth_and_rate_limit.cpp
     test_http_client.cpp
     test_upstream_manager.cpp
+    test_config_validation.cpp
     ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
     ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
     ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp

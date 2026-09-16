@@ -37,14 +37,29 @@ void TcpWorker::check_timeout() {
   time_t now = time(nullptr);
   const uint64_t reload_generation = config_reload_generation.load(std::memory_order_relaxed);
   if (reload_generation != applied_reload_generation_) {
-    std::ifstream config_file(config_path_);
-    if (!config_file.is_open() || !Config::is_valid_file(config_path_)) {
-      Logger::get()->error("Runtime configuration reload skipped: invalid or unavailable {}", config_path_);
+    std::vector<std::string> reload_errors;
+    Config reloaded;
+    if (Config::is_valid_file(config_path_)) {
+      reloaded = Config::from_file(config_path_, &reload_errors);
     } else {
-      Config reloaded = Config::from_file(config_path_);
+      reload_errors.push_back("file missing or not valid JSON");
+    }
+    for (const std::string& e : Config::validate(reloaded)) {
+      reload_errors.push_back(e);
+    }
+    if (!reload_errors.empty()) {
+      std::string joined;
+      for (const std::string& e : reload_errors) {
+        if (!joined.empty()) joined += "; ";
+        joined += e;
+      }
+      // AUDIT: rejected reload, keep serving with the old config
+      Logger::get()->warn("AUDIT config_reload_rejected path={} errors=[{}]", config_path_, joined);
+    } else {
       handler_.reload_config(reloaded);
       keepalive_timeout_ = reloaded.keepalive_timeout;
       applied_reload_generation_ = reload_generation;
+      Logger::get()->info("AUDIT config_reload_applied path={}", config_path_);
     }
   }
     for (auto it = last_active_.begin(); it != last_active_.end(); ) {

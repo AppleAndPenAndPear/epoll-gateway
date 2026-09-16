@@ -128,7 +128,10 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Added a platform-agnostic `ci.sh` (build → CTest unit tests → integration tests in one command), the single entry point shared by local and CI environments
   - GitHub Actions workflow in place (`.github/workflows/ci.yml`), activates automatically once the repo is mirrored to GitHub
   - The repo is currently hosted on Gitee: if Gitee-side CI is needed later, Gitee Go can invoke the same ci.sh
-- [ ] P2: config schema validation
+- [x] P2: config schema validation (2026-09-16)
+  - Added `Config::validate()` (field ranges, duplicate route names/matches, upstream reference existence, api key checks) and type/range-checked `from_file` reads
+  - Startup fails fast on invalid config; SIGHUP reload of an invalid config writes an AUDIT log and keeps the old config
+  - 14 new unit tests in `test_config_validation.cpp`
 - [ ] P2: HTTP request smuggling protection
 - [ ] P3: wrk baseline load test report
 - [ ] P3: upstream connection pool
