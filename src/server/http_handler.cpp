@@ -340,12 +340,19 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         // ★ Key: break out of the inner loop; handle the next request after sending completes
                         break;
                     }
-                    // ─── Check whether the body exceeds the size limit ───
-                    if (parsers_[sock_ptr].is_body_too_large()) {
-                        Logger::get()->warn("Request body too large (>{}) on fd {}",
-                            HttpParser::MAX_BODY_SIZE, fd);
-                        last_requests_[sock_ptr] = requests_[sock_ptr];
-                        send_error_response(sock_ptr, 413, "Payload Too Large");
+                    // ─── Reject malformed requests (request smuggling prevention) ───
+                    if (parsers_[sock_ptr].error() != HttpParser::ParseError::NONE) {
+                        const HttpParser::ParseError err = parsers_[sock_ptr].error();
+                        if (err == HttpParser::ParseError::BODY_TOO_LARGE) {
+                            Logger::get()->warn("Request body too large (>{}) on fd {}",
+                                HttpParser::MAX_BODY_SIZE, fd);
+                            last_requests_[sock_ptr] = requests_[sock_ptr];
+                            send_error_response(sock_ptr, 413, "Payload Too Large");
+                        } else {
+                            Logger::get()->warn("Malformed request rejected on fd {}: error={}", fd, static_cast<int>(err));
+                            last_requests_[sock_ptr] = requests_[sock_ptr];
+                            send_error_response(sock_ptr, 400, "Bad Request");
+                        }
                         // Remove partially consumed data
                         if (consumed > 0) read_buf.erase(0, consumed);
                         parsers_[sock_ptr].reset();
