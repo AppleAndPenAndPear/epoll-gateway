@@ -143,7 +143,9 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - `api_keys` can now live outside the main config: `"api_keys_file": "api_keys.json"` (JSON array, same schema) or the `GW_API_KEYS` environment variable; precedence env > file > inline
   - Inline keys in config.json still work (backward compat) but log a security hint at startup; a missing/invalid keys file or env JSON fails fast with a schema error
   - Integration tests now load keys via `api_keys_file` end-to-end; 6 unit tests cover the source precedence
-- [ ] P3: wrk baseline load test report
+- [x] P3: wrk baseline load test report (2026-09-17)
+  - `scripts/benchmark/run_benchmark.sh` + full report in `docs/BENCHMARKS.md` (P50/P99/QPS across static, proxy, handshake scenarios)
+  - Bonus fix found by the baseline: missing `TCP_NODELAY` caused a fixed ~43 ms delayed-ACK stall per request; enabling it improved light-load latency ~5.4x and handshake throughput ~4.3x
 - [ ] P3: upstream connection pool
 - [ ] P4: /healthz + graceful shutdown
 - [ ] Outreach: English README, first architecture article
