@@ -35,6 +35,22 @@ int main(){
         return 1;
     }
 
+    // TLS must come up at startup; abort on a broken or mismatched cert/key pair
+    std::string tls_error;
+    SSL_CTX* tls_probe = build_hardened_ssl_ctx(config.tls.cert_path, config.tls.key_path, &tls_error);
+    if (!tls_probe) {
+        logger->critical("TLS setup failed: {}", tls_error);
+        std::cerr << "TLS error: " << tls_error << '\n';
+        return 1;
+    }
+    SSL_CTX_free(tls_probe);
+
+    // Security hint: secrets should live outside the main config file
+    if (!config.api_keys.empty() && config.api_keys_file.empty()) {
+        logger->warn("api_keys are defined inline in the main config; "
+                     "prefer 'api_keys_file' or the GW_API_KEYS environment variable");
+    }
+
     // Register signal handlers
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);

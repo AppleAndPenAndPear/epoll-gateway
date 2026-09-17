@@ -132,7 +132,17 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Added `Config::validate()` (field ranges, duplicate route names/matches, upstream reference existence, api key checks) and type/range-checked `from_file` reads
   - Startup fails fast on invalid config; SIGHUP reload of an invalid config writes an AUDIT log and keeps the old config
   - 14 new unit tests in `test_config_validation.cpp`
-- [ ] P2: HTTP request smuggling protection
+- [x] P2: HTTP request smuggling protection (2026-09-17)
+  - Parser now rejects duplicate `Content-Length`, CL+TE mixing, non-chunked `Transfer-Encoding`, non-numeric `Content-Length`, invalid header name/value characters, control chars in the request line, non-hex chunk sizes, and oversized request lines/headers
+  - Malformed requests get 400 + `Connection: close`; also capped the previously unbounded chunked body at `MAX_BODY_SIZE`
+- [x] P2: TLS hardening (2026-09-17)
+  - `build_hardened_ssl_ctx` (`tls_context.cpp`): minimum TLS 1.2, AEAD-only cipher whitelist (ECDHE+GCM/ChaCha20), no compression, session cache + tickets for resumption
+  - TLS setup is fail-fast at startup; SIGHUP hot-reloads cert/key from the new `tls.cert_path`/`tls.key_path` config, AUDIT logs applied/rejected, old context kept on failure
+  - Integration tests: TLS 1.1 refused, cert hot reload verified via peer-certificate fingerprint; 6 unit tests for the context builder
+- [x] P2: Secret management (2026-09-17)
+  - `api_keys` can now live outside the main config: `"api_keys_file": "api_keys.json"` (JSON array, same schema) or the `GW_API_KEYS` environment variable; precedence env > file > inline
+  - Inline keys in config.json still work (backward compat) but log a security hint at startup; a missing/invalid keys file or env JSON fails fast with a schema error
+  - Integration tests now load keys via `api_keys_file` end-to-end; 6 unit tests cover the source precedence
 - [ ] P3: wrk baseline load test report
 - [ ] P3: upstream connection pool
 - [ ] P4: /healthz + graceful shutdown

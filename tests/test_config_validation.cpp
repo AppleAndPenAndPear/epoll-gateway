@@ -157,6 +157,26 @@ TEST(ConfigValidationTest, RejectsBadUpstreamServer) {
     EXPECT_GE(errors.size(), 2);
 }
 
+TEST(ConfigValidationTest, RejectsEmptyTlsPaths) {
+    Config config;
+    config.tls.cert_path = "";
+    std::vector<std::string> errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("tls.cert_path") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+
+    config = Config{};
+    config.tls.key_path = "";
+    errors = Config::validate(config);
+    found = false;
+    for (const auto& e : errors) {
+        if (e.find("tls.key_path") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
 TEST(ConfigValidationTest, RejectsDuplicateApiKey) {
     Config config;
     ApiKeyConfig a;
@@ -253,6 +273,86 @@ TEST(FromFileSchemaTest, RejectsCorruptedJson) {
     Config config = Config::from_file(path, &errors);
     ASSERT_EQ(errors.size(), 1);
     EXPECT_NE(errors[0].find("invalid JSON"), std::string::npos);
+}
+
+TEST(FromFileSchemaTest, ParsesTlsSection) {
+    const std::string path = write_temp_config("tls", R"({
+        "tls": {"cert_path": "/etc/ssl/gw.crt", "key_path": "/etc/ssl/gw.key"}
+    })");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(path, &errors);
+    EXPECT_TRUE(errors.empty());
+    EXPECT_EQ(config.tls.cert_path, "/etc/ssl/gw.crt");
+    EXPECT_EQ(config.tls.key_path, "/etc/ssl/gw.key");
+}
+
+TEST(FromFileSchemaTest, RejectsNonObjectTlsSection) {
+    const std::string path = write_temp_config("tls_bad", R"({"tls": [1, 2]})");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(path, &errors);
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_NE(errors[0].find("tls: expected an object"), std::string::npos);
+}
+
+TEST(ApiKeysSourceTest, LoadsKeysFromFile) {
+    const std::string keys_path = write_temp_config("keys_file",
+        R"([{"key": "file-key-1", "name": "from file",
+             "rate_limit": {"capacity": 7, "refill_per_second": 3}}])");
+    const std::string cfg_path = write_temp_config("keys_cfg",
+        R"({"api_keys_file": ")" + keys_path + R"("})");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(cfg_path, &errors);
+    for (const std::string& e : Config::validate(config)) errors.push_back(e);
+    EXPECT_TRUE(errors.empty()) << (errors.empty() ? "" : errors[0]);
+    ASSERT_EQ(config.api_keys.size(), 1);
+    EXPECT_EQ(config.api_keys[0].key, "file-key-1");
+    EXPECT_EQ(config.api_keys[0].rate_limit.capacity, 7);
+    EXPECT_EQ(config.api_keys_file, keys_path);
+}
+
+TEST(ApiKeysSourceTest, FileOverridesInlineKeys) {
+    const std::string keys_path = write_temp_config("keys_file2",
+        R"([{"key": "file-key", "name": "from file"}])");
+    const std::string cfg_path = write_temp_config("keys_cfg2", R"({
+        "api_keys": [{"key": "inline-key", "name": "inline"}],
+        "api_keys_file": ")" + keys_path + R"("})");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(cfg_path, &errors);
+    EXPECT_TRUE(errors.empty());
+    ASSERT_EQ(config.api_keys.size(), 1);
+    EXPECT_EQ(config.api_keys[0].key, "file-key");
+}
+
+TEST(ApiKeysSourceTest, EnvVarOverridesFile) {
+    const std::string keys_path = write_temp_config("keys_file3",
+        R"([{"key": "file-key", "name": "from file"}])");
+    const std::string cfg_path = write_temp_config("keys_cfg3",
+        R"({"api_keys_file": ")" + keys_path + R"("})");
+    setenv("GW_API_KEYS", R"([{"key": "env-key", "name": "from env"}])", 1);
+    std::vector<std::string> errors;
+    Config config = Config::from_file(cfg_path, &errors);
+    unsetenv("GW_API_KEYS");
+    EXPECT_TRUE(errors.empty());
+    ASSERT_EQ(config.api_keys.size(), 1);
+    EXPECT_EQ(config.api_keys[0].key, "env-key");
+}
+
+TEST(ApiKeysSourceTest, InvalidEnvJsonIsAnError) {
+    setenv("GW_API_KEYS", "not json", 1);
+    std::vector<std::string> errors;
+    Config config = Config::from_file("/tmp/gw_test_does_not_exist.json", &errors);
+    unsetenv("GW_API_KEYS");
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_NE(errors[0].find("GW_API_KEYS"), std::string::npos);
+}
+
+TEST(ApiKeysSourceTest, MissingKeysFileIsAnError) {
+    const std::string cfg_path = write_temp_config("keys_cfg4",
+        R"({"api_keys_file": "/nonexistent/keys.json"})");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(cfg_path, &errors);
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_NE(errors[0].find("api_keys_file"), std::string::npos);
 }
 
 TEST(FromFileSchemaTest, MissingFileYieldsDefaultsWithoutErrors) {

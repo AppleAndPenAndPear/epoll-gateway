@@ -92,7 +92,21 @@ def request(path, method="GET", headers=None, body=None, port=SERVER_PORT, timeo
         conn.close()
 
 
-def make_config(with_reloaded_route=False):
+# API keys live in their own file (P2 secret management), referenced from the
+# main config via "api_keys_file"; the server cwd is the workspace, so a bare
+# relative path resolves there.
+API_KEYS_FILE = "api_keys.json"
+API_KEYS = [
+    {"key": "limited-key-1", "name": "limited",
+     "rate_limit": {"capacity": 1000, "refill_per_second": 500},
+     "allowed_hosts": ["*"], "allowed_tenants": ["*"]},
+    {"key": "burst-key-1", "name": "burst",
+     "rate_limit": {"capacity": 1, "refill_per_second": 1},
+     "allowed_hosts": ["*"], "allowed_tenants": ["*"]},
+]
+
+
+def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None):
     routes = [
         {"name": "proxy-two", "method": "GET", "path": "/api/two/*",
          "target_type": "upstream",
@@ -119,7 +133,7 @@ def make_config(with_reloaded_route=False):
              "target_type": "upstream",
              "upstream_target": {"name": "two", "timeout_ms": 3000},
              "auth_required": False, "allow_anonymous": True})
-    return json.dumps({
+    cfg = {
         "port": SERVER_PORT,
         "backlog": 512,
         "num_workers": 1,
@@ -141,15 +155,88 @@ def make_config(with_reloaded_route=False):
         "routes": routes,
         # Large global rate limit to avoid interfering with other cases; 429 is triggered by a dedicated api_key quota
         "rate_limit": {"capacity": 100000, "refill_per_second": 50000},
-        "api_keys": [
-            {"key": "limited-key-1", "name": "limited",
-             "rate_limit": {"capacity": 1000, "refill_per_second": 500},
-             "allowed_hosts": ["*"], "allowed_tenants": ["*"]},
-            {"key": "burst-key-1", "name": "burst",
-             "rate_limit": {"capacity": 1, "refill_per_second": 1},
-             "allowed_hosts": ["*"], "allowed_tenants": ["*"]},
-        ],
-    }, indent=2)
+        # Secrets stay out of the main config: keys come from api_keys.json
+        "api_keys_file": API_KEYS_FILE,
+    }
+    if tls_cert and tls_key:
+        cfg["tls"] = {"cert_path": tls_cert, "key_path": tls_key}
+    return json.dumps(cfg, indent=2)
+
+
+def test_tls_hardening():
+    print("\n[15] TLS hardening (min version 1.2)")
+    # A legacy client offering only TLS 1.1 or below must be refused by the server
+    rejected = False
+    try:
+        legacy = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        legacy.check_hostname = False
+        legacy.verify_mode = ssl.CERT_NONE
+        legacy.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        legacy.maximum_version = ssl.TLSVersion.TLSv1_1
+        # avoid a client-side security-level failure masking the server refusal
+        try:
+            legacy.set_ciphers("DEFAULT@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
+        with socket.create_connection((BASE, SERVER_PORT), timeout=5) as raw:
+            with legacy.wrap_socket(raw):
+                pass
+    except Exception:
+        rejected = True
+    check("TLS 1.1 handshake refused", rejected)
+
+    status, _, _ = request("/")
+    check("TLS 1.2+ handshake still works", status == 200, "got %s" % status)
+
+
+def peer_cert_fingerprint():
+    """TLS-connects and returns the DER peer certificate bytes, or None."""
+    try:
+        with socket.create_connection((BASE, SERVER_PORT), timeout=5) as raw:
+            with TLS_CTX.wrap_socket(raw) as ss:
+                return ss.getpeercert(binary_form=True)
+    except Exception:
+        return None
+
+
+def test_tls_cert_hot_reload(ws_dir):
+    print("\n[16] TLS certificate hot reload")
+    if shutil.which("openssl") is None:
+        print("  SKIP: openssl CLI not available")
+        return
+
+    old_fp = peer_cert_fingerprint()
+    check("captured current certificate", old_fp is not None)
+    if old_fp is None:
+        return
+
+    cert_path = os.path.join(ws_dir, "tls-reload.crt")
+    key_path = os.path.join(ws_dir, "tls-reload.key")
+    gen = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", key_path, "-out", cert_path, "-days", "1",
+         "-subj", "/CN=gateway-reload-test"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check("generated replacement certificate", gen.returncode == 0)
+    if gen.returncode != 0:
+        return
+
+    cfg_path = os.path.join(ws_dir, "config.json")
+    with open(cfg_path, "w") as f:
+        f.write(make_config(with_reloaded_route=True, tls_cert=cert_path, tls_key=key_path))
+    os.kill(server_proc.pid, signal.SIGHUP)
+
+    new_fp = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        new_fp = peer_cert_fingerprint()
+        if new_fp is not None and new_fp != old_fp:
+            break
+        time.sleep(0.3)
+    check("peer certificate changed after SIGHUP", new_fp is not None and new_fp != old_fp)
+
+    status, _, _ = request("/api/reloaded/x")
+    check("traffic healthy after cert reload", status == 200, "got %s" % status)
 
 
 # ──────────────────────────── Test cases ────────────────────────────
@@ -367,6 +454,8 @@ def main():
         f.write("<html><body>INTEGRATION-INDEX</body></html>")
     with open(os.path.join(ws, "config.json"), "w") as f:
         f.write(make_config())
+    with open(os.path.join(ws, API_KEYS_FILE), "w") as f:
+        f.write(json.dumps(API_KEYS, indent=2))
     fail_control_dir = tempfile.mkdtemp(prefix="epoll-mock-fail-")
 
     try:
@@ -414,6 +503,8 @@ def main():
         test_corrupt_reload(ws)
         test_metrics()
         test_chunked()
+        test_tls_hardening()
+        test_tls_cert_hot_reload(ws)
 
         # Final check: the server stayed alive and responsive throughout
         status, _, _ = request("/")
