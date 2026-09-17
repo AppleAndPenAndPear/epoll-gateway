@@ -22,9 +22,13 @@ TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config
 
   SSL_library_init();
   OpenSSL_add_all_algorithms();
-  ssl_ctx_ = SSL_CTX_new(TLS_server_method());
-  SSL_CTX_use_certificate_file(ssl_ctx_, "certs/server.crt", SSL_FILETYPE_PEM);
-  SSL_CTX_use_PrivateKey_file(ssl_ctx_, "certs/server.key", SSL_FILETYPE_PEM);
+  std::string ssl_error;
+  ssl_ctx_ = build_hardened_ssl_ctx(config.tls.cert_path, config.tls.key_path, &ssl_error);
+  if (!ssl_ctx_) {
+    // Fail fast: a gateway that cannot serve TLS should not come up at all.
+    throw std::runtime_error("TLS setup failed (" + config.tls.cert_path + ", " +
+                             config.tls.key_path + "): " + ssl_error);
+  }
 
   Logger::get()->info("TcpWorker created with listen fd {} by move", listen_sock_.getFd());
 }
@@ -58,6 +62,23 @@ void TcpWorker::check_timeout() {
     } else {
       handler_.reload_config(reloaded);
       keepalive_timeout_ = reloaded.keepalive_timeout;
+
+      // Hot-reload the certificate/private key from the (possibly new) paths.
+      // SSL objects hold their own reference to the old context, so freeing it
+      // here only drops our reference; in-flight connections keep it alive.
+      std::string tls_error;
+      SSL_CTX* new_ctx = build_hardened_ssl_ctx(reloaded.tls.cert_path, reloaded.tls.key_path, &tls_error);
+      if (new_ctx) {
+        SSL_CTX* old_ctx = ssl_ctx_;
+        ssl_ctx_ = new_ctx;
+        SSL_CTX_free(old_ctx);
+        Logger::get()->info("AUDIT tls_reload_applied cert={} key={}",
+                            reloaded.tls.cert_path, reloaded.tls.key_path);
+      } else {
+        Logger::get()->warn("AUDIT tls_reload_rejected cert={} key={} error={}",
+                            reloaded.tls.cert_path, reloaded.tls.key_path, tls_error);
+      }
+
       applied_reload_generation_ = reload_generation;
       Logger::get()->info("AUDIT config_reload_applied path={}", config_path_);
     }

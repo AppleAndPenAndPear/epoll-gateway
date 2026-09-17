@@ -54,6 +54,7 @@ set(SERVER_SOURCES
     src/server/pool.cpp
     src/server/content_type.cpp
     src/server/tcpworker.cpp
+    src/server/tls_context.cpp
     src/server/gzip_utils.cpp
     src/server/metrics.cpp
     src/server/upstream_manager.cpp

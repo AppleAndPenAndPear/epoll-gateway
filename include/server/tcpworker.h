@@ -9,6 +9,12 @@
 extern std::atomic<bool> stop_server_flag;
 extern std::atomic<uint64_t> config_reload_generation;
 
+// Builds a hardened server SSL_CTX: minimum TLS 1.2, an AEAD-only cipher
+// whitelist with forward secrecy, session resumption (cache + tickets).
+// Returns nullptr and fills *error on any failure.
+SSL_CTX* build_hardened_ssl_ctx(const std::string& cert_path, const std::string& key_path,
+                                std::string* error);
+
 class TcpWorker {
 private:
   Socket listen_sock_;

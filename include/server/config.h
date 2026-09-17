@@ -1,5 +1,6 @@
 #pragma once
 #include <nlohmann/json.hpp>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <string>
@@ -71,6 +72,12 @@ struct UpstreamConfig {
     int health_check_timeout_ms = 500;
 };
 
+// TLS server material and hardening knobs
+struct TlsConfig {
+    std::string cert_path = "certs/server.crt";
+    std::string key_path = "certs/server.key";
+};
+
 struct Config {
     // Server port
     unsigned short port = 5005;
@@ -95,9 +102,14 @@ struct Config {
 
     UpstreamConfig upstream_config;
 
+    TlsConfig tls;
+
     RateLimitConfig rate_limit_config;
 
     std::vector<ApiKeyConfig> api_keys;      // API key list
+    // Path to a separate api-keys JSON file; empty when keys were provided
+    // inline or via GW_API_KEYS ("<env:GW_API_KEYS>")
+    std::string api_keys_file;
 
     static bool is_valid_file(const std::string& path) {
         std::ifstream ifs(path);
@@ -130,6 +142,10 @@ struct Config {
         if (config.rate_limit_config.capacity == 0) errors.push_back("rate_limit.capacity: must be > 0");
         if (config.rate_limit_config.refill_per_second == 0)
             errors.push_back("rate_limit.refill_per_second: must be > 0");
+        if (config.tls.cert_path.empty())
+            errors.push_back("tls.cert_path: must not be empty");
+        if (config.tls.key_path.empty())
+            errors.push_back("tls.key_path: must not be empty");
 
         for (const auto& [name, up] : config.upstream_config.upstreams) {
             if (up.servers.empty())
@@ -220,23 +236,6 @@ struct Config {
         std::vector<std::string>& errs = errors ? *errors : local_errors;
         errs.clear();
 
-        std::ifstream ifs(path);
-        if (!ifs.is_open()) {
-            // File missing; use defaults
-            return config;
-        }
-        nlohmann::json j;
-        try {
-            ifs >> j;
-        } catch (const std::exception& e) {
-            errs.push_back(std::string("invalid JSON: ") + e.what());
-            return config;
-        }
-        if (!j.is_object()) {
-            errs.push_back("top-level value must be a JSON object");
-            return config;
-        }
-
         // Reads an integer field with type and range checks. Returns false (and
         // records an error, leaving `out` untouched) when present but invalid.
         auto read_int = [&errs](const nlohmann::json& obj, const char* key,
@@ -288,6 +287,87 @@ struct Config {
             out = it->get<bool>();
             return true;
         };
+        // Parses an api-keys JSON array shared by all api key sources.
+        auto parse_api_keys_array = [&errs, &read_str, &read_int](
+                const nlohmann::json& arr, const char* source,
+                std::vector<ApiKeyConfig>& out) {
+            if (!arr.is_array()) {
+                errs.push_back(std::string(source) + ": expected an array");
+                return;
+            }
+            int index = 0;
+            for (auto& item : arr) {
+                const std::string at = std::string(source) + "[" + std::to_string(index++) + "].";
+                ApiKeyConfig ak;
+                read_str(item, "key", ak.key, at);
+                read_str(item, "name", ak.name, at);
+                if (item.contains("rate_limit")) {
+                    auto& rl = item["rate_limit"];
+                    long long v = ak.rate_limit.capacity;
+                    if (read_int(rl, "capacity", 1, 1000000000, v, at + "rate_limit."))
+                        ak.rate_limit.capacity = static_cast<size_t>(v);
+                    v = ak.rate_limit.refill_per_second;
+                    if (read_int(rl, "refill_per_second", 1, 1000000000, v, at + "rate_limit."))
+                        ak.rate_limit.refill_per_second = static_cast<size_t>(v);
+                }
+                if (item.contains("allowed_hosts")) {
+                    if (!item["allowed_hosts"].is_array()) {
+                        errs.push_back(at + "allowed_hosts: expected an array");
+                    } else {
+                        for (const auto& host : item["allowed_hosts"]) {
+                            if (host.is_string()) ak.allowed_hosts.push_back(host.get<std::string>());
+                            else errs.push_back(at + "allowed_hosts: entries must be strings");
+                        }
+                    }
+                }
+                if (item.contains("allowed_tenants")) {
+                    if (!item["allowed_tenants"].is_array()) {
+                        errs.push_back(at + "allowed_tenants: expected an array");
+                    } else {
+                        for (const auto& tenant : item["allowed_tenants"]) {
+                            if (tenant.is_string()) ak.allowed_tenants.push_back(tenant.get<std::string>());
+                            else errs.push_back(at + "allowed_tenants: entries must be strings");
+                        }
+                    }
+                }
+                out.push_back(ak);
+            }
+        };
+        // Applies the GW_API_KEYS environment variable (highest-priority api key
+        // source); defined before any early return so it always runs.
+        auto apply_env_keys = [&errs, &parse_api_keys_array](Config& cfg) {
+            if (const char* env_keys = std::getenv("GW_API_KEYS"); env_keys && *env_keys) {
+                nlohmann::json ej;
+                try {
+                    ej = nlohmann::json::parse(env_keys);
+                } catch (...) {
+                    errs.push_back("GW_API_KEYS: invalid JSON");
+                }
+                if (!ej.is_null()) {
+                    cfg.api_keys.clear();
+                    cfg.api_keys_file = "<env:GW_API_KEYS>";
+                    parse_api_keys_array(ej, "GW_API_KEYS", cfg.api_keys);
+                }
+            }
+        };
+
+        std::ifstream ifs(path);
+        if (!ifs.is_open()) {
+            // File missing; use defaults (GW_API_KEYS still applies)
+            apply_env_keys(config);
+            return config;
+        }
+        nlohmann::json j;
+        try {
+            ifs >> j;
+        } catch (const std::exception& e) {
+            errs.push_back(std::string("invalid JSON: ") + e.what());
+            return config;
+        }
+        if (!j.is_object()) {
+            errs.push_back("top-level value must be a JSON object");
+            return config;
+        }
 
         // Read field by field, overriding defaults when present
         {
@@ -441,6 +521,17 @@ struct Config {
             }
         }
 
+        // Parse TLS settings
+        if (j.contains("tls")) {
+            if (!j["tls"].is_object()) {
+                errs.push_back("tls: expected an object");
+            } else {
+                auto& tls = j["tls"];
+                read_str(tls, "cert_path", config.tls.cert_path, "tls.");
+                read_str(tls, "key_path", config.tls.key_path, "tls.");
+            }
+        }
+
         // Parse rate limit config
         if (j.contains("rate_limit")) {
             auto& rl = j["rate_limit"];
@@ -452,47 +543,33 @@ struct Config {
                 config.rate_limit_config.refill_per_second = static_cast<size_t>(v);
         }
 
+        // API keys may come from three sources, with later ones overriding
+        // earlier ones so secrets can be kept out of the main config:
+        //   1. inline "api_keys" array (legacy, discouraged)
+        //   2. "api_keys_file" pointing at a JSON array file
+        //   3. the GW_API_KEYS environment variable (see apply_env_keys below)
+        read_str(j, "api_keys_file", config.api_keys_file, "");
         if (j.contains("api_keys")) {
-            if (!j["api_keys"].is_array()) {
-                errs.push_back("api_keys: expected an array");
+            parse_api_keys_array(j["api_keys"], "api_keys", config.api_keys);
+        }
+        if (!config.api_keys_file.empty()) {
+            std::ifstream kfs(config.api_keys_file);
+            if (!kfs.is_open()) {
+                errs.push_back("api_keys_file: cannot open '" + config.api_keys_file + "'");
             } else {
-                for (auto& item : j["api_keys"]) {
-                    ApiKeyConfig ak;
-                    read_str(item, "key", ak.key, "api_key.");
-                    read_str(item, "name", ak.name, "api_key.");
-                    if (item.contains("rate_limit")) {
-                        auto& rl = item["rate_limit"];
-                        long long v = ak.rate_limit.capacity;
-                        if (read_int(rl, "capacity", 1, 1000000000, v, "api_key.rate_limit."))
-                            ak.rate_limit.capacity = static_cast<size_t>(v);
-                        v = ak.rate_limit.refill_per_second;
-                        if (read_int(rl, "refill_per_second", 1, 1000000000, v, "api_key.rate_limit."))
-                            ak.rate_limit.refill_per_second = static_cast<size_t>(v);
-                    }
-                    if (item.contains("allowed_hosts")) {
-                        if (!item["allowed_hosts"].is_array()) {
-                            errs.push_back("api_key.allowed_hosts: expected an array");
-                        } else {
-                            for (const auto& host : item["allowed_hosts"]) {
-                                if (host.is_string()) ak.allowed_hosts.push_back(host.get<std::string>());
-                                else errs.push_back("api_key.allowed_hosts: entries must be strings");
-                            }
-                        }
-                    }
-                    if (item.contains("allowed_tenants")) {
-                        if (!item["allowed_tenants"].is_array()) {
-                            errs.push_back("api_key.allowed_tenants: expected an array");
-                        } else {
-                            for (const auto& tenant : item["allowed_tenants"]) {
-                                if (tenant.is_string()) ak.allowed_tenants.push_back(tenant.get<std::string>());
-                                else errs.push_back("api_key.allowed_tenants: entries must be strings");
-                            }
-                        }
-                    }
-                    config.api_keys.push_back(ak);
+                nlohmann::json kj;
+                try {
+                    kfs >> kj;
+                } catch (const std::exception& e) {
+                    errs.push_back("api_keys_file: invalid JSON in '" + config.api_keys_file + "': " + e.what());
+                }
+                if (!kj.is_null()) {
+                    config.api_keys.clear();
+                    parse_api_keys_array(kj, "api_keys_file", config.api_keys);
                 }
             }
         }
+        apply_env_keys(config);
 
         return config;
     }

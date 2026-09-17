@@ -7,10 +7,14 @@ add_executable(runTests
     test_http_client.cpp
     test_upstream_manager.cpp
     test_config_validation.cpp
+    test_tls_context.cpp
     ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
     ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
     ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/tls_context.cpp
 )
+
+target_compile_definitions(runTests PRIVATE GW_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Link your common library and gtest
 target_link_libraries(runTests PRIVATE
