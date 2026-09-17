@@ -62,6 +62,28 @@ After enabling `TCP_NODELAY` on client and upstream sockets
 
 **Light-load latency improved ~5.4x, handshake throughput ~4.3x.**
 
+## Finding: upstream connection pooling (P3)
+
+Originally the gateway opened one TCP connection to the backend per proxied
+request (`Connection: close`, read to EOF). It now maintains a per-upstream
+pool of keep-alive connections (`src/server/connection_pool.cpp`): responses
+are framed precisely (Content-Length or chunked), any bytes past the end of a
+response are kept with the pooled connection, and a pooled connection that the
+backend closed while idle is detected and transparently retried on a fresh
+connection.
+
+Functional proof: the integration suite counts backend connections — 10
+consecutive proxied requests now open at most 2 backend connections instead
+of 10.
+
+Throughput impact on this box is within noise (proxy-light 965 vs 1000 QPS
+before the pool, proxy c50 1098 vs 1083): on loopback a TCP connect costs
+tens of microseconds, so with the client, gateway, and Python backend all
+sharing 2 CPU cores the bottleneck remains CPU, not connections. The win
+scales with backend distance — for a remote backend one connect round-trip
+(RTT) per request is removed, which on any real network dominates the
+request budget.
+
 ## Interpretation
 
 - At 50 connections the single worker saturates its CPU share (~1000 QPS

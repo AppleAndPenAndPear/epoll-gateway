@@ -5,11 +5,13 @@ add_executable(runTests
     test_route_utils.cpp
     test_auth_and_rate_limit.cpp
     test_http_client.cpp
+    test_connection_pool.cpp
     test_upstream_manager.cpp
     test_config_validation.cpp
     test_tls_context.cpp
     ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
     ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/connection_pool.cpp
     ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/server/tls_context.cpp
 )

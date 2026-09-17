@@ -24,6 +24,17 @@ CONTROL_DIR = sys.argv[2] if len(sys.argv) > 2 else ""
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        # Connection counter: lets integration tests assert that the gateway
+        # reuses pooled keep-alive connections instead of opening one per request.
+        if CONTROL_DIR:
+            try:
+                with open(os.path.join(CONTROL_DIR, "conn_count"), "a") as f:
+                    f.write("1\n")
+            except OSError:
+                pass
+
     def _drain_body(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -39,6 +50,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._drain_body()
         if self._reject_requested():
             self.close_connection = True
+            return
+        if self.path.endswith("/chunked-trailer"):
+            # Raw chunked response with a trailer section, to exercise the
+            # gateway's chunked framing end-to-end. Keep-alive stays intact.
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Trailer: X-Sum\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"\r\n"
+                b"3\r\nabc\r\n"
+                b"2\r\nde\r\n"
+                b"0\r\nX-Sum: 5\r\n"
+                b"\r\n"
+            )
             return
         body = json.dumps({
             "backend": "127.0.0.1:%d" % PORT,

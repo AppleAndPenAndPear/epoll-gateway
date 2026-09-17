@@ -303,6 +303,43 @@ def test_proxy():
     check("response comes from the mock backend", ok, "body=%r" % body[:120])
 
 
+def test_connection_reuse(control_dir):
+    print("\n[07b] Upstream connection reuse (keep-alive pool)")
+    count_path = os.path.join(control_dir, "conn_count")
+
+    def conn_count():
+        try:
+            with open(count_path) as f:
+                return len(f.read().split())
+        except OSError:
+            return 0
+
+    before = conn_count()
+    ok = 0
+    for _ in range(10):
+        status, _, _ = request("/api/two/pool")
+        if status == 200:
+            ok += 1
+    after = conn_count()
+    new_conns = after - before
+    check("10 proxied requests succeeded", ok == 10, "%d/10 ok" % ok)
+    check("backend connections reused by the pool", new_conns <= 4,
+          "%d new backend connections for 10 requests" % new_conns)
+
+
+def test_chunked_trailer():
+    print("\n[07c] Chunked response with trailer (pool-safe framing)")
+    status, _, body = request("/api/two/chunked-trailer")
+    check("chunked+trailer response proxied with full body",
+          status == 200 and body == b"abcde", "status=%s body=%r" % (status, body[:60]))
+    # The pooled connection must survive the trailer: a second request on the
+    # same upstream must still work (would time out/garble if leftover CRLF
+    # from the trailer were kept on the connection).
+    status2, _, body2 = request("/api/two/chunked-trailer")
+    check("connection reusable after chunked trailer",
+          status2 == 200 and body2 == b"abcde", "status=%s" % status2)
+
+
 def test_auth():
     print("\n[7] API key auth")
     status, _, _ = request("/api/limited/x")
@@ -495,6 +532,8 @@ def main():
         test_405_allow()
         test_404_403()
         test_proxy()
+        test_connection_reuse(fail_control_dir)
+        test_chunked_trailer()
         test_auth()
         test_rate_limit()
         test_failover(kill_backend_a)

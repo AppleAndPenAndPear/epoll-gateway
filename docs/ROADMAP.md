@@ -146,7 +146,10 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
 - [x] P3: wrk baseline load test report (2026-09-17)
   - `scripts/benchmark/run_benchmark.sh` + full report in `docs/BENCHMARKS.md` (P50/P99/QPS across static, proxy, handshake scenarios)
   - Bonus fix found by the baseline: missing `TCP_NODELAY` caused a fixed ~43 ms delayed-ACK stall per request; enabling it improved light-load latency ~5.4x and handshake throughput ~4.3x
-- [ ] P3: upstream connection pool
+- [x] P3: upstream connection pool (2026-09-17)
+  - Per-upstream keep-alive pool (`connection_pool.cpp`): checkout/checkin with idle timeout (60s) and max-idle cap (16), leftovers carried with the connection, stale connections invalidated and retried transparently
+  - `forward_request` now frames responses precisely (Content-Length / chunked / close-delimited) and returns healthy connections to the pool
+  - Integration test counts backend connections: 10 proxied requests open ≤2 backend connections (was 10); 5 new unit tests
 - [ ] P4: /healthz + graceful shutdown
 - [ ] Outreach: English README, first architecture article
 - [ ] Signals: interview 5 potential users
