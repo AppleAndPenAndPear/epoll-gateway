@@ -61,6 +61,7 @@ BackendResponse forward_request(const std::string& host, int port,
     Socket upstream_socket(AF_INET, SOCK_STREAM, 0);
     try {
             upstream_socket.setnonblocking();
+            upstream_socket.setnodelay();  // avoid delayed-ACK stalls on proxied responses
     } catch (const std::exception&) {
         resp.error = BackendError::ConnectFailed;
         return resp;

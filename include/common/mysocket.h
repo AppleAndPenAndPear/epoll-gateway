@@ -54,6 +54,9 @@ public:
 
   void setcloexec();
 
+  // Disables Nagle's algorithm (TCP_NODELAY); avoids 40ms delayed-ACK stalls
+  void setnodelay();
+
   void bind(const struct sockaddr* addr, socklen_t addrlen);
 
   void listen(int backlog);

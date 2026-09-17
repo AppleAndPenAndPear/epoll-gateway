@@ -1,6 +1,8 @@
 #include "mysocket.h"
 #include <unistd.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 
 using namespace std;
@@ -92,6 +94,13 @@ void Socket::setcloexec(){
   if (fcntl(fd_, F_SETFD, FD_CLOEXEC) == -1)
     throw_system_error("fcntl() F_SETFD failed,setcloexec()");
   Logger::get()->debug("setcloexec fd {} success",fd_);
+}
+
+void Socket::setnodelay(){
+  int one = 1;
+  if (setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == -1)
+    throw_system_error("setsockopt() TCP_NODELAY failed,setnodelay()");
+  Logger::get()->debug("setnodelay fd {} success",fd_);
 }
 
 void Socket::bind(const struct sockaddr* addr, socklen_t addrlen){

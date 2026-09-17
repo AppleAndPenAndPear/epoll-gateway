@@ -179,6 +179,10 @@ void TcpWorker::handle_accept() {
     auto client_sock = make_shared<Socket>(clientsock);
     client_sock->setnonblocking();   // Set non-blocking
     client_sock->setcloexec();
+    // Disable Nagle: TLS responses leave the socket in several small writes
+    // (handshake records, header/body records), and with Nagle enabled each
+    // stall on an unacked segment costs the peer's 40ms delayed-ACK timer.
+    client_sock->setnodelay();
 
     // Set up SSL
     if (!client_sock->initSSL(ssl_ctx_)) {
