@@ -4,6 +4,33 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-17
+
+### Added
+
+- P3 upstream connection pool (`src/server/connection_pool.cpp`):
+  - Per-upstream keep-alive pool: `checkout`/`checkin` with 60 s idle timeout, max 16 idle connections per upstream, RAII fd ownership via `shared_ptr<Socket>`. Lazy eviction at checkout (FIFO ⇒ LRU, oldest idle connection probed first).
+  - `forward_request` rewritten to frame backend responses precisely (Content-Length / chunked incl. trailer section / close-delimited), and to carry read-ahead `leftover` bytes with the connection so subsequent responses never garble.
+  - Stale-connection race covered two ways: a 0-timeout `MSG_PEEK` probe on checkout discards connections the backend closed while idle (safe for every method), and post-send failures auto-retry only for idempotent methods so POSTs are never duplicated.
+  - Integration tests prove reuse (10 proxied requests open ≤2 backend connections, was 10) and trailer-safe framing; 5 new unit tests cover pool logic.
+- P3 wrk baseline load test report (`docs/BENCHMARKS.md`): `scripts/benchmark/run_benchmark.sh` produces P50/P99/QPS across three scenarios (static cache hit, reverse proxy, TLS handshake). Bonus finding: missing `TCP_NODELAY` caused a fixed ~43 ms delayed-ACK stall per request; enabling it on both client and upstream sockets improved light-load latency ~5.4× and handshake throughput ~4.3×.
+- P2 secret management: `api_keys` can now live outside the main config — `"api_keys_file": "api_keys.json"` (JSON array, same schema) or the `GW_API_KEYS` environment variable; precedence env > file > inline. Inline keys still work (backward compat) but log a security hint at startup. Missing/invalid file or env JSON fails fast with a schema error.
+- P2 TLS hardening (`src/server/tls_context.cpp`): `build_hardened_ssl_ctx` enforces minimum TLS 1.2, AEAD-only cipher whitelist (ECDHE+GCM/ChaCha20), no compression, session cache + tickets for resumption. TLS setup is fail-fast at startup; SIGHUP hot-reloads cert/key from the new `tls.cert_path`/`tls.key_path` config with AUDIT log on apply/reject; the old context is kept on failure. Integration tests: TLS 1.1 refused, cert hot reload verified via peer-certificate fingerprint; 6 unit tests for the context builder.
+- P2 HTTP request smuggling protection: parser now rejects duplicate `Content-Length`, CL+TE mixing, non-chunked `Transfer-Encoding`, non-numeric `Content-Length`, invalid header name/value characters, control chars in the request line, non-hex chunk sizes, and oversized request lines/headers. Malformed requests get 400 + `Connection: close`; also capped the previously unbounded chunked body at `MAX_BODY_SIZE` (16 unit tests).
+- P2 config schema validation: `Config::validate()` checks field ranges (ports 1-65535, thresholds > 0, `min_threads <= max_threads`), duplicate route names/matches, upstream reference existence, `static` routes have `static_root`, and api key uniqueness; `from_file` does type/range-checked reads. Startup fails fast on invalid config; SIGHUP reload of an invalid config writes an AUDIT log and keeps the old config (14 unit tests).
+
+### Changed
+
+- Default gateway behavior change: an invalid config file at startup now causes the server to exit instead of silently running with default config (fail-fast). SIGHUP reload of an invalid config keeps the currently active config and logs `AUDIT config_reload_rejected`.
+- Header-value parsing in `forward_request` now trims OWS per RFC 7230 instead of assuming `": "` (a single space after the colon); accepts `Header:value`, `Header:  value`, etc.
+- Chunked response scanning now consumes the trailer section line by line until the terminating empty line (previously only one `\r\n` was consumed after the last-chunk, which dropped the terminator into `leftover` and garbled subsequent responses when a trailer was present).
+
+### Decisions
+
+- The baseline benchmark is the first piece of public marketing material. The TCP_NODELAY fix is surfaced as a "found and fixed" story rather than a quiet patch — concrete, measurable, reproducible by anyone running `scripts/benchmark/run_benchmark.sh`.
+- Honest result reporting: the connection pool showed no measurable QPS gain on loopback (the saved `connect()` is microseconds against a CPU-bound loopback backend). The real value is proportional to backend RTT, so correctness is proven via integration tests (backend connection count) rather than local QPS. The BENCHMARKS report says this plainly instead of inflating numbers.
+- POST safety: the original pool retry could resend a POST after a stale-connection reset; the new policy only auto-retries idempotent methods once the request has been sent. This is deliberately stricter than what `should_retry_backend_request` enforces at the higher layer — the in-flight retry happens before the gateway considers the request "sent", but POSTs still aren't retried because the backend may have already acted.
+
 ## 2026-09-15
 
 ### Changed

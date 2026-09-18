@@ -2,15 +2,16 @@
 
 ## Current Stage
 
-Building the core capability set of a commercial API gateway. The evolution from an epoll HTTP server to a configuration-driven gateway is complete; work is now closing out maintainability, protocol semantics, and production operations.
+Building the core capability set of a commercial API gateway. P1 (regression safety net) and P2 (config + security hardening) are complete; P3 (performance baseline) is complete with the wrk benchmark report and the upstream connection pool landed. Next: P4, operations productization (`/healthz`+`/readyz`, admin API, deployment docs).
 
 ## Current Validation
 
 - C++17 Release build passes.
-- CTest: 30/30 passing.
-- Integration tests: 32/32 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
-- Covered: HTTP parser, file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, and circuit breaker basics.
-- Integration layer covers TLS, Keep-Alive, Trace-Id, 405+Allow, authentication, rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, and Chunked.
+- CTest: 84/84 passing.
+- Integration tests: 42/42 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation, TLS context hardening, connection-pool reuse and eviction.
+- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, Chunked (incl. trailer section), and connection-pool reuse (10 requests ≤2 backend connections).
+- Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
 - Debug builds support AddressSanitizer.
 
 ## Completed
@@ -30,6 +31,8 @@ Building the core capability set of a commercial API gateway. The evolution from
 - Request line, header, query, body, and Chunked transfer parsing.
 - Currently supports `GET`, `HEAD`, `POST`, `PUT`, `DELETE`.
 - OpenSSL non-blocking TLS handshake and encrypted read/write.
+- Hardened TLS context: minimum TLS 1.2, AEAD-only cipher whitelist (ECDHE+GCM/ChaCha20), no compression, session cache + tickets for resumption; certificate/private key hot-reloadable via SIGHUP (`tls.cert_path`/`tls.key_path`).
+- Request-smuggling protection: duplicate `Content-Length`, CL+TE mixing, non-chunked `Transfer-Encoding`, non-numeric `Content-Length`, invalid header characters, control chars in the request line, non-hex chunk sizes, and oversized request lines/headers are all rejected with 400 + `Connection: close`.
 - Responses support Content-Length, Chunked, Content-Type, and Content-Encoding.
 - Gzip response compression with `Accept-Encoding` negotiation.
 - Uniform `X-Trace-Id` for request and log correlation.
@@ -79,6 +82,10 @@ Building the core capability set of a commercial API gateway. The evolution from
 	- Invalid upstream response
 - The retry policy only allows idempotent methods and retryable transient errors.
 - Routes can configure extra retries via `max_retries`.
+- Per-upstream keep-alive connection pool (`connection_pool.cpp`):
+	- `checkout`/`checkin` with a 60 s idle timeout and a max of 16 idle connections per upstream; fd lifetime managed by `shared_ptr<Socket>` RAII.
+	- Backend responses are framed precisely (Content-Length / chunked incl. trailer section / close-delimited); read-ahead `leftover` bytes travel with the connection.
+	- Stale connections (closed by the backend while idle) are discarded by a 0-timeout `MSG_PEEK` probe at checkout; post-send failures are retried only for idempotent methods.
 - A basic circuit breaker per upstream/backend:
 	- Enters OPEN after consecutive failures reach `circuit_failure_threshold`.
 	- Allows recovery probing after `circuit_recovery_timeout_ms`.
@@ -121,31 +128,39 @@ Building the core capability set of a commercial API gateway. The evolution from
 
 ### 8. Configuration and Runtime Operations
 
-- `Config::from_file()` parses JSON configuration in one place.
+- `Config::from_file()` parses JSON configuration in one place, with type/range-checked reads.
+- `Config::validate()` enforces field ranges (ports 1-65535, thresholds > 0, `min_threads <= max_threads`), duplicate route names/matches, upstream reference existence, `static` routes having `static_root`, and api key uniqueness/non-emptiness. Startup fails fast on an invalid config.
 - Routes, upstreams, API keys, rate limiting, timeouts, and static root are all configurable.
+- API keys can be loaded from outside the main config: `api_keys_file` (JSON array, same schema) or the `GW_API_KEYS` environment variable; precedence env > file > inline. Inline keys still work but log a security hint.
+- New `tls` config section: `cert_path`/`key_path`, hot-reloaded on SIGHUP with AUDIT logging of applied/rejected.
 - `SIGHUP` triggers runtime reload.
 - The signal handler only increments the reload generation; it performs no file IO or JSON parsing.
 - Workers read and apply the new configuration at safe checkpoints.
-- Reload updates routes, upstreams, API keys, default rate-limit settings, and Keep-Alive timeouts.
-- Before reload, the JSON file is checked for existence and validity, preventing a corrupted config from overwriting the currently working one.
+- Reload updates routes, upstreams, API keys, default rate-limit settings, Keep-Alive timeouts, and the TLS certificate.
+- Before reload, the JSON is schema-validated; an invalid config never overwrites the currently working one and is recorded as `AUDIT config_reload_rejected`.
 - Dockerfile, docker-compose, Prometheus configuration, and startup scripts are provided.
 
 ### 9. Testing and Engineering
 
-- Google Test suite currently 30/30 passing.
+- Google Test suite currently 84/84 passing.
 - Covered:
-	- HTTP request parsing
+	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body
 	- LRU file cache
 	- FD/response basics
 	- Route parameters and Host/Tenant matching
 	- 404/405 routing semantics basics
 	- Static path traversal protection
-	- API key authorization
+	- API key authorization and key-source precedence (env > file > inline)
 	- Rate limiter and per-key isolation
+	- Config schema validation
+	- TLS context builder hardening
+	- Connection pool reuse, bucketing, idle eviction, cap truncation, invalidation
 	- Upstream timeouts, connection failures, and idempotent retries
 	- Upstream health checks
 	- Circuit breaker open/reject/recovery probing
+- Integration suite (42 assertions) proves end-to-end behavior including connection reuse and TLS policy.
+- Benchmark harness `scripts/benchmark/run_benchmark.sh` + report in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Request Flow
 
@@ -172,23 +187,21 @@ Client connects
 ## Known Limitations
 
 - Circuit breaker state is currently maintained independently per worker, not as a global state shared across all workers.
-- `forward_request` reads backend responses with `Connection: close` semantics (satisfied by Content-Length or EOF); forwarding of Chunked upstream responses is not handled yet.
 - The route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
 - Runtime reload uses periodic worker polling; workers are not guaranteed to switch configuration at exactly the same instant.
-- Current config validation mostly verifies that the JSON is parseable; full field type, range, and route-conflict validation is not yet provided.
 - Route matching is still a linear scan — simple and reliable at the current scale, with no Trie or index structure for large route sets yet.
-- Connection pooling, async upstream, multi-level load balancing algorithms, and distributed rate limiting are not implemented.
+- The upstream connection pool keeps only idle connections in memory (no cross-process sharing); async upstream I/O and multi-algorithm load balancing (beyond round_robin) are not implemented.
+- No `/healthz`/`/readyz` endpoints or admin API yet (planned for P4).
 - OpenTelemetry `traceparent`, distributed tracing, and external audit storage are not yet integrated.
-- Testing is mostly unit tests; real TLS, HTTP/1.1 long connections, reload, and end-to-end upstream scenarios still need integration tests.
 - A dynamic thread pool interface exists, but the main HTTP path still mostly runs on worker threads.
 
 ## Next Steps
 
-1. Add runtime reload and real HTTP end-to-end tests.
-2. Add config field range validation, route conflict checks, and reload failure auditing.
-3. Complete per-route/host/tenant latency histograms and failure-rate metrics.
-4. Evaluate an implementation for cross-worker shared circuit breaker state.
-5. Decide on route indexing, connection pooling, or async upstream based on real route scale and load test results.
+1. P4: add `/healthz` (liveness) and `/readyz` (readiness) endpoints.
+2. P4: graceful-shutdown drain refinement (stop accepting first, wait for in-flight requests) and deployment docs.
+3. P4: admin API (separate listen address, authenticated) for hot config updates and upstream/breaker status.
+4. Complete per-route/host/tenant latency histograms and failure-rate metrics.
+5. Evaluate an implementation for cross-worker shared circuit breaker state.
 
 ## Recent Decisions
 
@@ -198,3 +211,6 @@ Client connects
 - Plain `Request:` entry logs are downgraded to debug, avoiding duplicate production info logs alongside CLF.
 - Only masked API keys are kept in AUDIT to prevent credential leakage.
 - A matched route with an unsupported method returns 405 with an `Allow` header; only a nonexistent path falls into 404 or static fallback.
+- Invalid configuration fails fast at startup instead of silently running on defaults; rejected reloads keep the active config and write AUDIT.
+- API keys load with precedence env (`GW_API_KEYS`) > `api_keys_file` > inline config, so secrets can stay out of the main config entirely.
+- Connection-pool retries after send are restricted to idempotent methods; POSTs are never resent internally.

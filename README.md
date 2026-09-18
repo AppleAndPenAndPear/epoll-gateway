@@ -4,7 +4,7 @@
 
 > Lightweight, self-contained API gateway in C++17 — a single binary built on epoll, with auth, rate limiting, circuit breaking and Prometheus metrics built in.
 
-epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, TLS, keep-alive, zero-copy file serving, LRU/FD caching, config-driven routing, reverse proxying with upstream health checks, idempotent retries and circuit breaking, API-key authentication, host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (30/30 passing on CTest) and AddressSanitizer support.
+epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload), keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (84/84 passing on CTest), integration tests (42/42 assertions) and AddressSanitizer support.
 
 ## Features
 
@@ -20,7 +20,8 @@ epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and net
 
 ### Protocol support
 - **HTTP/1.1** — built-in state-machine parser covering the request line, headers, query string and body, supporting `GET / HEAD / POST / PUT / DELETE` and chunked transfer encoding.
-- **HTTPS/TLS** — OpenSSL-based TLS using `certs/server.crt` and `certs/server.key`; handshake and encrypted I/O both run inside the non-blocking epoll loop.
+- **HTTPS/TLS, hardened** — OpenSSL-based TLS with a minimum version of TLS 1.2 and an AEAD-only cipher whitelist (ECDHE + GCM/ChaCha20, no CBC/3DES/RC4), session resumption via cache + tickets, and fail-fast setup. The certificate/private key can be hot-reloaded with `SIGHUP` (`tls.cert_path`/`tls.key_path`), keeping the old context if the new one fails to load.
+- **Request-smuggling protection** — the parser rejects duplicate `Content-Length`, CL+TE mixing, non-chunked `Transfer-Encoding`, non-numeric `Content-Length`, invalid header characters, control characters in the request line, non-hex chunk sizes and oversized request lines/headers, answering malformed requests with 400 + `Connection: close`.
 - **Gzip compression** — text-like responses are gzip-compressed when negotiated via the client's `Accept-Encoding` header.
 - **Chunked responses** — `Transfer-Encoding: chunked` support for dynamically generated or streamed content.
 - **Status codes & error handling** — 200, 400, 403, 404, 405, 413, 429, 500, 502, 503, 504 and more; unreachable backends are distinguished from backend timeouts, path-traversal attacks are deflected, and a matched path with an unsupported method returns 405 with an `Allow` header.
@@ -28,11 +29,12 @@ epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and net
 ### Gateway routing, auth & rate limiting
 - **RESTful routing** — register handlers for any method + path pattern (e.g. `/users/{id}`) with dynamic parameter extraction and dispatch; build JSON APIs with ease.
 - **Config-driven gateway routes** — `routes` entries declare method, path, host, tenant, auth, rate limiting and execution target; registration and dispatch are decoupled, with `local`, `upstream` and `static` target types.
-- **API-key authentication** — keys are accepted via the `X-API-Key` header or `Authorization: Bearer`; supports route-level allow/deny lists and per-key host/tenant scopes with differentiated rate-limit quotas.
+- **API-key authentication** — keys are accepted via the `X-API-Key` header or `Authorization: Bearer`; supports route-level allow/deny lists and per-key host/tenant scopes with differentiated rate-limit quotas. Keys can live inline in `config.json`, in a separate file (`api_keys_file`), or come from the `GW_API_KEYS` environment variable (precedence env > file > inline) so secrets stay out of the main config.
 - **Token-bucket rate limiting** — a global limiter shared across workers (totals stay accurate under `SO_REUSEPORT` multi-worker mode), counted per client IP and returning `429 Too Many Requests`; fractional token refill avoids truncation errors.
 
 ### Reverse proxy & reliability
 - **Reverse proxy & load balancing** — routes reference upstream groups via `UpstreamTarget`; `UpstreamManager` round-robins across healthy backends and probes them with active TCP health checks, automatically ejecting failed nodes.
+- **Upstream connection pooling** — keep-alive connections to backends are pooled and reused across requests (60 s idle timeout, max 16 idle per upstream), eliminating one TCP handshake per request; backend responses are framed precisely (Content-Length / chunked incl. trailers / close-delimited) and connections closed by the backend while idle are detected up front and transparently replaced. Post-send failures are retried only for idempotent methods, so POSTs are never duplicated.
 - **Upstream access control & timeouts** — host and tenant binding per route/API key; connect, send and read phases each have timeout control, with distinct 502 vs 504 semantics.
 - **Upstream error classification** — connect failure/timeout, send failure/timeout, read failure/timeout and invalid responses are distinguished, exposed as Prometheus error counters and mapped to 502/503/504.
 - **Idempotent retries** — only idempotent methods (GET/HEAD, etc.) and retryable transient errors are retried; routes can add extra attempts via `max_retries`, so non-idempotent requests are never duplicated.
@@ -49,10 +51,11 @@ epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and net
 - **Grafana dashboards** — bundled Grafana + Prometheus monitoring stack, deployed with a single `docker-compose` command for out-of-the-box dashboards.
 
 ### Operations & engineering
-- **External JSON configuration** — port, thread count, web root, thread-pool parameters, cache sizes, timeouts and more, making deployment and tuning easy.
-- **Runtime reload** — `SIGHUP` triggers a hot reload: the signal handler only increments a generation counter, and workers read and apply the new config at safe checkpoints. Reload updates routes, upstreams, API keys, rate limiting and the keep-alive timeout, and an invalid file never overwrites the running config.
+- **External JSON configuration with schema validation** — port, thread count, web root, thread-pool parameters, cache sizes, timeouts and more, making deployment and tuning easy. Field types/ranges, duplicate route names/matches and upstream references are validated; startup fails fast on an invalid config.
+- **Runtime reload** — `SIGHUP` triggers a hot reload: the signal handler only increments a generation counter, and workers read and apply the new config at safe checkpoints. Reload updates routes, upstreams, API keys, rate limiting, the keep-alive timeout and the TLS certificate; an invalid file never overwrites the running config and is recorded as an AUDIT event.
 - **Companion non-blocking client** — an independent state-machine client covering connect/send/receive, demonstrating epoll from the client side.
-- **Unit tests** — Google Test, currently 30/30 via CTest, covering the HTTP parser, LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy, rate-limit isolation, HTTP client timeouts, idempotent retries, upstream health checks and the circuit breaker.
+- **Unit tests** — Google Test, currently 84/84 via CTest, covering the HTTP parser (incl. smuggling vectors), LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy (incl. key-source precedence), rate-limit isolation, config schema validation, TLS context hardening, connection-pool semantics, HTTP client timeouts, idempotent retries, upstream health checks and the circuit breaker.
+- **Integration tests** — 42 end-to-end assertions against a real server + mock upstreams (TLS policy, cert hot reload, auth from a keys file, rate limiting, failover, circuit breaking, reload, connection reuse, chunked trailers), runnable with nothing but the Python 3 standard library.
 - **AddressSanitizer** — enabled automatically in Debug builds to catch memory leaks and out-of-bounds accesses.
 - **Docker** — multi-stage `Dockerfile` builds a lean image for one-command deployment anywhere.
 
@@ -171,6 +174,10 @@ Edit `config.json` to suit your deployment (every field has a default; if the fi
     "cache_max_entries": 1024,      // Max LRU file-cache entries
     "cache_max_file_size_mb": 1,    // Max cacheable file size (MB)
     "keepalive_timeout": 60,        // Keep-Alive idle timeout (seconds)
+    "tls": {                        // Optional TLS paths (defaults shown)
+        "cert_path": "certs/server.crt",
+        "key_path": "certs/server.key"
+    },
     "upstreams": {                  // Upstream service definitions
         "test-service": {
             "servers": [
@@ -204,6 +211,7 @@ Edit `config.json` to suit your deployment (every field has a default; if the fi
         "capacity": 20,
         "refill_per_second": 5
     },
+    "api_keys_file": "api_keys.json", // Optional: load keys from a separate file (or GW_API_KEYS env) instead of inline
     "api_keys": [                   // API keys, rate-limit quotas and host/tenant scopes
         {
             "key": "test-key-123",
@@ -252,7 +260,7 @@ cmake --build . -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-Integration tests — start the real server plus a mock upstream and verify end-to-end behavior (TLS, keep-alive, auth, rate limiting, failover, circuit breaking, reload, etc. — 14 scenario groups):
+Integration tests — start the real server plus a mock upstream and verify end-to-end behavior (TLS policy, cert hot reload, auth, rate limiting, failover, circuit breaking, reload, connection reuse, chunked trailers — 16 scenario groups):
 
 ```bash
 python3 tests/integration/run_integration_tests.py
@@ -332,8 +340,9 @@ Reverse proxying is configured through the `upstreams` and `routes` sections of 
 - **`routes`** — forwards matching "method + path" pairs to a named upstream (paths support `*` wildcards).
 - **Health checks** — every worker actively probes upstream nodes over TCP once per second, ejecting failed nodes and re-admitting them after recovery.
 - **Load balancing** — `UpstreamManager` round-robins across healthy nodes; forwarding is implemented in `http_client::forward_request`.
+- **Connection pooling** — keep-alive connections to each upstream are pooled (60 s idle timeout, max 16 idle per upstream) and reused across requests, saving one TCP handshake per request; responses are framed precisely (Content-Length / chunked incl. trailers / close-delimited) and connections closed by the backend while idle are detected before use and transparently replaced.
 - **Timeouts & error classification** — connect, send and read phases each have timeout control; structured `BackendError` values distinguish failure types and map to 502/503/504.
-- **Retries** — only idempotent methods and retryable transient errors are retried; `max_retries` controls the extra attempts per route.
+- **Retries** — only idempotent methods and retryable transient errors are retried; `max_retries` controls the extra attempts per route, and the pool never resends POSTs internally.
 - **Circuit breaking** — consecutive failures are tracked per upstream/backend; `circuit_failure_threshold` opens the circuit, half-open probes are allowed after `circuit_recovery_timeout_ms`, and success closes it.
 
 ## Auth & Rate Limiting
@@ -423,12 +432,12 @@ kill -HUP $(pgrep server)
 
 - The signal handler only increments the reload generation — no file I/O or JSON parsing happens there.
 - Workers check the generation at safe checkpoints and apply the new config; workers do not switch at the exact same instant.
-- Reload updates routes, upstreams, API keys, default rate limiting and the keep-alive timeout.
-- The JSON file is validated (exists and parses) before reload; an invalid config never replaces the currently active one.
+- Reload updates routes, upstreams, API keys, default rate limiting, the keep-alive timeout and the TLS certificate.
+- The JSON file is schema-validated before reload; an invalid config never replaces the currently active one and is recorded as `AUDIT config_reload_rejected`.
 
 ## HTTPS
 
-The server integrates OpenSSL and performs the TLS handshake automatically once the TCP connection is established, using `certs/server.crt` and `certs/server.key` as the certificate and private key. Clients must connect over HTTPS:
+The server integrates OpenSSL and performs the TLS handshake automatically once the TCP connection is established, using `certs/server.crt` and `certs/server.key` as the certificate and private key (configurable via the `tls` section). TLS 1.0/1.1 are refused — the minimum version is TLS 1.2, restricted to an AEAD cipher whitelist (ECDHE + GCM/ChaCha20) with session resumption. Clients must connect over HTTPS:
 
 ```bash
 # -k skips self-signed certificate verification
@@ -436,7 +445,12 @@ curl -kv https://localhost:5005/
 
 # Or test the TLS handshake directly with the openssl client
 openssl s_client -connect localhost:5005
+
+# Verify the TLS 1.1 handshake is refused
+openssl s_client -connect localhost:5005 -tls1_1
 ```
+
+The certificate can be swapped at runtime: update the files (or point `tls.cert_path`/`tls.key_path` elsewhere in `config.json`) and send `SIGHUP` — the new context is validated before activation and the old one is kept on failure.
 
 > The bundled certificate is a self-signed demo certificate — replace it with a CA-issued certificate in production.
 
@@ -480,7 +494,7 @@ Debug builds enable AddressSanitizer automatically, detecting:
 6. **Signals & graceful shutdown** — `SIGINT`/`SIGTERM` set a global atomic flag; workers check it on every epoll_wait timeout and exit their event loop; `SIGHUP` triggers runtime reload; destruction order guarantees Tcpserver → DynamicThreadPool → Logger::Guard, with logs closed last.
 7. **Routing** — built-in routes are registered by `register_default_routes()` and config-driven routes by `register_configured_routes()`; each request is matched exactly once and the `ResolvedRoute` is reused across auth, rate limiting and dispatch; matching covers method/path/Host/Tenant with `local`/`upstream`/`static` targets, and GET/HEAD fall back to static file serving when no gateway route matches.
 8. **Idle timeout** — each connection tracks its last-active time; when epoll_wait times out, expired connections are swept and closed, with a configurable threshold.
-9. **Unit tests** — Google Test, currently 30/30 passing, covering parsing, caching, routing, auth, rate limiting, upstream timeouts/retries/health checks and the circuit breaker; one command via `ctest`.
+9. **Unit & integration tests** — Google Test, currently 84/84 passing, covering parsing (incl. smuggling vectors), caching, routing, auth, rate limiting, config schema validation, TLS hardening, connection-pool semantics, upstream timeouts/retries/health checks and the circuit breaker; one command via `ctest`. Integration tests (42 assertions) cover end-to-end behavior with a real server + mock upstreams.
 
 ## Tech Stack
 
@@ -503,30 +517,37 @@ Debug builds enable AddressSanitizer automatically, detecting:
 
 ## Performance
 
+Measured on a 2-core dev box with wrk; the full report (environment, methodology, per-scenario P50/P99/QPS) lives in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and is reproducible via `scripts/benchmark/run_benchmark.sh`.
+
+| Scenario (light load, 8 connections) | Baseline | After TCP_NODELAY fix |
+|---|---|---|
+| Static cache-hit P50 latency | 43.0 ms | **8.0 ms (~5.4×)** |
+| TLS handshake throughput (10 conn) | 224 QPS | **956 QPS (~4.3×)** |
+| Reverse-proxy throughput (8 conn) | 169 QPS | **1000 QPS (~5.9×)** |
+
+- The baseline famously caught a missing `TCP_NODELAY`: every request stalled ~43 ms on the Nagle + delayed-ACK interaction.
 - Concurrency: handles 10,000+ concurrent connections with ease (subject to the system fd limit).
-- Throughput: with caching enabled, repeated requests for small static files (e.g. index.html) reach several times the baseline QPS — tens of thousands of QPS per worker.
-- Latency: request processing sits in the microsecond range; zero-copy + in-memory caching keeps CPU usage very low.
-- Detailed benchmark reports are forthcoming.
+- Upstream connection pooling removes one TCP handshake per proxied request — the gain scales with backend RTT (invisible on loopback, significant cross-host).
 
 ## Known Limitations
 
 - Circuit-breaker state is maintained independently by each worker — it is not a global, cross-worker shared state.
 - Route/host/tenant dimensions currently expose latency sum/count only, without a dedicated histogram (so per-dimension P95/P99 cannot be derived directly).
 - Runtime reload is polled by workers at checkpoints; workers do not switch config at the exact same instant.
-- Config validation currently amounts to "the JSON parses"; field types, ranges and route-conflict checks are not yet covered.
 - Route matching is a linear scan — fine at the current scale, with no Trie/index structure yet.
-- Connection pooling, async upstream, multi-algorithm load balancing and distributed rate limiting are not implemented yet.
+- The connection pool keeps only in-process idle connections; async upstream I/O and multi-algorithm load balancing (beyond `round_robin`) are not implemented yet.
+- No `/healthz`/`/readyz` endpoints or admin API yet (planned for P4).
 - OpenTelemetry `traceparent`, distributed tracing and external audit storage are not integrated yet.
 
 ## Roadmap
 
-1. Add runtime-reload and real-HTTP end-to-end integration tests.
-2. Add config field/range validation, route-conflict checks and reload-failure auditing.
+1. ~~Add runtime-reload and real-HTTP end-to-end integration tests.~~ ✅ P1
+2. ~~Add config field/range validation, route-conflict checks and reload-failure auditing.~~ ✅ P2 (with request-smuggling protection, TLS hardening and secret management)
 3. Complete route/host/tenant latency histograms and failure-rate metrics.
 4. Evaluate a cross-worker shared circuit-breaker implementation.
-5. Decide on a route index, connection pooling or async upstream based on real route counts and benchmark results.
-6. HTTP/2 and WebSocket support.
-7. Stress testing and performance profiling reports.
+5. ~~Connection pooling~~ ✅ P3 (with the wrk baseline report); async upstream still open.
+6. P4: `/healthz` + `/readyz`, admin API, graceful-shutdown drain, deployment docs.
+7. P5: commercial features shaped by customer feedback.
 8. Extend CI/CD: GitHub Actions releases and image publishing, plus Gitee CI.
 
 ## Documentation
@@ -534,6 +555,7 @@ Debug builds enable AddressSanitizer automatically, detecting:
 - [Project status](docs/PROJECT_STATUS.md) — snapshot of current capabilities, limitations and next steps
 - [Changelog](docs/CHANGELOG.md) — dated change history
 - [Roadmap](docs/ROADMAP.md) — commercialization positioning, technical evolution and validation plan
+- [Benchmarks](docs/BENCHMARKS.md) — wrk baseline report (P50/P99/QPS across three scenarios)
 
 ## Project Structure
 
@@ -545,6 +567,8 @@ epollthread/
 │   │   ├── tcpworker.h       # TcpWorker thread (with SSL state machine)
 │   │   ├── http_handler.h    # HTTP request handling & routing
 │   │   ├── http_client.h     # Reverse-proxy forwarding & BackendError
+│   │   ├── connection_pool.h # Per-upstream keep-alive connection pool
+│   │   ├── tls_context.h     # Hardened TLS context builder
 │   │   ├── upstream_manager.h# Upstream management & health checks
 │   │   ├── rate_limiter.h    # Token-bucket rate limiter
 │   │   ├── rate_limiter_manager.h # Rate-limiter manager
@@ -574,7 +598,9 @@ epollthread/
 │   │   ├── server.cpp        # TcpServer implementation
 │   │   ├── tcpworker.cpp     # TcpWorker implementation (incl. TLS handshake)
 │   │   ├── http_handler.cpp  # HttpHandler implementation (route registration, rate limiting)
-│   │   ├── http_client.cpp   # Reverse-proxy forwarding
+│   │   ├── http_client.cpp   # Reverse-proxy forwarding (precise response framing)
+│   │   ├── connection_pool.cpp # Upstream connection pool implementation
+│   │   ├── tls_context.cpp   # TLS hardening (min version, cipher whitelist)
 │   │   ├── upstream_manager.cpp # Upstream management & health checks
 │   │   ├── rate_limiter.cpp  # Token-bucket rate limiter
 │   │   ├── metrics.cpp       # Metrics collector implementation
@@ -606,9 +632,15 @@ epollthread/
 │   ├── test_auth_and_rate_limit.cpp # API key & rate limiting tests
 │   ├── test_http_client.cpp  # Upstream timeout & error classification tests
 │   ├── test_upstream_manager.cpp # Upstream health-check tests
+│   ├── test_config_validation.cpp # Config schema validation tests
+│   ├── test_tls_context.cpp  # TLS context hardening tests
+│   ├── test_connection_pool.cpp # Connection pool tests
 │   └── integration/          # Integration tests (real server + mock upstream)
 │       ├── run_integration_tests.py
 │       └── mock_backend.py
+├── scripts/
+│   └── benchmark/
+│       └── run_benchmark.sh  # One-command wrk baseline (static/proxy/handshake)
 ├── www/                      # Static file root
 │   ├── index.html
 │   └── big.html
@@ -626,6 +658,7 @@ epollthread/
 ├── docs/
 │   ├── PROJECT_STATUS.md     # Project status snapshot (capabilities, limits, next steps)
 │   ├── CHANGELOG.md          # Change history (reverse-chronological)
+│   ├── BENCHMARKS.md         # wrk baseline report (P50/P99/QPS)
 │   └── ROADMAP.md            # Commercialization roadmap (positioning, evolution, validation)
 ├── README.md                 # Documentation (English)
 └── README.zh-CN.md           # Documentation (Simplified Chinese)
