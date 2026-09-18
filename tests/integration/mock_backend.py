@@ -16,6 +16,7 @@ import http.server
 import json
 import os
 import sys
+import time
 
 PORT = int(sys.argv[1])
 CONTROL_DIR = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -51,6 +52,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self._reject_requested():
             self.close_connection = True
             return
+        if self.path.endswith("/slow"):
+            # Slow endpoint: holds the request open so tests can exercise the
+            # gateway's graceful-shutdown drain with a genuinely in-flight request.
+            time.sleep(1.5)
         if self.path.endswith("/chunked-trailer"):
             # Raw chunked response with a trailer section, to exercise the
             # gateway's chunked framing end-to-end. Keep-alive stays intact.

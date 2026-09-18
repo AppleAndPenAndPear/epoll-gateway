@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
@@ -9,7 +10,7 @@
 class UpstreamManager {
 private:
     UpstreamConfig config_;  // Copy of the config; health state is managed internally
-    std::mutex mutex_;       // Protects config_ and the round-robin indices
+    mutable std::mutex mutex_;       // Protects config_ and the round-robin indices
     std::unordered_map<std::string, size_t> round_robin_indices_;
     int health_check_timeout_ms_;
 
@@ -39,6 +40,25 @@ public:
 
     // Active health check: probe every node of every upstream and update health state
     void check_health();
+
+    // Per-upstream <healthy, total> backend counts, taken under the manager
+    // mutex. Used by /readyz (readiness) and the admin status endpoint.
+    std::map<std::string, std::pair<size_t, size_t>> health_snapshot() const;
+
+    // Full per-backend status (health, failure count, circuit state) for the
+    // admin API. One entry per configured upstream, backends in config order.
+    struct BackendStatus {
+        std::string host;
+        int port = 0;
+        bool healthy = true;
+        int consecutive_failures = 0;
+        bool circuit_open = false;
+    };
+    struct UpstreamStatus {
+        std::string name;
+        std::vector<BackendStatus> backends;
+    };
+    std::vector<UpstreamStatus> status_snapshot() const;
 
     // Read-only access to the upstream config (for monitoring or debugging)
     const UpstreamConfig& config() const { return config_; }

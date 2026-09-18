@@ -53,9 +53,11 @@ epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and net
 ### Operations & engineering
 - **External JSON configuration with schema validation** — port, thread count, web root, thread-pool parameters, cache sizes, timeouts and more, making deployment and tuning easy. Field types/ranges, duplicate route names/matches and upstream references are validated; startup fails fast on an invalid config.
 - **Runtime reload** — `SIGHUP` triggers a hot reload: the signal handler only increments a generation counter, and workers read and apply the new config at safe checkpoints. Reload updates routes, upstreams, API keys, rate limiting, the keep-alive timeout and the TLS certificate; an invalid file never overwrites the running config and is recorded as an AUDIT event.
+- **Ops endpoints + Admin API** — `/healthz`, `/readyz`, `/version` built in; a separate authenticated admin listener serves `/admin/stats`, `/admin/upstreams` (health + circuit-breaker state) and `POST /admin/reload`. See [Operations](#operations--health).
+- **Graceful shutdown** — SIGTERM stops accepting first, closes idle keep-alive connections, and drains in-flight requests (up to `shutdown_drain_timeout`, default 30 s) before exiting; pairs with systemd `TimeoutStopSec`.
 - **Companion non-blocking client** — an independent state-machine client covering connect/send/receive, demonstrating epoll from the client side.
-- **Unit tests** — Google Test, currently 84/84 via CTest, covering the HTTP parser (incl. smuggling vectors), LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy (incl. key-source precedence), rate-limit isolation, config schema validation, TLS context hardening, connection-pool semantics, HTTP client timeouts, idempotent retries, upstream health checks and the circuit breaker.
-- **Integration tests** — 42 end-to-end assertions against a real server + mock upstreams (TLS policy, cert hot reload, auth from a keys file, rate limiting, failover, circuit breaking, reload, connection reuse, chunked trailers), runnable with nothing but the Python 3 standard library.
+- **Unit tests** — Google Test, currently 89/89 via CTest, covering the HTTP parser (incl. smuggling vectors), LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy (incl. key-source precedence), rate-limit isolation, config schema validation, TLS context hardening, connection-pool semantics, HTTP client timeouts, idempotent retries, upstream health checks, status snapshots and the circuit breaker.
+- **Integration tests** — 65 end-to-end assertions against a real server + mock upstreams (TLS policy, cert hot reload, auth from a keys file, rate limiting, failover, circuit breaking, reload, ops endpoints, admin API, connection reuse, chunked trailers, graceful shutdown), runnable with nothing but the Python 3 standard library.
 - **AddressSanitizer** — enabled automatically in Debug builds to catch memory leaks and out-of-bounds accesses.
 - **Docker** — multi-stage `Dockerfile` builds a lean image for one-command deployment anywhere.
 
@@ -435,6 +437,50 @@ kill -HUP $(pgrep server)
 - Reload updates routes, upstreams, API keys, default rate limiting, the keep-alive timeout and the TLS certificate.
 - The JSON file is schema-validated before reload; an invalid config never replaces the currently active one and is recorded as `AUDIT config_reload_rejected`.
 
+Reloads can also be triggered through the admin API — see below.
+
+## Operations & Health
+
+### Probe endpoints (built in, no auth, exempt from rate limiting)
+
+```bash
+curl -sk https://localhost:5005/healthz    # liveness: "ok" while the event loop serves
+curl -sk https://localhost:5005/readyz     # readiness: 200 + per-upstream healthy/total JSON,
+                                           # 503 when an upstream has no healthy backend
+curl -sk https://localhost:5005/version    # {"version":"0.1.0"}
+```
+
+Point your load balancer at `/readyz` (not `/healthz`) so a gateway with all backends down leaves the pool instead of failing client traffic.
+
+### Admin API (separate listener, key required)
+
+Enable it in the config (bind stays on loopback by default; every endpoint requires the key):
+
+```json
+"admin": {"enabled": true, "port": 8105, "bind": "127.0.0.1",
+          "api_keys": ["choose-a-long-random-admin-key"]}
+```
+
+```bash
+# Request counters, latency totals, uptime, version
+curl -s -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/stats
+
+# Per-backend health, failure counts and circuit-breaker state
+curl -s -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/upstreams
+
+# Hot reload with pre-validation: invalid config -> 400 and nothing applied,
+# valid config -> 200 and workers apply it within ~1 second
+curl -s -X POST -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/reload
+```
+
+### Graceful shutdown
+
+```bash
+kill -TERM $(pgrep server)   # or: systemctl restart epoll-gateway
+```
+
+The gateway stops accepting new connections, closes idle keep-alive connections immediately, then waits for in-flight requests to finish (up to `shutdown_drain_timeout` seconds, default 30) before exiting. Set systemd's `TimeoutStopSec` above that value; a ready-made unit and a full rolling-upgrade walkthrough live in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## HTTPS
 
 The server integrates OpenSSL and performs the TLS handshake automatically once the TCP connection is established, using `certs/server.crt` and `certs/server.key` as the certificate and private key (configurable via the `tls` section). TLS 1.0/1.1 are refused — the minimum version is TLS 1.2, restricted to an AEAD cipher whitelist (ECDHE + GCM/ChaCha20) with session resumption. Clients must connect over HTTPS:
@@ -531,12 +577,12 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 
 ## Known Limitations
 
-- Circuit-breaker state is maintained independently by each worker — it is not a global, cross-worker shared state.
+- Circuit-breaker and health state is now shared process-wide (all workers + the admin API read the same state); load balancing beyond `round_robin` is still not implemented.
 - Route/host/tenant dimensions currently expose latency sum/count only, without a dedicated histogram (so per-dimension P95/P99 cannot be derived directly).
 - Runtime reload is polled by workers at checkpoints; workers do not switch config at the exact same instant.
 - Route matching is a linear scan — fine at the current scale, with no Trie/index structure yet.
 - The connection pool keeps only in-process idle connections; async upstream I/O and multi-algorithm load balancing (beyond `round_robin`) are not implemented yet.
-- No `/healthz`/`/readyz` endpoints or admin API yet (planned for P4).
+- The admin API is a separate plain-HTTP listener (loopback by default) without built-in TLS (terminate TLS in a reverse proxy if it must be exposed).
 - OpenTelemetry `traceparent`, distributed tracing and external audit storage are not integrated yet.
 
 ## Roadmap
@@ -544,9 +590,9 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 1. ~~Add runtime-reload and real-HTTP end-to-end integration tests.~~ ✅ P1
 2. ~~Add config field/range validation, route-conflict checks and reload-failure auditing.~~ ✅ P2 (with request-smuggling protection, TLS hardening and secret management)
 3. Complete route/host/tenant latency histograms and failure-rate metrics.
-4. Evaluate a cross-worker shared circuit-breaker implementation.
+4. ~~Evaluate a cross-worker shared circuit-breaker implementation.~~ ✅ P4 (`UpstreamManager` is now process-wide)
 5. ~~Connection pooling~~ ✅ P3 (with the wrk baseline report); async upstream still open.
-6. P4: `/healthz` + `/readyz`, admin API, graceful-shutdown drain, deployment docs.
+6. ~~P4: `/healthz` + `/readyz`, admin API, graceful-shutdown drain, deployment docs.~~ ✅ P4 (plus `/version`, a systemd unit and an upgrade guide)
 7. P5: commercial features shaped by customer feedback.
 8. Extend CI/CD: GitHub Actions releases and image publishing, plus Gitee CI.
 
@@ -556,6 +602,7 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 - [Changelog](docs/CHANGELOG.md) — dated change history
 - [Roadmap](docs/ROADMAP.md) — commercialization positioning, technical evolution and validation plan
 - [Benchmarks](docs/BENCHMARKS.md) — wrk baseline report (P50/P99/QPS across three scenarios)
+- [Deployment](docs/DEPLOYMENT.md) — systemd unit, admin API, rolling upgrade with graceful drain
 
 ## Project Structure
 

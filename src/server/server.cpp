@@ -19,7 +19,8 @@ Tcpserver::Tcpserver(unsigned short port,int backlog,size_t min_threads, size_t 
 Tcpserver::~Tcpserver(){
 }
 
-void Tcpserver::start(unsigned int num_workers, const Config& config, const std::string& config_path) {
+void Tcpserver::start(unsigned int num_workers, const Config& config, const std::string& config_path,
+                      std::shared_ptr<UpstreamManager> upstream_manager) {
   if (num_workers == 0) {
     num_workers = std::thread::hardware_concurrency();
     if (num_workers == 0) num_workers = 4; // Fallback
@@ -28,10 +29,13 @@ void Tcpserver::start(unsigned int num_workers, const Config& config, const std:
 
   auto shared_limiter = std::make_shared<RateLimiterManager>(config.rate_limit_config);
 
-  // Create N listen sockets and start worker threads
+  // Create N listen sockets and start worker threads. All workers share one
+  // UpstreamManager so health/circuit state is process-wide (and visible to
+  // the admin API).
   for (unsigned int i = 0; i < num_workers; ++i) {
     Socket listen_sock = create_listen_sock();
-    workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config, shared_limiter, config_path));
+    workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config,
+                                                      upstream_manager, shared_limiter, config_path));
     threads_.emplace_back(&TcpWorker::run, workers_.back().get());
   }
 

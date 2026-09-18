@@ -92,6 +92,10 @@ public:
     void handle_write(std::shared_ptr<Socket> sock);
     void close_connection(std::shared_ptr<Socket> sock);
     void cleanup(std::shared_ptr<Socket> sock);
+    // True when the connection still has work to finish: a partially received
+    // request, a parsed request awaiting dispatch, or response data queued
+    // for sending. Used by the graceful-shutdown drain phase.
+    bool has_inflight_work(Socket* sock) const;
     void process_request(Socket* sock_ptr);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // Register a route: method is "GET", "POST", etc.; path like "/api/hello"
     void addRoute(const GatewayRoute& route, RouteHandler handler);

@@ -1,0 +1,52 @@
+# systemd unit for the epoll gateway.
+#
+# Install:
+#   sudo cp build/server /usr/local/bin/epoll-gateway
+#   sudo mkdir -p /etc/epoll-gateway /var/lib/epoll-gateway
+#   sudo cp config.json api_keys.json /etc/epoll-gateway/     # config + secrets
+#   sudo cp -r certs /etc/epoll-gateway/certs                 # TLS material
+#   sudo cp deploy/gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now epoll-gateway
+#
+# Reload (hot, without dropping connections):
+#   systemctl reload epoll-gateway        # sends SIGHUP
+#   curl -s -X POST -H "X-API-Key: ..." http://127.0.0.1:8105/admin/reload
+#
+# Stop/restart use graceful shutdown: the gateway stops accepting, drains
+# in-flight requests for shutdown_drain_timeout seconds, then exits.
+
+[Unit]
+Description=epoll API gateway
+Documentation=https://github.com/OWNER/epollthread
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=epoll-gateway
+Group=epoll-gateway
+# WorkingDirectory holds config.json, api_keys.json, certs/ and logs/
+WorkingDirectory=/var/lib/epoll-gateway
+ExecStart=/usr/local/bin/epoll-gateway
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Secrets can be provided outside config.json (env > file > inline)
+#Environment=GW_API_KEYS=[{"key":"...","name":"prod"}]
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/epoll-gateway
+
+# Graceful shutdown: stop accepting, then drain in-flight requests.
+# Must be larger than shutdown_drain_timeout in config.json (default 30s),
+# otherwise systemd kills the process before draining finishes.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

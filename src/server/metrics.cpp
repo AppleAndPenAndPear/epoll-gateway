@@ -94,8 +94,20 @@ void Metrics::record_upstream_error(BackendError error) {
     }
 }
 
+Metrics::Snapshot Metrics::snapshot() const {
+    Snapshot s;
+    s.total_requests = total_requests_.load(std::memory_order_relaxed);
+    s.requests_2xx = requests_2xx_.load(std::memory_order_relaxed);
+    s.requests_3xx = requests_3xx_.load(std::memory_order_relaxed);
+    s.requests_4xx = requests_4xx_.load(std::memory_order_relaxed);
+    s.requests_5xx = requests_5xx_.load(std::memory_order_relaxed);
+    s.duration_sum = duration_sum_.load(std::memory_order_relaxed);
+    s.duration_count = duration_count_.load(std::memory_order_relaxed);
+    return s;
+}
+
 std::string Metrics::to_string() const {
-        std::ostringstream oss;
+    std::ostringstream oss;
     std::lock_guard<std::mutex> lock(route_metrics_mutex_);
         // Total requests
         oss << "# HELP epoll_http_requests_total Total number of HTTP requests\n";

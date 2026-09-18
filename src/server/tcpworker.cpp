@@ -6,16 +6,19 @@
 #include <fstream>
 
 
-TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path):
+TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config,
+                     std::shared_ptr<UpstreamManager> upstream_manager,
+                     std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path):
   listen_sock_(std::move(listen_sock)),
   pool_(pool),
   closed_(false),
   epoll_(),
-  upstream_manager_(config.upstream_config),
+  upstream_manager_(std::move(upstream_manager)),
   api_key_manager_(config.api_keys),
   rate_limiter_manager_(std::move(rate_limiter_manager)),
-  handler_(epoll_, config, upstream_manager_, api_key_manager_, rate_limiter_manager_),
+  handler_(epoll_, config, *upstream_manager_, api_key_manager_, rate_limiter_manager_),
   keepalive_timeout_(config.keepalive_timeout),
+  shutdown_drain_timeout_(config.shutdown_drain_timeout),
   config_path_(config_path),
   applied_reload_generation_(config_reload_generation.load(std::memory_order_relaxed)) {
   epoll_.add(listen_sock_.getFd(), EPOLLIN);
@@ -106,7 +109,7 @@ void TcpWorker::check_timeout() {
         }
     }
     
-    upstream_manager_.check_health();  // Active health check every second
+    upstream_manager_->check_health();  // Active health check every second
 
     // Periodically clean up long-unused rate limiters to prevent unbounded memory growth (shared across workers, protected by a mutex)
     if (now - last_limiter_cleanup_ >= 60) {
@@ -150,14 +153,65 @@ void TcpWorker::run(){
     }
   }
 
-  // Clean up all remaining connections before exiting
+  // ── Graceful shutdown (P4): the stop flag is set, so stop accepting new
+  // connections first, then keep serving in-flight requests until they finish
+  // or the drain budget expires. Idle keep-alive connections are closed
+  // immediately so clients reconnect to another instance. ──
+  drain_connections();
+
+  Logger::get()->info("TcpWorker on fd {} exiting", listen_sock_.getFd());
+}
+
+void TcpWorker::drain_connections() {
+  // Phase 1: stop accepting. Removing the listen fd from epoll prevents any
+  // further accept events; already-accepted sockets stay in the kernel
+  // backlog and will be picked up by another instance (SO_REUSEPORT).
+  epoll_.del(listen_sock_.getFd());
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(shutdown_drain_timeout_);
+  Logger::get()->info("Draining {} connection(s), budget {}s", conns_.size(),
+                      shutdown_drain_timeout_);
+
+  const int MAX_EVENTS = 64;
+  epoll_event evs[MAX_EVENTS];
+  while (!conns_.empty()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      Logger::get()->warn("Drain budget of {}s expired with {} connection(s) still open; closing them",
+                          shutdown_drain_timeout_, conns_.size());
+      break;
+    }
+    // Keep processing events so in-flight requests can complete.
+    auto wait_result = epoll_.wait(evs, MAX_EVENTS, 100);
+    if (wait_result) {
+      for (int i = 0; i < wait_result.event_count; ++i) {
+        const int fd = evs[i].data.fd;
+        if (fd != listen_sock_.getFd()) {
+          handle_client(fd, evs[i].events);
+        }
+      }
+    }
+    // Phase 2: close connections that are between requests (idle keep-alive)
+    // or stuck in handshake; keep those with an in-flight request/response.
+    for (auto it = conns_.begin(); it != conns_.end();) {
+      const int fd = it->first;
+      const bool handshaking = it->second.ssl_state == SSLState::HANDSHAKING;
+      if (handshaking || !handler_.has_inflight_work(it->second.sock.get())) {
+        handler_.cleanup(it->second.sock);
+        it = conns_.erase(it);
+        last_active_.erase(fd);
+        client_ips_.erase(fd);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // Force-close whatever is left (drain expired or the last events finished).
   for (auto& [fd, conn] : conns_) {
     handler_.cleanup(conn.sock);
   }
   conns_.clear();
   last_active_.clear();
-
-  Logger::get()->info("TcpWorker on fd {} exiting", listen_sock_.getFd());
 }
 
 void TcpWorker::handle_accept() {

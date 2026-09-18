@@ -77,6 +77,18 @@ public:
     // Generate Prometheus text format
     std::string to_string() const;
 
+    // Point-in-time copy of the global counters for the admin stats endpoint
+    struct Snapshot {
+        uint64_t total_requests = 0;
+        uint64_t requests_2xx = 0;
+        uint64_t requests_3xx = 0;
+        uint64_t requests_4xx = 0;
+        uint64_t requests_5xx = 0;
+        double duration_sum = 0.0;
+        uint64_t duration_count = 0;
+    };
+    Snapshot snapshot() const;
+
     void record_gzip_cache_hit();
     void record_gzip_cache_miss();
     void record_upstream_error(BackendError error);

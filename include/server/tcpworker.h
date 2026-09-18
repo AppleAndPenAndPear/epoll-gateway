@@ -29,13 +29,16 @@ private:
   };
   std::unordered_map<int, ConnInfo> conns_;
 
-  UpstreamManager upstream_manager_;
+  // Shared process-wide (also used by the admin API) so health and circuit
+  // state is consistent no matter which worker served a request.
+  std::shared_ptr<UpstreamManager> upstream_manager_;
   ApiKeyManager api_key_manager_;
   std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // Shared across workers
 
   HttpHandler handler_;
   std::unordered_map<int, time_t> last_active_; // Last active time per connection (second granularity)
   int keepalive_timeout_; // Keep-alive timeout (seconds)
+  int shutdown_drain_timeout_; // Graceful-shutdown drain budget (seconds)
   time_t last_timeout_check_ = 0; // Time of the last timeout check
   time_t last_limiter_cleanup_ = 0; // Time of the last limiter cleanup
   std::unordered_map<int, std::string> client_ips_; // Client IP per connection for logging
@@ -44,10 +47,15 @@ private:
 
   void update_active(int fd);
   void check_timeout();
+  // Graceful shutdown: stop accepting, close idle keep-alive connections,
+  // keep serving in-flight requests until done or the drain budget expires.
+  void drain_connections();
 
   SSL_CTX* ssl_ctx_ = nullptr;
 public:
-  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config, std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path);
+  TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config,
+            std::shared_ptr<UpstreamManager> upstream_manager,
+            std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path);
 
   void run();
   void handle_accept();

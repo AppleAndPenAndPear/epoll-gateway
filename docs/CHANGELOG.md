@@ -4,6 +4,29 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-18
+
+### Added
+
+- P4 operations endpoints: `/healthz` (liveness, always 200 while the event loop serves), `/readyz` (readiness — 200 with a per-upstream healthy/total JSON breakdown only when every configured upstream has a healthy backend, 503 otherwise), and `/version` (build version sourced from `project(VERSION)` via a CMake-generated header). All probe endpoints are exempt from authentication and rate limiting so load balancers and Prometheus can never trip a limiter.
+- P4 graceful shutdown on SIGTERM/SIGINT: the gateway first stops accepting (listen fd removed from epoll), immediately closes idle keep-alive connections and unfinished TLS handshakes, then keeps serving in-flight requests until they complete or the new `shutdown_drain_timeout` budget (default 30 s) expires — pairing with systemd `TimeoutStopSec`. Covered by an integration test that kills the server mid-proxy of a 1.5 s backend request.
+- P4 Admin API on a separate listener (`admin` config section: `enabled`/`port`/`bind`/`api_keys`, loopback by default, key mandatory):
+  - `GET /admin/stats` — request counters, latency totals, uptime, version
+  - `GET /admin/upstreams` — per-backend health, consecutive failures and circuit-breaker state
+  - `POST /admin/reload` — validates `config.json` first (invalid config ⇒ 400, nothing applied), then triggers the same worker reload path as SIGHUP (applied within ~1 s)
+  - Auth uses `X-API-Key` or `Authorization: Bearer` with a constant-time comparison; failures are AUDIT logged.
+- P4 systemd unit (`deploy/gateway.service`, with hardening options and `TimeoutStopSec=45`) and a deployment/upgrade guide (`docs/DEPLOYMENT.md`: install, config, health probes, rolling upgrade with drain, hot reload, monitoring checklist).
+
+### Changed
+
+- `UpstreamManager` is now shared process-wide (one instance across all workers and the admin API, mutex-protected as before) so health and circuit state have a single source of truth; previously every worker held its own copy and the admin API could not see real state.
+- Admin-facing metrics gained `Metrics::snapshot()` (atomic counter copy) and `UpstreamManager::status_snapshot()` (full per-backend status under lock).
+
+### Decisions
+
+- The admin API is plain HTTP on a loopback/management listener instead of TLS-on-data-plane: TLS on the admin port can be terminated by a reverse proxy or SSH tunnel, keeping the gateway binary simple; the alternative (a second hardened TLS listener) doubles cert/key handling for little gain at this stage.
+- Readiness is defined per-upstream ("every upstream has ≥1 healthy backend") rather than global: a single degraded backend must not remove a healthy gateway from the pool, but a fully unreachable upstream means client traffic would fail anyway.
+
 ## 2026-09-17
 
 ### Added

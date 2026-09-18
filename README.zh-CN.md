@@ -36,13 +36,14 @@
 - **请求/响应日志**：记录每个请求的方法、路径、状态码、User-Agent、客户端 IP 及响应大小，便于监控与分析。
 - **RAII 资源管理**：`Socket`、`Epoll` 等资源封装为 RAII 类，支持移动语义，杜绝描述符泄漏。
 - **等待器职责分离**：`Socket` 只负责 fd 生命周期和 I/O，`Poller` 封装单 fd 的 poll 等待，`Epoll` 负责长期管理大量连接。
-- **优雅关闭**：捕获 `SIGINT`/`SIGTERM` 信号，安全通知所有 Worker 线程退出，保证日志完整、资源正确回收。
+- **优雅关闭**（P4）：SIGINT/SIGTERM 先停止接受新连接，关闭空闲 keep-alive 连接，再等待在途请求完成（上限 `shutdown_drain_timeout`，默认 30 秒）后退出，与 systemd `TimeoutStopSec` 配合。
 - **外部配置驱动 + schema 校验**：通过 JSON 配置文件指定端口、线程数、Web 根目录、线程池参数、缓存大小、超时时间等，方便部署和调整；字段类型/范围、路由重名与冲突、upstream 引用存在性均被校验，非法配置在启动时直接拒绝（fail-fast）。
 - **Runtime Reload**：`SIGHUP` 触发热更新，信号处理器仅递增 generation，Worker 在安全检查点读取并应用新配置；reload 更新路由、upstream、API Key、限流、Keep-Alive 超时和 TLS 证书，非法配置会保留当前生效配置并记录 `AUDIT config_reload_rejected`。
+- **运维端点 + Admin API**（P4）：内置 `/healthz`、`/readyz`、`/version`；独立监听、强制鉴权的 Admin API 提供 `/admin/stats`、`/admin/upstreams`（后端健康 + 熔断状态）和 `POST /admin/reload`。详见下方「运维与健康检查」。
 - **配套非阻塞客户端**：独立的状态机客户端，支持连接、发送、接收全流程，展示 epoll 在客户端的使用方法。
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
-- **单元测试**：基于 Google Test，当前 CTest 84/84 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固、连接池语义、HTTP client 超时、幂等重试、upstream 健康检查和熔断等核心模块。
-- **集成测试**：42 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、连接复用、chunked trailer），仅依赖 Python 3 标准库。
+- **单元测试**：基于 Google Test，当前 CTest 89/89 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固、连接池语义、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
+- **集成测试**：65 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、连接复用、chunked trailer、优雅停机），仅依赖 Python 3 标准库。
 - **性能基线**：`scripts/benchmark/run_benchmark.sh` 一键复现 wrk 压测（静态缓存命中 / 反向代理 / TLS 握手三场景），完整报告见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
 - **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
@@ -530,6 +531,50 @@ kill -HUP $(pgrep server)
 - reload 更新路由、upstream、API Key、默认限流配置、Keep-Alive 超时和 TLS 证书。
 - reload 前对配置做 schema 校验，无效配置不会覆盖当前生效配置，并记录 `AUDIT config_reload_rejected`。
 
+reload 也可以通过 Admin API 触发，见下节。
+
+## 运维与健康检查
+
+### 探针端点（内置，无需鉴权，不限流）
+
+```bash
+curl -sk https://localhost:5005/healthz    # 存活：事件循环正常服务时返回 "ok"
+curl -sk https://localhost:5005/readyz     # 就绪：每个 upstream 至少有一个健康后端返回
+                                           # 200 + 各 upstream healthy/total JSON，否则 503
+curl -sk https://localhost:5005/version    # {"version":"0.1.0"}
+```
+
+负载均衡器应探测 `/readyz`（而不是 `/healthz`）：当所有后端都不可用时，网关会自动被摘除，而不是继续吃进流量再失败。
+
+### Admin API（独立监听，强制鉴权）
+
+在配置中启用（默认只绑回环地址；所有端点都必须带 key）：
+
+```json
+"admin": {"enabled": true, "port": 8105, "bind": "127.0.0.1",
+          "api_keys": ["choose-a-long-random-admin-key"]}
+```
+
+```bash
+# 请求计数、延迟累计、运行时长、版本
+curl -s -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/stats
+
+# 每个后端的健康状态、连续失败数和熔断器状态
+curl -s -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/upstreams
+
+# 先校验再热更新：非法配置返回 400 且不应用任何变更，
+# 合法配置返回 200，Worker 在约 1 秒内完成应用
+curl -s -X POST -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/reload
+```
+
+### 优雅停机
+
+```bash
+kill -TERM $(pgrep server)   # 或：systemctl restart epoll-gateway
+```
+
+网关先停止接受新连接，立即关闭空闲 keep-alive 连接，然后等待在途请求完成（上限 `shutdown_drain_timeout` 秒，默认 30）后退出。systemd 的 `TimeoutStopSec` 应大于该值；现成的 unit 文件和完整的滚动升级流程见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
 ## 限流与 API Key 认证
 
 - **令牌桶限流**：基于 `RateLimiter` 令牌桶算法，全局限流器跨 Worker 共享（配合 `SO_REUSEPORT` 多 Worker 场景保证总量准确），按客户端 IP 计数，超限返回 `429 Too Many Requests`。
@@ -608,7 +653,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 6. **信号处理与优雅关闭**：`SIGINT`/`SIGTERM` 置位全局原子标志，Worker 在每次超时返回时检查并主动退出事件循环；`SIGHUP` 触发 runtime reload；析构顺序保证 Tcpserver → DynamicThreadPool → Logger::Guard，日志最后关闭。
 7. **路由系统**：内置路由通过 `register_default_routes()` 注册，配置路由通过 `register_configured_routes()` 注册；一次请求只匹配一次，`ResolvedRoute` 在鉴权、限流和分发之间复用；支持 method/path/Host/Tenant 四维匹配和 `local`/`upstream`/`static` 三类目标，未命中网关路由时 GET/HEAD 回退到静态文件服务。
 8. **空闲超时**：每个连接维护最后活跃时间，epoll_wait 超时时扫描并清理过期连接，支持配置超时阈值。
-9. **单元与集成测试**：使用 Google Test，当前 84/84 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固、连接池语义、上游超时/重试/健康检查/熔断等模块，`ctest` 一键运行；集成测试 42 项断言，基于真实服务器 + mock 上游端到端验证。
+9. **单元与集成测试**：使用 Google Test，当前 89/89 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 65 项断言，基于真实服务器 + mock 上游端到端验证。
 
 ## 性能指标
 
@@ -626,12 +671,12 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 
 ## 已知限制
 
-- 熔断状态由每个 Worker 独立维护，不是跨 Worker 共享的全局状态。
+- 熔断与健康状态已改为进程级共享（所有 Worker + Admin API 同一份）；但除 `round_robin` 之外的负载均衡算法仍未实现。
 - route/host/tenant 维度目前只有 latency sum/count，暂无独立 histogram（无法直接得到维度级 P95/P99）。
 - runtime reload 采用 Worker 周期检查，各 Worker 不保证同一时刻切换配置。
 - 路由匹配为线性遍历，适合当前规模，未引入 Trie/索引。
 - 连接池仅维护进程内空闲连接（无跨进程共享）；异步 upstream 与 `round_robin` 之外的多负载均衡算法尚未实现。
-- 尚无 `/healthz`/`/readyz` 端点和管理 API（计划于 P4）。
+- Admin API 为独立明文 HTTP 监听（默认回环地址），未提供内建 TLS（可由反向代理终结）。
 - 尚未接入 OpenTelemetry `traceparent`、分布式 Trace 和外部审计存储。
 
 ## 后续计划
@@ -639,9 +684,9 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 1. ~~补充 runtime reload 和真实 HTTP 端到端集成测试。~~ ✅ P1
 2. ~~增加配置字段范围校验、路由冲突检查和 reload 失败审计。~~ ✅ P2（含请求走私防护、TLS 加固、密钥管理）
 3. 完善 route/host/tenant 维度的 latency histogram 和失败率指标。
-4. 评估跨 Worker 共享熔断状态的实现方式。
+4. ~~评估跨 Worker 共享熔断状态的实现方式。~~ ✅ P4（UpstreamManager 已改为进程级共享）
 5. ~~连接池~~ ✅ P3（含 wrk 基线压测报告）；异步 upstream 仍待做。
-6. P4：`/healthz` + `/readyz`、管理 API、优雅停机 drain、部署文档。
+6. ~~P4：`/healthz` + `/readyz`、管理 API、优雅停机 drain、部署文档。~~ ✅ P4（含 `/version`、systemd unit 与升级指南）
 7. P5：按客户反馈决定商业化功能形态。
 8. CI/CD (GitHub Actions / Gitee CI)。
 

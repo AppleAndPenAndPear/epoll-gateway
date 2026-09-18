@@ -4,6 +4,7 @@
 #include "spdlog/spdlog.h"
 #include <csignal>
 #include "config.h"
+#include "admin_server.h"
 
 std::atomic<bool> stop_server_flag{false};
 std::atomic<uint64_t> config_reload_generation{0};
@@ -66,7 +67,21 @@ int main(){
                     config.thread_pool.scale_up_threshold,
                     config.thread_pool.scale_down_threshold);
         logger->info("Starting epoll server on port {}", config.port);
-        t.start(config.num_workers, config, "config.json");
+
+        // One process-wide UpstreamManager shared by every worker and the
+        // admin API, so health/circuit state has a single source of truth.
+        auto upstream_manager = std::make_shared<UpstreamManager>(config.upstream_config);
+
+        // Admin API on its own listener (separate from the data plane)
+        AdminServer admin(config, upstream_manager, "config.json");
+        if (config.admin.enabled) {
+            admin.start();
+        }
+
+        t.start(config.num_workers, config, "config.json", upstream_manager);
+
+        // Workers have exited (stop flag); let the admin loop wind down too
+        admin.wait();
     } catch (const system_error& e) {
         logger->critical("Server startup failed: {}", e.what());
         std::cerr << "System error: " << e.what() << " [code: " << e.code() << "]\n";

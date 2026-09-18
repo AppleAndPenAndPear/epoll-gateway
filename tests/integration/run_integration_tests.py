@@ -48,6 +48,8 @@ BACKEND_FAIL = 5613  # Circuit breaker test backend (can be switched to reject v
 BACKEND_LIMIT = 5614  # Rate limit test backend
 
 BASE = "127.0.0.1"
+ADMIN_PORT = 5615   # Admin API listener (separate from the data plane)
+ADMIN_KEY = "admin-secret-key"
 TLS_CTX = ssl._create_unverified_context()
 
 PASS = 0
@@ -157,6 +159,9 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None):
         "rate_limit": {"capacity": 100000, "refill_per_second": 50000},
         # Secrets stay out of the main config: keys come from api_keys.json
         "api_keys_file": API_KEYS_FILE,
+        # Admin API on a separate loopback listener with its own key
+        "admin": {"enabled": True, "port": ADMIN_PORT, "bind": "127.0.0.1",
+                  "api_keys": [ADMIN_KEY]},
     }
     if tls_cert and tls_key:
         cfg["tls"] = {"cert_path": tls_cert, "key_path": tls_key}
@@ -454,6 +459,136 @@ def test_chunked():
     check("Transfer-Encoding: chunked", te == "chunked", "te=%r" % te)
 
 
+def test_ops_endpoints():
+    print("\n[15] /healthz /readyz /version endpoints")
+    status, hdrs, body = request("/healthz")
+    check("healthz 200", status == 200, "got %s" % status)
+    check("healthz body ok", body.strip() == b"ok", "body=%r" % body)
+
+    status, _, body = request("/version")
+    check("version 200", status == 200, "got %s" % status)
+    ver = None
+    try:
+        ver = json.loads(body).get("version")
+    except Exception:
+        pass
+    check("version reports a semver string", isinstance(ver, str) and ver.count(".") == 2,
+          "body=%r" % body)
+
+    status, _, body = request("/readyz")
+    check("readyz 200 with healthy backends", status == 200, "got %s status, body=%r" % (status, body))
+    try:
+        doc = json.loads(body)
+    except Exception:
+        doc = {}
+    check("readyz status=ready", doc.get("status") == "ready", "body=%r" % body)
+    ups = doc.get("upstreams", {})
+    check("readyz lists upstreams with healthy>0",
+          bool(ups) and all(v.get("healthy", 0) > 0 for v in ups.values()), "upstreams=%r" % ups)
+
+
+def test_rate_limit_exemption():
+    print("\n[16] Probe endpoints are exempt from rate limiting")
+    statuses = set()
+    for _ in range(30):
+        status, _, _ = request("/healthz")
+        statuses.add(status)
+    check("healthz never 429 under burst", statuses == {200}, "statuses=%r" % statuses)
+
+
+def admin_request(path, method="GET", headers=None):
+    """Plain-HTTP request to the admin listener; returns (status, body bytes)."""
+    conn = http.client.HTTPConnection(BASE, ADMIN_PORT, timeout=5)
+    try:
+        conn.request(method, path, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def test_admin_api(ws_dir):
+    print("\n[17] Admin API (separate listener + auth)")
+    auth = {"X-API-Key": ADMIN_KEY}
+
+    status, _ = admin_request("/admin/stats")
+    check("admin without key 401", status == 401, "got %s" % status)
+    status, _ = admin_request("/admin/stats", headers={"X-API-Key": "wrong-key"})
+    check("admin with wrong key 401", status == 401, "got %s" % status)
+
+    status, body = admin_request("/admin/stats", headers=auth)
+    check("admin stats 200", status == 200, "got %s" % status)
+    try:
+        doc = json.loads(body)
+    except Exception:
+        doc = {}
+    check("stats has request counters",
+          isinstance(doc.get("requests"), dict) and "total" in doc["requests"],
+          "body=%r" % body[:120])
+    check("stats has uptime and version",
+          isinstance(doc.get("uptime_seconds"), int) and "version" in doc, "body=%r" % body[:120])
+
+    status, body = admin_request("/admin/upstreams", headers=auth)
+    check("admin upstreams 200", status == 200, "got %s" % status)
+    try:
+        doc = json.loads(body)
+    except Exception:
+        doc = {}
+    ups = {u["name"]: u for u in doc.get("upstreams", [])}
+    check("upstreams snapshot lists all upstreams",
+          {"two", "single", "limit"} <= set(ups), "names=%r" % sorted(ups))
+    check("backend status has health and circuit fields",
+          "two" in ups and len(ups["two"].get("backends", [])) == 2 and
+          all("circuit_open" in b and "healthy" in b for b in ups["two"]["backends"]),
+          "two=%r" % ups.get("two"))
+
+    status, _ = admin_request("/admin/unknown", headers=auth)
+    check("unknown admin endpoint 404", status == 404, "got %s" % status)
+
+    # Corrupt config on disk must be rejected without touching the live config
+    cfg_path = os.path.join(ws_dir, "config.json")
+    with open(cfg_path, "w") as f:
+        f.write("{ broken json !!!")
+    status, body = admin_request("/admin/reload", method="POST", headers=auth)
+    check("admin reload rejects corrupt config", status == 400, "got %s status, body=%r" % (status, body[:120]))
+
+    # Restore a valid config via the admin API and confirm it applies
+    with open(cfg_path, "w") as f:
+        f.write(make_config(with_reloaded_route=True))
+    status, body = admin_request("/admin/reload", method="POST", headers=auth)
+    check("admin reload accepts valid config", status == 200, "got %s" % status)
+    time.sleep(1.5)   # workers apply the reload at their next checkpoint (<=1s)
+    status, _, _ = request("/api/reloaded/x")
+    check("traffic healthy after admin reload", status == 200, "got %s" % status)
+
+
+def test_graceful_shutdown():
+    print("\n[18] SIGTERM graceful shutdown")
+    # Start an in-flight request against the slow backend (sleeps 1.5s), then
+    # send SIGTERM while it is being proxied: the gateway must finish it.
+    import threading
+    result = {}
+
+    def slow_req():
+        result['s'], result['h'], result['b'] = request("/api/two/slow", timeout=10)
+
+    t = threading.Thread(target=slow_req)
+    t.start()
+    time.sleep(0.6)   # the request is now inside the gateway / backend
+    os.kill(server_proc.pid, signal.SIGTERM)
+    t.join(timeout=10)
+    check("in-flight request completed during shutdown", result.get('s') == 200,
+          "got %s" % result.get('s'))
+    # After SIGTERM the gateway must stop accepting/serving new connections
+    status, _, _ = request("/healthz", timeout=3)
+    check("new request after SIGTERM is not served", status == 0, "got %s" % status)
+    try:
+        rc = server_proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        rc = None
+    check("server exits cleanly on SIGTERM", rc == 0, "rc=%s" % rc)
+
+
 # ──────────────────────────── Main flow ────────────────────────────
 
 server_proc = None
@@ -542,12 +677,18 @@ def main():
         test_corrupt_reload(ws)
         test_metrics()
         test_chunked()
+        test_ops_endpoints()
+        test_rate_limit_exemption()
         test_tls_hardening()
         test_tls_cert_hot_reload(ws)
+        test_admin_api(ws)
 
         # Final check: the server stayed alive and responsive throughout
         status, _, _ = request("/")
         check("server alive throughout", status == 200, "got %s" % status)
+
+        # Must be the last scenario: it terminates the server.
+        test_graceful_shutdown()
     finally:
         cleanup()
         shutil.rmtree(ws, ignore_errors=True)

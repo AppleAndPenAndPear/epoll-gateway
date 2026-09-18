@@ -150,6 +150,12 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Per-upstream keep-alive pool (`connection_pool.cpp`): checkout/checkin with idle timeout (60s) and max-idle cap (16), leftovers carried with the connection, stale connections invalidated and retried transparently
   - `forward_request` now frames responses precisely (Content-Length / chunked / close-delimited) and returns healthy connections to the pool
   - Integration test counts backend connections: 10 proxied requests open ≤2 backend connections (was 10); 5 new unit tests
-- [ ] P4: /healthz + graceful shutdown
+- [x] P4: /healthz + graceful shutdown (2026-09-18)
+  - Built-in ops endpoints: `/healthz` (liveness), `/readyz` (readiness: 200 only when every upstream has a healthy backend, JSON breakdown otherwise 503), `/version` (build version from CMake via a generated header); all probe endpoints are exempt from auth and rate limiting
+  - Graceful shutdown: SIGTERM stops accepting first (listen fd removed from epoll), closes idle keep-alive connections immediately, keeps serving in-flight requests until done or `shutdown_drain_timeout` (default 30s, pairs with systemd `TimeoutStopSec`), then exits
+  - Admin API: separate listener (`admin.enabled/port/bind`) with mandatory key auth (`X-API-Key`/Bearer, constant-time compare): `GET /admin/stats` (counters/latency/uptime/version), `GET /admin/upstreams` (per-backend health + circuit state), `POST /admin/reload` (validates first, rejects invalid config with 400, otherwise triggers the same worker reload path as SIGHUP)
+  - `UpstreamManager` is now process-wide (shared by workers and admin) so health/circuit state has a single source of truth
+  - systemd unit (`deploy/gateway.service`) + deployment/upgrade guide (`docs/DEPLOYMENT.md`)
+  - Tests: 89 unit / 65 integration assertions passing
 - [ ] Outreach: English README, first architecture article
 - [ ] Signals: interview 5 potential users

@@ -55,17 +55,24 @@ set(SERVER_SOURCES
     src/server/pool.cpp
     src/server/content_type.cpp
     src/server/tcpworker.cpp
+    src/server/admin_server.cpp
     src/server/tls_context.cpp
     src/server/gzip_utils.cpp
     src/server/metrics.cpp
     src/server/upstream_manager.cpp
     src/server/rate_limiter.cpp
 )
+# Generate the version header from project(VERSION) — single source of truth
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/server/gateway_version.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/gateway_version.h
+)
+
 # Create the server executable
 add_executable(server ${SERVER_SOURCES})
 # Link against the common library
 target_link_libraries(server PRIVATE common z OpenSSL::SSL OpenSSL::Crypto)
-target_include_directories(server PRIVATE include/server)
+target_include_directories(server PRIVATE include/server ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # Client executable
 set(CLIENT_SOURCES

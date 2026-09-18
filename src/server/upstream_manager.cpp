@@ -153,6 +153,42 @@ void UpstreamManager::check_health() {
     }
 }
 
+std::map<std::string, std::pair<size_t, size_t>> UpstreamManager::health_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::map<std::string, std::pair<size_t, size_t>> snapshot;
+    for (const auto& [name, upstream] : config_.upstreams) {
+        size_t healthy = 0;
+        for (const auto& server : upstream.servers) {
+            if (server.healthy) ++healthy;
+        }
+        snapshot.emplace(name, std::make_pair(healthy, upstream.servers.size()));
+    }
+    return snapshot;
+}
+
+std::vector<UpstreamManager::UpstreamStatus> UpstreamManager::status_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<UpstreamStatus> result;
+    result.reserve(config_.upstreams.size());
+    for (const auto& [name, upstream] : config_.upstreams) {
+        UpstreamStatus st;
+        st.name = name;
+        st.backends.reserve(upstream.servers.size());
+        for (const auto& server : upstream.servers) {
+            BackendStatus b;
+            b.host = server.host;
+            b.port = server.port;
+            b.healthy = server.healthy;
+            b.consecutive_failures = server.consecutive_failures;
+            const auto circuit_it = circuit_states_.find(circuit_key(name, server));
+            b.circuit_open = circuit_it != circuit_states_.end() && circuit_it->second.open;
+            st.backends.push_back(std::move(b));
+        }
+        result.push_back(std::move(st));
+    }
+    return result;
+}
+
 bool UpstreamManager::health_probe(const std::string& host, int port) const {
     try {
         Socket socket(AF_INET, SOCK_STREAM, 0);

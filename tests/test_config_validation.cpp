@@ -18,6 +18,40 @@ TEST(ConfigValidationTest, AcceptsDefaults) {
     EXPECT_TRUE(Config::validate(config).empty());
 }
 
+TEST(ConfigValidationTest, RejectsAdminEnabledWithoutKeys) {
+    Config config;
+    config.admin.enabled = true;
+    config.admin.api_keys.clear();
+    const auto errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("admin.api_keys") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(ConfigValidationTest, AcceptsAdminEnabledWithKeys) {
+    Config config;
+    config.admin.enabled = true;
+    config.admin.api_keys = {"admin-secret"};
+    EXPECT_TRUE(Config::validate(config).empty());
+}
+
+TEST(FromFileSchemaTest, ParsesAdminSection) {
+    const std::string path = write_temp_config("admin_section", R"({
+        "admin": {"enabled": true, "port": 8105, "bind": "127.0.0.1",
+                  "api_keys": ["admin-secret"]}
+    })");
+    std::vector<std::string> errors;
+    const Config config = Config::from_file(path, &errors);
+    EXPECT_TRUE(errors.empty()) << (errors.empty() ? "" : errors[0]);
+    EXPECT_TRUE(config.admin.enabled);
+    EXPECT_EQ(config.admin.port, 8105);
+    EXPECT_EQ(config.admin.bind, "127.0.0.1");
+    ASSERT_EQ(config.admin.api_keys.size(), 1u);
+    EXPECT_EQ(config.admin.api_keys[0], "admin-secret");
+}
+
 TEST(ConfigValidationTest, RejectsZeroPort) {
     Config config;
     config.port = 0;

@@ -78,6 +78,15 @@ struct TlsConfig {
     std::string key_path = "certs/server.key";
 };
 
+// Out-of-band admin API: a separate listener (never on the data-plane port)
+// serving /admin/stats, /admin/upstreams and /admin/reload behind a key check.
+struct AdminConfig {
+    bool enabled = false;
+    unsigned short port = 8105;
+    std::string bind = "127.0.0.1";   // Loopback by default; admin traffic stays off the wire
+    std::vector<std::string> api_keys; // Required (non-empty) when enabled
+};
+
 struct Config {
     // Server port
     unsigned short port = 5005;
@@ -92,6 +101,11 @@ struct Config {
     size_t cache_max_file_size_mb = 1; // Max cacheable file size (MB)
 
     int keepalive_timeout = 60; // Keep-alive timeout (seconds)
+    // Graceful shutdown: after SIGTERM the gateway stops accepting new
+    // connections and waits up to this many seconds for in-flight requests to
+    // finish before forcing remaining connections closed. Pairs with
+    // systemd's TimeoutStopSec (which should be larger than this value).
+    int shutdown_drain_timeout = 30; // seconds
     // Dynamic thread pool configuration
     struct ThreadPoolConfig {
         size_t min_threads = 2;
@@ -103,6 +117,8 @@ struct Config {
     UpstreamConfig upstream_config;
 
     TlsConfig tls;
+
+    AdminConfig admin;
 
     RateLimitConfig rate_limit_config;
 
@@ -132,6 +148,7 @@ struct Config {
         if (config.port == 0) errors.push_back("port: must be in [1, 65535]");
         if (config.backlog <= 0) errors.push_back("backlog: must be > 0");
         if (config.keepalive_timeout <= 0) errors.push_back("keepalive_timeout: must be > 0");
+        if (config.shutdown_drain_timeout <= 0) errors.push_back("shutdown_drain_timeout: must be > 0");
         if (config.cache_max_entries == 0) errors.push_back("cache_max_entries: must be > 0");
         if (config.cache_max_file_size_mb == 0) errors.push_back("cache_max_file_size_mb: must be > 0");
         if (config.thread_pool.min_threads == 0) errors.push_back("thread_pool.min: must be > 0");
@@ -146,6 +163,14 @@ struct Config {
             errors.push_back("tls.cert_path: must not be empty");
         if (config.tls.key_path.empty())
             errors.push_back("tls.key_path: must not be empty");
+        if (config.admin.enabled) {
+            if (config.admin.api_keys.empty())
+                errors.push_back("admin.api_keys: at least one key is required when admin is enabled");
+            for (size_t i = 0; i < config.admin.api_keys.size(); ++i) {
+                if (config.admin.api_keys[i].empty())
+                    errors.push_back("admin.api_keys[" + std::to_string(i) + "]: must not be empty");
+            }
+        }
 
         for (const auto& [name, up] : config.upstream_config.upstreams) {
             if (up.servers.empty())
@@ -414,6 +439,11 @@ struct Config {
             if (read_int(j, "keepalive_timeout", 1, 86400, v, ""))
                 config.keepalive_timeout = static_cast<int>(v);
         }
+        {
+            long long v = config.shutdown_drain_timeout;
+            if (read_int(j, "shutdown_drain_timeout", 1, 86400, v, ""))
+                config.shutdown_drain_timeout = static_cast<int>(v);
+        }
 
         // Parse upstreams
         if (j.contains("upstreams")) {
@@ -529,6 +559,32 @@ struct Config {
                 auto& tls = j["tls"];
                 read_str(tls, "cert_path", config.tls.cert_path, "tls.");
                 read_str(tls, "key_path", config.tls.key_path, "tls.");
+            }
+        }
+
+        // Parse admin API settings
+        if (j.contains("admin")) {
+            if (!j["admin"].is_object()) {
+                errs.push_back("admin: expected an object");
+            } else {
+                auto& adm = j["admin"];
+                read_bool(adm, "enabled", config.admin.enabled, "admin.");
+                {
+                    long long v = config.admin.port;
+                    if (read_int(adm, "port", 1, 65535, v, "admin."))
+                        config.admin.port = static_cast<unsigned short>(v);
+                }
+                read_str(adm, "bind", config.admin.bind, "admin.");
+                if (adm.contains("api_keys")) {
+                    if (!adm["api_keys"].is_array()) {
+                        errs.push_back("admin.api_keys: expected an array");
+                    } else {
+                        for (const auto& k : adm["api_keys"]) {
+                            if (k.is_string()) config.admin.api_keys.push_back(k.get<std::string>());
+                            else errs.push_back("admin.api_keys: entries must be strings");
+                        }
+                    }
+                }
             }
         }
 

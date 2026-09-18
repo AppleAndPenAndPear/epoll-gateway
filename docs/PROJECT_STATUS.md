@@ -2,16 +2,17 @@
 
 ## Current Stage
 
-Building the core capability set of a commercial API gateway. P1 (regression safety net) and P2 (config + security hardening) are complete; P3 (performance baseline) is complete with the wrk benchmark report and the upstream connection pool landed. Next: P4, operations productization (`/healthz`+`/readyz`, admin API, deployment docs).
+Building the core capability set of a commercial API gateway. P1 (regression safety net), P2 (config + security hardening), P3 (performance baseline) and P4 (operations productization: ops endpoints, admin API, graceful shutdown, deployment docs) are complete. Next: P5, commercial features shaped by customer feedback.
 
 ## Current Validation
 
 - C++17 Release build passes.
-- CTest: 84/84 passing.
-- Integration tests: 42/42 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
-- Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation, TLS context hardening, connection-pool reuse and eviction.
-- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, Chunked (incl. trailer section), and connection-pool reuse (10 requests ≤2 backend connections).
+- CTest: 89/89 passing.
+- Integration tests: 65/65 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening, connection-pool reuse and eviction, upstream health/circuit status snapshots.
+- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
+- Deployment: [DEPLOYMENT.md](DEPLOYMENT.md) — systemd unit, rolling upgrade with graceful drain, admin API usage.
 - Debug builds support AddressSanitizer.
 
 ## Completed
@@ -22,7 +23,7 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 - `SO_REUSEPORT + One Loop Per Worker`: each `TcpWorker` owns an independent listen socket and epoll loop.
 - `EPOLLET + EPOLLONESHOT` event management, avoiding redundant triggering and thundering herd.
 - Socket, Epoll, and other resources wrapped in RAII.
-- Graceful shutdown: `SIGINT`/`SIGTERM` notify workers to exit and drain connections.
+- Graceful shutdown (P4): SIGINT/SIGTERM stop accepting first, close idle keep-alive connections, and drain in-flight requests up to `shutdown_drain_timeout` (default 30 s) before exiting; pairs with systemd `TimeoutStopSec`.
 - Keep-Alive, idle connection timeout, and serial multi-request handling on a single connection.
 
 ### 2. HTTP/HTTPS Protocol Support
@@ -139,10 +140,14 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 - Reload updates routes, upstreams, API keys, default rate-limit settings, Keep-Alive timeouts, and the TLS certificate.
 - Before reload, the JSON is schema-validated; an invalid config never overwrites the currently working one and is recorded as `AUDIT config_reload_rejected`.
 - Dockerfile, docker-compose, Prometheus configuration, and startup scripts are provided.
+- Operations endpoints (P4): `/healthz` (liveness), `/readyz` (readiness — every configured upstream needs ≥1 healthy backend; JSON healthy/total breakdown, 503 otherwise), `/version` (build version from `project(VERSION)` via a generated header). Probe endpoints are exempt from auth and rate limiting.
+- Admin API (P4, `admin` config section: enabled/port/bind/api_keys): a separate listener (loopback by default) with mandatory key auth and constant-time comparison; serves `GET /admin/stats` (counters/latency/uptime/version), `GET /admin/upstreams` (per-backend health + circuit state) and `POST /admin/reload` (validates first, 400 + AUDIT on invalid config, otherwise triggers the worker reload path). Auth failures are AUDIT logged.
+- `UpstreamManager` is shared process-wide (all workers + admin) so health/circuit state has a single source of truth.
+- systemd unit (`deploy/gateway.service`) and a deployment/upgrade guide (`docs/DEPLOYMENT.md`) with a zero-downtime rolling-upgrade procedure built on graceful drain.
 
 ### 9. Testing and Engineering
 
-- Google Test suite currently 84/84 passing.
+- Google Test suite currently 89/89 passing.
 - Covered:
 	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body

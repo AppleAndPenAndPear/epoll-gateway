@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "upstream_manager.h"
+#include "gateway_version.h"
 #include <atomic>
 #include <cstdint>
 using json = nlohmann::json;
@@ -124,6 +125,50 @@ void HttpHandler::reload_config(const Config& config) {
 }
 
 void HttpHandler::register_default_routes() {
+    // ── Operations endpoints (P4). Probe endpoints must never be rate limited
+    // or fail because of one — see should_rate_limit(). ──
+    addRoute("GET", "/healthz", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
+        // Liveness: the process is up and its event loop is serving requests.
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "text/plain";
+        resp.body = "ok\n";
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+    });
+
+    addRoute("GET", "/readyz", [this](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
+        // Readiness: every configured upstream must have at least one healthy
+        // backend. A gateway that cannot reach any backend should be removed
+        // from the load balancer pool instead of failing client requests.
+        const auto snapshot = upstream_manager_.health_snapshot();
+        bool ready = true;
+        json upstreams = json::object();
+        for (const auto& [name, counts] : snapshot) {
+            upstreams[name] = {{"healthy", counts.first}, {"total", counts.second}};
+            if (counts.first == 0) ready = false;
+        }
+        json j;
+        j["status"] = ready ? "ready" : "unavailable";
+        j["upstreams"] = upstreams;
+        std::string body = j.dump() + "\n";
+        resp.status_code = ready ? 200 : 503;
+        resp.status_message = ready ? "OK" : "Service Unavailable";
+        resp.headers["Content-Type"] = "application/json";
+        resp.body = body;
+        resp.headers["Content-Length"] = std::to_string(body.size());
+    });
+
+    addRoute("GET", "/version", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
+        json j;
+        j["version"] = GATEWAY_VERSION;
+        std::string body = j.dump() + "\n";
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "application/json";
+        resp.body = body;
+        resp.headers["Content-Length"] = std::to_string(body.size());
+    });
+
     addRoute("GET", "/metrics", [](const HttpRequest& req, HttpResponse& resp, const RouteParams&) {
         std::string body = Metrics::instance().to_string();
         resp.status_code = 200;
@@ -1177,12 +1222,30 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
     return tokens;
 }
 
+bool HttpHandler::has_inflight_work(Socket* sock) const {
+    if (sock == nullptr) return false;
+    const auto rb = read_bufs_.find(sock);
+    if (rb != read_bufs_.end() && !rb->second.empty()) return true;
+    const auto rr = request_ready_.find(sock);
+    if (rr != request_ready_.end() && rr->second) return true;
+    const auto sq = send_queues_.find(sock);
+    if (sq != send_queues_.end() && !sq->second.empty()) return true;
+    if (file_fds_.count(sock)) return true;   // sendfile in progress
+    return false;
+}
+
 bool HttpHandler::requires_auth(const HttpRequest& req) const {
     // Only /api/-prefixed endpoints require auth; static files and public routes like /metrics need none
     return req.path.rfind("/api/", 0) == 0;
 }
 
 bool HttpHandler::should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const {
+    // Operations/probe endpoints are exempt: a load balancer or Prometheus
+    // scraping frequently must not trip the per-IP limiter and break probing.
+    static const char* kExemptPaths[] = {"/healthz", "/readyz", "/version", "/metrics"};
+    for (const char* p : kExemptPaths) {
+        if (req.path == p) return false;
+    }
     if (route.rate_limit_policy == "route") {
         return !rate_limiter_manager_->try_acquire("route:" + route.path + ":" + req.method, config_.rate_limit_config);
     }
