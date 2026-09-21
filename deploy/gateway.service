@@ -2,10 +2,12 @@
 #
 # Install:
 #   sudo cp build/server /usr/local/bin/epoll-gateway
+#   sudo useradd -r -s /usr/sbin/nologin epoll-gateway        # matches User/Group below
 #   sudo mkdir -p /var/lib/epoll-gateway/logs                 # logs/ must exist:
 #                                                             # spdlog does not create it
 #   sudo cp config.json api_keys.json /var/lib/epoll-gateway/ # config + secrets
 #   sudo cp -r certs /var/lib/epoll-gateway/certs             # TLS material
+#   sudo chown -R epoll-gateway:epoll-gateway /var/lib/epoll-gateway
 #   sudo cp deploy/gateway.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now epoll-gateway
 #
@@ -21,7 +23,7 @@
 
 [Unit]
 Description=epoll API gateway
-Documentation=https://github.com/OWNER/epollthread
+Documentation=https://github.com/AppleAndPenAndPear/epoll-gateway
 After=network-online.target
 Wants=network-online.target
 
@@ -35,6 +37,12 @@ ExecStart=/usr/local/bin/epoll-gateway
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
+
+# systemd's default soft limit (1024) is below what the gateway needs: one fd
+# per accepted connection plus cached static files and pooled upstream
+# connections, all held while the accept backlog itself is 1024 deep. Hitting
+# the limit surfaces as EMFILE on accept.
+LimitNOFILE=65535
 
 # Secrets can be provided outside config.json (env > file > inline)
 #Environment=GW_API_KEYS=[{"key":"...","name":"prod"}]

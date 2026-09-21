@@ -13,6 +13,7 @@ How to run the gateway as a managed service, verify it, and upgrade it without d
 sudo cp build/server /usr/local/bin/epoll-gateway
 sudo useradd -r -s /usr/sbin/nologin epoll-gateway
 sudo mkdir -p /var/lib/epoll-gateway/logs
+sudo chown -R epoll-gateway:epoll-gateway /var/lib/epoll-gateway
 ```
 
 The binary is statically self-contained apart from OpenSSL/spdlog/zlib shared libraries (install `libssl`, `zlib` via the system package manager). A single binary, no etcd/Postgres/runtime.
