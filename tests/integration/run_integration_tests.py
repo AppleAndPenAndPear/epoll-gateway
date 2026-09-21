@@ -663,7 +663,15 @@ def main():
         start_mock(BACKEND_B)
         start_mock(BACKEND_FAIL)
         start_mock(BACKEND_LIMIT)
-        time.sleep(0.5)
+        # Wait for each mock to actually bind instead of sleeping a fixed time.
+        # The server starts accepting right after this, so any proxy test that
+        # runs before a backend is listening sees a refused upstream connection
+        # and fails with an intermittent 502 (the backend probe connection is
+        # counted, but test_connection_reuse snapshots the counter later).
+        for port in (BACKEND_A, BACKEND_B, BACKEND_FAIL, BACKEND_LIMIT):
+            if not wait_for_port(port):
+                print("mock backend on port %d never came up" % port)
+                return 1
         if any(p.poll() is not None for p in mock_procs):
             print("failed to start mock backends")
             return 1
