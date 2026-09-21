@@ -157,5 +157,6 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - `UpstreamManager` is now process-wide (shared by workers and admin) so health/circuit state has a single source of truth
   - systemd unit (`deploy/gateway.service`) + deployment/upgrade guide (`docs/DEPLOYMENT.md`)
   - Tests: 91 unit / 69 integration assertions passing
-- [ ] Outreach: English README, first architecture article
+- [x] Outreach: English README (2026-09-16) — `README.md` is the English edition with a language switcher, kept in sync with `README.zh-CN.md`
+- [ ] Outreach: first architecture article — draft lives in [docs/articles/](articles/); publishing to Juejin/Zhihu/V2EX/HN still pending
 - [ ] Signals: interview 5 potential users

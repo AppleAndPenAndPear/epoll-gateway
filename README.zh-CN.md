@@ -2,7 +2,7 @@
 
 # epollthread
 
-基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 84/84 通过）、集成测试（42 项断言）及 AddressSanitizer 支持。
+基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 91/91 通过）、集成测试（69 项断言）及 AddressSanitizer 支持。
 
 ## 特性
 - **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡，无锁竞争。
@@ -689,6 +689,15 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 6. ~~P4：`/healthz` + `/readyz`、管理 API、优雅停机 drain、部署文档。~~ ✅ P4（含 `/version`、systemd unit 与升级指南）
 7. P5：按客户反馈决定商业化功能形态。
 8. CI/CD (GitHub Actions / Gitee CI)。
+
+## 延伸阅读
+
+- [项目现状](docs/PROJECT_STATUS.md) — 当前能力、限制与下一步快照
+- [变更日志](docs/CHANGELOG.md) — 按日期倒序的变更历史
+- [路线图](docs/ROADMAP.md) — 商业化定位、技术演进与验证计划
+- [性能基线](docs/BENCHMARKS.md) — wrk 压测报告（三种场景的 P50/P99/QPS）
+- [部署指南](docs/DEPLOYMENT.md) — systemd unit、Admin API、含 drain 的滚动升级
+- [架构文章](docs/articles/01-architecture.zh-CN.md) — 设计取舍、线程模型与三个真实 Bug（[English](docs/articles/01-architecture.md)）
 
 ## 许可
 

@@ -91,9 +91,10 @@ request budget.
   reflect queueing behind a saturated event loop, not per-request cost.
 - Per-request cost at light load is now ~8 ms for TLS-served traffic on this
   small box, dominated by symmetric TLS crypto and epoll overhead.
-- The proxy scenario still opens one TCP connection to the backend per
-  request (three-way handshake each time). The planned **upstream connection
-  pool** (P3) removes that cost and is expected to be the next biggest win.
+- The proxy rows above were measured **before** the upstream connection pool
+  (P3); the pool's own finding below records the comparison (throughput within
+  noise on loopback). Functionally, 10 proxied requests now open ≤4 backend
+  connections instead of 10, and the win grows with backend network distance.
 - The handshake scenario shows the gateway sustains ~956 full TLS handshakes
   per second even while sharing 2 cores with the client — session resumption
   (session cache + tickets, P2) is active for repeat connections.

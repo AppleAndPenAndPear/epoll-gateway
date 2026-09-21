@@ -4,7 +4,7 @@
 
 > Lightweight, self-contained API gateway in C++17 — a single binary built on epoll, with auth, rate limiting, circuit breaking and Prometheus metrics built in.
 
-epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload), keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (84/84 passing on CTest), integration tests (42/42 assertions) and AddressSanitizer support.
+epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload), keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (91/91 passing on CTest), integration tests (69/69 assertions) and AddressSanitizer support.
 
 ## Features
 
@@ -540,7 +540,7 @@ Debug builds enable AddressSanitizer automatically, detecting:
 6. **Signals & graceful shutdown** — `SIGINT`/`SIGTERM` set a global atomic flag; workers check it on every epoll_wait timeout and exit their event loop; `SIGHUP` triggers runtime reload; destruction order guarantees Tcpserver → DynamicThreadPool → Logger::Guard, with logs closed last.
 7. **Routing** — built-in routes are registered by `register_default_routes()` and config-driven routes by `register_configured_routes()`; each request is matched exactly once and the `ResolvedRoute` is reused across auth, rate limiting and dispatch; matching covers method/path/Host/Tenant with `local`/`upstream`/`static` targets, and GET/HEAD fall back to static file serving when no gateway route matches.
 8. **Idle timeout** — each connection tracks its last-active time; when epoll_wait times out, expired connections are swept and closed, with a configurable threshold.
-9. **Unit & integration tests** — Google Test, currently 84/84 passing, covering parsing (incl. smuggling vectors), caching, routing, auth, rate limiting, config schema validation, TLS hardening, connection-pool semantics, upstream timeouts/retries/health checks and the circuit breaker; one command via `ctest`. Integration tests (42 assertions) cover end-to-end behavior with a real server + mock upstreams.
+9. **Unit & integration tests** — Google Test, currently 91/91 passing, covering parsing (incl. smuggling vectors), caching, routing, auth, rate limiting, config schema validation, TLS hardening, connection-pool semantics, upstream timeouts/retries/health checks, status snapshots and the circuit breaker; one command via `ctest`. Integration tests (69 assertions) cover end-to-end behavior with a real server + mock upstreams.
 
 ## Tech Stack
 
@@ -603,6 +603,7 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 - [Roadmap](docs/ROADMAP.md) — commercialization positioning, technical evolution and validation plan
 - [Benchmarks](docs/BENCHMARKS.md) — wrk baseline report (P50/P99/QPS across three scenarios)
 - [Deployment](docs/DEPLOYMENT.md) — systemd unit, admin API, rolling upgrade with graceful drain
+- [Architecture article](docs/articles/01-architecture.md) — design decisions, threading model and three real bugs ([中文版](docs/articles/01-architecture.zh-CN.md))
 
 ## Project Structure
 

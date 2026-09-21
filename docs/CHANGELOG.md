@@ -8,6 +8,7 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 ### Added
 
+- First architecture article draft in `docs/articles/` — `01-architecture.md` (English) and `01-architecture.zh-CN.md` (中文), linked from both READMEs. It covers the threading model and the cost of `EPOLLET + EPOLLONESHOT`, the control-plane/data-plane split, the three reliability rules (precise response framing, idempotent-only retries, liveness check before pool reuse) and three real bugs with their measurements: the 43 ms Nagle/delayed-ACK floor, the RST-on-close that can destroy a just-written response, and connection reuse corrupted by an unconsumed chunked trailer. Publishing to Juejin/Zhihu/V2EX/HN is still pending.
 - Admin key hot rotation: the admin listener watches the reload generation and adopts a new `admin.api_keys` list from `config.json` within ~1 second of any accepted reload (SIGHUP or `POST /admin/reload`), so rotating the admin key no longer requires a restart. A refresh never adopts an invalid config or an empty key list — the previous keys are kept and an AUDIT `admin_keys_refresh_failed` line is written; success logs AUDIT `admin_keys_rotated`. `enabled`/`port`/`bind` remain startup-fixed (rebuilding a listener at runtime has messy failure modes for near-zero value). Integration tests cover rotation: old key 401, new key 200.
 
 ### Fixed
@@ -18,11 +19,14 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 - `Config::validate()` did not check `admin.bind`, so a non-IPv4-literal bind passed validation and only failed later inside `AdminServer::start()` as a generic startup error. Now reported as a field-level `admin.bind` error.
 - `deploy/gateway.service`: the install notes (unlike DEPLOYMENT.md §1) omitted creating the `epoll-gateway` user and chowning the working directory, so following the unit's own instructions produced a service that cannot resolve `User=` or write its logs; the steps are now listed in the right order before the unit is enabled. The `Documentation=` placeholder also pointed at a different repository name, and no `LimitNOFILE` was set, leaving the service on systemd's default soft limit of 1024 fds — below what a gateway with a 1024-deep accept backlog, cached static files and pooled upstream connections can hold — where exhaustion surfaces as `EMFILE` on accept. The unit now sets `LimitNOFILE=65535`.
 - Integration harness started upstream mocks and then slept a fixed 0.5 s before starting the gateway, so a slow-to-bind mock could still be absent when the first proxied test ran, producing an intermittent 502 in unrelated scenarios. The harness now waits for each mock port to accept connections (and still fails fast if a mock process died).
+- README test counts were only partially synced: the intro paragraph of both READMEs and item 9 of the English README's tech-stack section still claimed 84/84 unit and 42 integration assertions while other lines in the same files already said 91/91 and 69. All spots now agree.
+- `docs/BENCHMARKS.md` described the upstream connection pool as "planned (P3)" in its interpretation section while the report's own section above documents it as shipped; the bullet now states that the proxy rows predate the pool and records the current reuse bound (10 proxied requests open ≤4 backend connections instead of 10).
 
 ### Changed
 
 - Admin key refresh reuses the config revision already parsed and validated by `POST /admin/reload` instead of re-reading the file, removing a window where the validated revision and the adopted keys could differ. The SIGHUP path still reads the file.
 - The refresh log distinguishes "admin disabled in the new config" (AUDIT `admin_keys_unchanged`, informational — the listener keeps serving with its previous keys since it cannot be stopped at runtime) from a genuine failure, instead of reporting both as a refresh error.
+- ROADMAP's outreach item bundled two deliverables ("English README, first architecture article") behind one checkbox, leaving the finished English README unticked. Split into two entries: English README checked (2026-09-16) and the article/publishing work tracked on its own.
 
 ## 2026-09-18
 
