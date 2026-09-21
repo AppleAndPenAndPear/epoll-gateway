@@ -42,8 +42,8 @@
 - **运维端点 + Admin API**（P4）：内置 `/healthz`、`/readyz`、`/version`；独立监听、强制鉴权的 Admin API 提供 `/admin/stats`、`/admin/upstreams`（后端健康 + 熔断状态）和 `POST /admin/reload`。详见下方「运维与健康检查」。
 - **配套非阻塞客户端**：独立的状态机客户端，支持连接、发送、接收全流程，展示 epoll 在客户端的使用方法。
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
-- **单元测试**：基于 Google Test，当前 CTest 89/89 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固、连接池语义、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
-- **集成测试**：65 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、连接复用、chunked trailer、优雅停机），仅依赖 Python 3 标准库。
+- **单元测试**：基于 Google Test，当前 CTest 91/91 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固、连接池语义、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
+- **集成测试**：69 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、chunked trailer、优雅停机），仅依赖 Python 3 标准库。
 - **性能基线**：`scripts/benchmark/run_benchmark.sh` 一键复现 wrk 压测（静态缓存命中 / 反向代理 / TLS 握手三场景），完整报告见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
 - **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
@@ -653,7 +653,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 6. **信号处理与优雅关闭**：`SIGINT`/`SIGTERM` 置位全局原子标志，Worker 在每次超时返回时检查并主动退出事件循环；`SIGHUP` 触发 runtime reload；析构顺序保证 Tcpserver → DynamicThreadPool → Logger::Guard，日志最后关闭。
 7. **路由系统**：内置路由通过 `register_default_routes()` 注册，配置路由通过 `register_configured_routes()` 注册；一次请求只匹配一次，`ResolvedRoute` 在鉴权、限流和分发之间复用；支持 method/path/Host/Tenant 四维匹配和 `local`/`upstream`/`static` 三类目标，未命中网关路由时 GET/HEAD 回退到静态文件服务。
 8. **空闲超时**：每个连接维护最后活跃时间，epoll_wait 超时时扫描并清理过期连接，支持配置超时阈值。
-9. **单元与集成测试**：使用 Google Test，当前 89/89 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 65 项断言，基于真实服务器 + mock 上游端到端验证。
+9. **单元与集成测试**：使用 Google Test，当前 91/91 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 69 项断言，基于真实服务器 + mock 上游端到端验证。
 
 ## 性能指标
 

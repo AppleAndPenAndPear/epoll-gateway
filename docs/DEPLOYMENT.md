@@ -106,6 +106,8 @@ curl -s -X POST -H "X-API-Key: $ADMIN_KEY" http://127.0.0.1:8105/admin/reload
 
 The admin listener binds `127.0.0.1` by default. To expose it remotely, terminate TLS in a reverse proxy bound to a management interface, or use an SSH tunnel — do not put the admin API on the public data-plane address.
 
+Note on the `admin` section: `api_keys` **are** hot-reloadable — after a reload (SIGHUP or `POST /admin/reload`) the admin listener adopts the new keys within ~1 second, so key rotation needs no restart. The listener topology (`enabled`, `port`, `bind`) is fixed at startup and requires `systemctl restart epoll-gateway` to change: setting `enabled: false` in a reloaded config stops the data-plane reload but leaves the admin listener running with its previous keys (logged as AUDIT `admin_keys_unchanged`). A reload whose config is invalid, or whose `admin.api_keys` list is empty, keeps the previous keys (the admin listener never locks itself out). Everything else (routes, upstreams, data-plane API keys, rate limits, TLS cert) reloads live.
+
 ## 7. Rolling Upgrade (zero-downtime, single instance)
 
 1. **Check readiness**: `GET /readyz` → 200 (a gateway that would fail probing should not be restarted).

@@ -37,6 +37,31 @@ TEST(ConfigValidationTest, AcceptsAdminEnabledWithKeys) {
     EXPECT_TRUE(Config::validate(config).empty());
 }
 
+// A bind address that is not an IPv4 literal must be caught by validate(), not
+// surface later as a generic startup error from inet_pton in AdminServer::start.
+TEST(ConfigValidationTest, RejectsAdminBindThatIsNotAnIPv4Literal) {
+    Config config;
+    config.admin.enabled = true;
+    config.admin.api_keys = {"admin-secret"};
+    config.admin.bind = "localhost:8105";
+    const auto errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("admin.bind") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(ConfigValidationTest, AcceptsAdminBindWildcardAndLoopback) {
+    for (const char* bind : {"127.0.0.1", "0.0.0.0", "10.1.2.3"}) {
+        Config config;
+        config.admin.enabled = true;
+        config.admin.api_keys = {"admin-secret"};
+        config.admin.bind = bind;
+        EXPECT_TRUE(Config::validate(config).empty()) << "bind=" << bind;
+    }
+}
+
 TEST(FromFileSchemaTest, ParsesAdminSection) {
     const std::string path = write_temp_config("admin_section", R"({
         "admin": {"enabled": true, "port": 8105, "bind": "127.0.0.1",

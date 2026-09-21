@@ -108,7 +108,7 @@ API_KEYS = [
 ]
 
 
-def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None):
+def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_key=None):
     routes = [
         {"name": "proxy-two", "method": "GET", "path": "/api/two/*",
          "target_type": "upstream",
@@ -161,7 +161,7 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None):
         "api_keys_file": API_KEYS_FILE,
         # Admin API on a separate loopback listener with its own key
         "admin": {"enabled": True, "port": ADMIN_PORT, "bind": "127.0.0.1",
-                  "api_keys": [ADMIN_KEY]},
+                  "api_keys": [admin_key or ADMIN_KEY]},
     }
     if tls_cert and tls_key:
         cfg["tls"] = {"cert_path": tls_cert, "key_path": tls_key}
@@ -496,11 +496,11 @@ def test_rate_limit_exemption():
     check("healthz never 429 under burst", statuses == {200}, "statuses=%r" % statuses)
 
 
-def admin_request(path, method="GET", headers=None):
+def admin_request(path, method="GET", headers=None, body_bytes=None):
     """Plain-HTTP request to the admin listener; returns (status, body bytes)."""
     conn = http.client.HTTPConnection(BASE, ADMIN_PORT, timeout=5)
     try:
-        conn.request(method, path, headers=headers or {})
+        conn.request(method, path, body=body_bytes, headers=headers or {})
         resp = conn.getresponse()
         return resp.status, resp.read()
     finally:
@@ -560,6 +560,28 @@ def test_admin_api(ws_dir):
     time.sleep(1.5)   # workers apply the reload at their next checkpoint (<=1s)
     status, _, _ = request("/api/reloaded/x")
     check("traffic healthy after admin reload", status == 200, "got %s" % status)
+
+    # Rotate the admin key via reload: the new key must be accepted and the
+    # old one rejected, without restarting the process (<=1s poll loop)
+    rotated_key = "rotated-admin-key-77"
+    with open(cfg_path, "w") as f:
+        f.write(make_config(with_reloaded_route=True, admin_key=rotated_key))
+    status, body = admin_request("/admin/reload", method="POST", headers=auth)
+    check("admin reload with rotated key accepted", status == 200, "got %s" % status)
+    time.sleep(1.5)   # admin loop adopts the new keys at its next poll (<=1s)
+    status, _ = admin_request("/admin/stats", headers=auth)
+    check("old admin key rejected after rotation", status == 401, "got %s" % status)
+    status, _ = admin_request("/admin/stats", headers={"X-API-Key": rotated_key})
+    check("new admin key accepted after rotation", status == 200, "got %s" % status)
+
+    # A POST carrying a body is never parsed (no admin endpoint takes one), but
+    # the response must still arrive: closing the socket with unread body bytes
+    # makes the kernel send RST, which can discard the response we just wrote.
+    status, resp_body = admin_request("/admin/reload", method="POST",
+                                      headers={"X-API-Key": rotated_key},
+                                      body_bytes=b'{"note":"ignored"}')
+    check("admin reload with request body still returns its response",
+          status == 200, "got %s status, body=%r" % (status, resp_body[:120]))
 
 
 def test_graceful_shutdown():

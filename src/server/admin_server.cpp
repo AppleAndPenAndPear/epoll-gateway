@@ -1,7 +1,6 @@
 #include "admin_server.h"
 #include "metrics.h"
 #include "mylogger.h"
-#include "mysocket.h"
 #include "gateway_version.h"
 
 #include <arpa/inet.h>
@@ -25,6 +24,9 @@ struct ParsedAdminRequest {
     std::string method;
     std::string path;
     std::unordered_map<std::string, std::string> headers;  // lowercased names
+    size_t body_consumed = 0;        // body bytes already read while hunting for the head terminator
+    long long content_length = -1;   // -1 when absent or not a valid non-negative integer
+    bool chunked = false;            // Transfer-Encoding: chunked (size unknown up front)
     bool ok = false;
 };
 
@@ -32,6 +34,39 @@ namespace {
 
 constexpr size_t MAX_REQUEST_BYTES = 8192;
 constexpr int RECV_TIMEOUT_SECONDS = 5;
+constexpr size_t MAX_DRAIN_BYTES = 65536;
+
+// Discard the rest of the request body before the socket is closed. We
+// deliberately never parse a body (no admin endpoint takes one), but closing a
+// socket that still has unread received data makes the kernel send RST instead
+// of FIN — and an RST can destroy a response the client has not read yet. So
+// drain what the caller's Content-Length promises, bounded, before returning.
+void drain_request_body(int fd, const ParsedAdminRequest& req) {
+    size_t remaining = 0;
+    if (req.content_length > 0) {
+        const size_t total = static_cast<size_t>(req.content_length);
+        remaining = total > req.body_consumed ? total - req.body_consumed : 0;
+    } else if (req.chunked) {
+        remaining = MAX_DRAIN_BYTES;   // Unknown length: drain what has arrived
+    }
+    if (remaining == 0) return;
+    if (remaining > MAX_DRAIN_BYTES) remaining = MAX_DRAIN_BYTES;
+
+    // Shorten the timeout for this phase: the accept loop is serial, so a
+    // client that stalls mid-body must not hold the admin listener for 5s.
+    timeval tv{};
+    tv.tv_sec = 1;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char buf[1024];
+    size_t drained = 0;
+    while (drained < remaining) {
+        const size_t want = std::min(sizeof(buf), remaining - drained);
+        const ssize_t n = ::recv(fd, buf, want, 0);
+        if (n <= 0) break;   // EOF, error or timeout
+        drained += static_cast<size_t>(n);
+    }
+}
 
 // Read one blocking-with-timeout HTTP request (headers only; admin endpoints
 // carry no body). Returns false on IO failure or an oversized/malformed head.
@@ -80,6 +115,24 @@ bool read_request_head(int fd, ParsedAdminRequest& out) {
         for (auto& c : name) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
         trim(value);
         out.headers[name] = value;
+    }
+
+    // Record how much of a body we already swallowed while scanning for the
+    // head terminator, plus how much more the caller promised — drain_request_body
+    // needs both to know what is still unread in the kernel buffer.
+    const size_t head_end = head.find("\r\n\r\n") + 4;
+    if (head.size() > head_end) out.body_consumed = head.size() - head_end;
+    if (const auto cl = out.headers.find("content-length"); cl != out.headers.end()) {
+        try {
+            const long long n = std::stoll(cl->second);
+            if (n >= 0) out.content_length = n;
+        } catch (...) {
+            // Malformed Content-Length: no exact drain target; best effort only
+        }
+    }
+    if (const auto te = out.headers.find("transfer-encoding"); te != out.headers.end() &&
+        te->second.find("chunked") != std::string::npos) {
+        out.chunked = true;
     }
     out.ok = true;
     return true;
@@ -132,14 +185,20 @@ AdminServer::AdminServer(const Config& config, std::shared_ptr<UpstreamManager> 
 
 AdminServer::~AdminServer() {
     if (thread_.joinable()) thread_.join();
-    if (listen_fd_ >= 0) ::close(listen_fd_);
+    // listen_sock_ closes its fd via RAII
 }
 
+// Note: I/O here deliberately uses ::recv/::send on raw fds instead of the
+// Socket wrappers. Socket::recv/send/accept throw on ECONNRESET, ECONNABORTED,
+// EMFILE and friends, but in this blocking-with-timeout model those errnos are
+// routine per-connection noise that must never escape run() (an uncaught
+// exception in a thread calls std::terminate and would kill the whole
+// process). Socket is used purely as the RAII fd owner.
 void AdminServer::start() {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (listen_fd_ < 0) throw std::runtime_error("admin: socket() failed");
+    listen_sock_ = Socket(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    if (listen_sock_.getFd() < 0) throw std::runtime_error("admin: socket() failed");
     int one = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(listen_sock_.getFd(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -147,11 +206,11 @@ void AdminServer::start() {
     if (inet_pton(AF_INET, config_.admin.bind.c_str(), &addr.sin_addr) != 1) {
         throw std::runtime_error("admin: invalid bind address '" + config_.admin.bind + "'");
     }
-    if (::bind(listen_fd_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::bind(listen_sock_.getFd(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
         throw std::runtime_error("admin: bind failed on " + config_.admin.bind + ":" +
                                  std::to_string(config_.admin.port));
     }
-    if (::listen(listen_fd_, 64) != 0) {
+    if (::listen(listen_sock_.getFd(), 64) != 0) {
         throw std::runtime_error("admin: listen failed");
     }
 
@@ -166,17 +225,30 @@ void AdminServer::wait() {
 
 void AdminServer::run() {
     while (!stop_server_flag.load(std::memory_order_relaxed)) {
-        pollfd pfd{listen_fd_, POLLIN, 0};
-        if (::poll(&pfd, 1, 1000) <= 0) continue;   // Timeout or EINTR: re-check the stop flag
+        // Nothing may escape this loop: an uncaught exception in a thread calls
+        // std::terminate and would take the whole gateway down with it. The
+        // per-request code is written to not throw (raw ::recv/::send below),
+        // but the refresh path reads and parses a file, and JSON/string growth
+        // can still fail on allocation — so the guarantee is enforced here.
+        try {
+            maybe_refresh_keys();
 
-        sockaddr_in peer{};
-        socklen_t peer_len = sizeof(peer);
-        const int fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_len);
-        if (fd < 0) continue;
+            pollfd pfd{listen_sock_.getFd(), POLLIN, 0};
+            if (::poll(&pfd, 1, 1000) <= 0) continue;   // Timeout or EINTR: re-check the stop flag
 
-        const std::string peer_str = peer_to_string(peer);
-        handle_connection(fd, peer_str);
-        ::close(fd);
+            sockaddr_in peer{};
+            socklen_t peer_len = sizeof(peer);
+            const int fd = ::accept(listen_sock_.getFd(), reinterpret_cast<sockaddr*>(&peer), &peer_len);
+            if (fd < 0) continue;
+
+            const Socket client(fd);   // RAII: closed on any exit path from this scope
+            const std::string peer_str = peer_to_string(peer);
+            handle_connection(client.getFd(), peer_str);
+        } catch (const std::exception& e) {
+            Logger::get()->error("AUDIT admin_request_failed error={}", e.what());
+        } catch (...) {
+            Logger::get()->error("AUDIT admin_request_failed error=unknown");
+        }
     }
 }
 
@@ -201,33 +273,43 @@ bool AdminServer::authorize(const ParsedAdminRequest& req, std::string* err) {
 
 void AdminServer::handle_connection(int fd, const std::string& peer) {
     ParsedAdminRequest req;
-    if (!read_request_head(fd, req) || !req.ok) {
-        send_response(fd, 400, "Bad Request", R"({"error":"malformed request"})");
-        return;
+    int status = 400;
+    const char* status_text = "Bad Request";
+    std::string body = R"({"error":"malformed request"})";
+
+    if (read_request_head(fd, req) && req.ok) {
+        std::string auth_err;
+        if (!authorize(req, &auth_err)) {
+            Logger::get()->warn("AUDIT admin_auth_failed peer={} method={} path={} reason={}",
+                                peer, req.method, req.path, auth_err);
+            status = 401;
+            status_text = "Unauthorized";
+            body = R"({"error":"unauthorized"})";
+        } else if (req.path == "/admin/stats" && req.method == "GET") {
+            status = 200;
+            status_text = "OK";
+            body = handle_stats();
+        } else if (req.path == "/admin/upstreams" && req.method == "GET") {
+            status = 200;
+            status_text = "OK";
+            body = handle_upstreams();
+        } else if (req.path == "/admin/reload" && req.method == "POST") {
+            auto [reload_status, reload_body] = handle_reload();
+            status = reload_status;
+            status_text = reload_status == 200 ? "OK" : "Bad Request";
+            body = std::move(reload_body);
+        } else {
+            status = 404;
+            status_text = "Not Found";
+            body = R"({"error":"unknown admin endpoint"})";
+        }
     }
 
-    std::string auth_err;
-    if (!authorize(req, &auth_err)) {
-        Logger::get()->warn("AUDIT admin_auth_failed peer={} method={} path={} reason={}",
-                            peer, req.method, req.path, auth_err);
-        send_response(fd, 401, "Unauthorized", R"({"error":"unauthorized"})");
-        return;
-    }
-
-    if (req.path == "/admin/stats" && req.method == "GET") {
-        send_response(fd, 200, "OK", handle_stats());
-        return;
-    }
-    if (req.path == "/admin/upstreams" && req.method == "GET") {
-        send_response(fd, 200, "OK", handle_upstreams());
-        return;
-    }
-    if (req.path == "/admin/reload" && req.method == "POST") {
-        const auto [status, body] = handle_reload();
-        send_response(fd, status, status == 200 ? "OK" : "Bad Request", body);
-        return;
-    }
-    send_response(fd, 404, "Not Found", R"({"error":"unknown admin endpoint"})");
+    send_response(fd, status, status_text, body);
+    // Must happen after the response, before the socket closes (see the note
+    // on drain_request_body): a client that sent a body would otherwise get an
+    // RST that can discard the response we just wrote.
+    drain_request_body(fd, req);
 }
 
 std::string AdminServer::handle_stats() {
@@ -273,10 +355,11 @@ std::string AdminServer::handle_upstreams() {
 
 std::pair<int, std::string> AdminServer::handle_reload() {
     std::vector<std::string> errors;
+    Config reloaded;
     if (!Config::is_valid_file(config_path_)) {
         errors.push_back("config file missing or not valid JSON");
     } else {
-        Config reloaded = Config::from_file(config_path_, &errors);
+        reloaded = Config::from_file(config_path_, &errors);
         for (const std::string& e : Config::validate(reloaded)) {
             errors.push_back(e);
         }
@@ -293,6 +376,10 @@ std::pair<int, std::string> AdminServer::handle_reload() {
         j["errors"] = errors;
         return {400, j.dump() + "\n"};
     }
+    // Hand the validated admin section to the refresh step so it adopts exactly
+    // the revision that was validated, instead of re-reading (and possibly
+    // picking up a newer revision of) config.json.
+    pending_admin_keys_ = PendingAdminKeys{reloaded.admin.enabled, reloaded.admin.api_keys};
     // Valid config: bump the reload generation; workers validate-and-apply it
     // at their next safe checkpoint (same path as SIGHUP, within ~1s).
     config_reload_generation.fetch_add(1, std::memory_order_relaxed);
@@ -300,4 +387,68 @@ std::pair<int, std::string> AdminServer::handle_reload() {
     json j;
     j["status"] = "reload_triggered";
     return {200, j.dump() + "\n"};
+}
+
+// Adopt a validated admin key set. `enabled` distinguishes the two reasons the
+// list can be empty: admin switched off (a legitimate new state — keep serving
+// with the previous keys, since the listener cannot be stopped at runtime) from
+// an enabled-but-empty list (a config error we never adopt).
+void AdminServer::apply_admin_keys(const std::vector<std::string>& keys, bool enabled,
+                                   bool from_admin_api) {
+    const char* source = from_admin_api ? "admin api" : "sighup";
+    if (!enabled) {
+        Logger::get()->info("AUDIT admin_keys_unchanged reason=admin_disabled source={} "
+                            "(listener keeps its current keys until restart)", source);
+        return;
+    }
+    if (keys.empty()) {
+        // validate() rejects this combination, so it should be unreachable —
+        // guarding anyway because adopting it would lock the listener out.
+        Logger::get()->warn("AUDIT admin_keys_refresh_failed reason=empty_key_list source={} "
+                            "errors=[keeping previous keys]", source);
+        return;
+    }
+    config_.admin.api_keys = keys;
+    Logger::get()->info("AUDIT admin_keys_rotated count={} source={}", keys.size(), source);
+}
+
+// Hot-reload admin.api_keys: whenever the reload generation changes (SIGHUP or
+// POST /admin/reload), adopt the new key list so rotation needs no restart.
+// Listener topology (enabled/port/bind) intentionally stays fixed until
+// restart — only the keys are runtime-refreshable. A failed refresh always
+// keeps the previous keys, so the listener can never lock itself out.
+// No locking needed: this runs on the accept-loop thread, same as authorize().
+void AdminServer::maybe_refresh_keys() {
+    const uint64_t gen = config_reload_generation.load(std::memory_order_relaxed);
+    if (gen == applied_generation_) return;
+    applied_generation_ = gen;   // Mark seen regardless of outcome; failures are logged once
+
+    // Preferred path: the admin API already parsed and validated this config.
+    if (pending_admin_keys_) {
+        PendingAdminKeys pending = std::move(*pending_admin_keys_);
+        pending_admin_keys_.reset();
+        apply_admin_keys(pending.keys, pending.enabled, /*from_admin_api=*/true);
+        return;
+    }
+
+    // SIGHUP path: no parsed config in hand, so read the file ourselves.
+    std::vector<std::string> errors;
+    if (!Config::is_valid_file(config_path_)) {
+        errors.push_back("config file missing or not valid JSON");
+    } else {
+        Config reloaded = Config::from_file(config_path_, &errors);
+        for (const std::string& e : Config::validate(reloaded)) {
+            errors.push_back(e);
+        }
+        if (errors.empty()) {
+            apply_admin_keys(reloaded.admin.api_keys, reloaded.admin.enabled, /*from_admin_api=*/false);
+            return;
+        }
+    }
+    std::string joined;
+    for (const std::string& e : errors) {
+        if (!joined.empty()) joined += "; ";
+        joined += e;
+    }
+    Logger::get()->warn("AUDIT admin_keys_refresh_failed source=sighup errors=[{}]", joined);
 }

@@ -156,6 +156,6 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Admin API: separate listener (`admin.enabled/port/bind`) with mandatory key auth (`X-API-Key`/Bearer, constant-time compare): `GET /admin/stats` (counters/latency/uptime/version), `GET /admin/upstreams` (per-backend health + circuit state), `POST /admin/reload` (validates first, rejects invalid config with 400, otherwise triggers the same worker reload path as SIGHUP)
   - `UpstreamManager` is now process-wide (shared by workers and admin) so health/circuit state has a single source of truth
   - systemd unit (`deploy/gateway.service`) + deployment/upgrade guide (`docs/DEPLOYMENT.md`)
-  - Tests: 89 unit / 65 integration assertions passing
+  - Tests: 91 unit / 69 integration assertions passing
 - [ ] Outreach: English README, first architecture article
 - [ ] Signals: interview 5 potential users

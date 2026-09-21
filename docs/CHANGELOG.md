@@ -4,6 +4,24 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-21
+
+### Added
+
+- Admin key hot rotation: the admin listener watches the reload generation and adopts a new `admin.api_keys` list from `config.json` within ~1 second of any accepted reload (SIGHUP or `POST /admin/reload`), so rotating the admin key no longer requires a restart. A refresh never adopts an invalid config or an empty key list — the previous keys are kept and an AUDIT `admin_keys_refresh_failed` line is written; success logs AUDIT `admin_keys_rotated`. `enabled`/`port`/`bind` remain startup-fixed (rebuilding a listener at runtime has messy failure modes for near-zero value). Integration tests cover rotation: old key 401, new key 200.
+
+### Fixed
+
+- Admin accept loop had no exception guard: an uncaught exception in the thread calls `std::terminate`, so a failure in the (file-reading, JSON-parsing) key refresh or in JSON response building would have killed the whole gateway, data plane included. The loop body is now wrapped in try/catch and logs AUDIT `admin_request_failed` — enforcing the guarantee the surrounding comment already claimed.
+- `POST` to an admin endpoint with a request body could lose its response: the body is deliberately never parsed, and closing a socket with unread received data makes the kernel send RST instead of FIN, which can discard the response just written. The rest of the body (per `Content-Length`, bounded, 1 s cap) is now drained after the response and before the socket closes; covered by an integration assertion.
+- `admin.api_keys` parsing did not clear the target list first, unlike the data-plane `api_keys` parsing; a reused `Config` would accumulate keys, keeping revoked ones valid. Defensive today (a fresh `Config` per parse) but a security footgun if the parse path is ever reused.
+- `Config::validate()` did not check `admin.bind`, so a non-IPv4-literal bind passed validation and only failed later inside `AdminServer::start()` as a generic startup error. Now reported as a field-level `admin.bind` error.
+
+### Changed
+
+- Admin key refresh reuses the config revision already parsed and validated by `POST /admin/reload` instead of re-reading the file, removing a window where the validated revision and the adopted keys could differ. The SIGHUP path still reads the file.
+- The refresh log distinguishes "admin disabled in the new config" (AUDIT `admin_keys_unchanged`, informational — the listener keeps serving with its previous keys since it cannot be stopped at runtime) from a genuine failure, instead of reporting both as a refresh error.
+
 ## 2026-09-18
 
 ### Added

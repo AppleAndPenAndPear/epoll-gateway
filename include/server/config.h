@@ -1,5 +1,6 @@
 #pragma once
 #include <nlohmann/json.hpp>
+#include <arpa/inet.h>
 #include <cstdlib>
 #include <fstream>
 #include <set>
@@ -164,6 +165,9 @@ struct Config {
         if (config.tls.key_path.empty())
             errors.push_back("tls.key_path: must not be empty");
         if (config.admin.enabled) {
+            in_addr bind_probe{};
+            if (inet_pton(AF_INET, config.admin.bind.c_str(), &bind_probe) != 1)
+                errors.push_back("admin.bind: '" + config.admin.bind + "' is not a valid IPv4 address");
             if (config.admin.api_keys.empty())
                 errors.push_back("admin.api_keys: at least one key is required when admin is enabled");
             for (size_t i = 0; i < config.admin.api_keys.size(); ++i) {
@@ -579,6 +583,9 @@ struct Config {
                     if (!adm["api_keys"].is_array()) {
                         errs.push_back("admin.api_keys: expected an array");
                     } else {
+                        // Clear first, like the data-plane api_keys parsing: a
+                        // reused Config must not accumulate revoked keys.
+                        config.admin.api_keys.clear();
                         for (const auto& k : adm["api_keys"]) {
                             if (k.is_string()) config.admin.api_keys.push_back(k.get<std::string>());
                             else errs.push_back("admin.api_keys: entries must be strings");

@@ -7,8 +7,8 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 ## Current Validation
 
 - C++17 Release build passes.
-- CTest: 89/89 passing.
-- Integration tests: 65/65 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- CTest: 91/91 passing.
+- Integration tests: 69/69 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
 - Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening, connection-pool reuse and eviction, upstream health/circuit status snapshots.
 - Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
@@ -147,7 +147,7 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 
 ### 9. Testing and Engineering
 
-- Google Test suite currently 89/89 passing.
+- Google Test suite currently 91/91 passing.
 - Covered:
 	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body
