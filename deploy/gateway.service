@@ -2,11 +2,15 @@
 #
 # Install:
 #   sudo cp build/server /usr/local/bin/epoll-gateway
-#   sudo mkdir -p /etc/epoll-gateway /var/lib/epoll-gateway
-#   sudo cp config.json api_keys.json /etc/epoll-gateway/     # config + secrets
-#   sudo cp -r certs /etc/epoll-gateway/certs                 # TLS material
+#   sudo mkdir -p /var/lib/epoll-gateway/logs                 # logs/ must exist:
+#                                                             # spdlog does not create it
+#   sudo cp config.json api_keys.json /var/lib/epoll-gateway/ # config + secrets
+#   sudo cp -r certs /var/lib/epoll-gateway/certs             # TLS material
 #   sudo cp deploy/gateway.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now epoll-gateway
+#
+# The paths above must match WorkingDirectory below: the binary loads
+# config.json and writes logs/epollserver.log relative to that directory.
 #
 # Reload (hot, without dropping connections):
 #   systemctl reload epoll-gateway        # sends SIGHUP
