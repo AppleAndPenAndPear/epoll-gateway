@@ -88,10 +88,12 @@ void TcpWorker::check_timeout() {
   }
     for (auto it = last_active_.begin(); it != last_active_.end(); ) {
         int fd = it->first;
-        // If the fd is already invalid (closed), remove the record directly
-        if (fcntl(fd, F_GETFD) == -1 && errno == EBADF) {
-            Logger::get()->debug("check_timeout: remove stale fd {} (already closed)", fd);
-            conns_.erase(fd);                    // Also clean up the stale entry in conns_
+        // A live connection always has entries in both conns_ and last_active_
+        // (accept inserts both, every cleanup path erases both). Membership in
+        // conns_ is the source of truth; probing with fcntl(fd) would be unsafe
+        // because the fd number may already have been reused by a new connection.
+        if (conns_.find(fd) == conns_.end()) {
+            Logger::get()->debug("check_timeout: remove stale last_active_ entry fd {}", fd);
             it = last_active_.erase(it);
             continue;
         }

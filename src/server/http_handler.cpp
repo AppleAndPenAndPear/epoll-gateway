@@ -276,6 +276,9 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
         char buf[4096];
         while (true) {
             bool is_ssl = sock_ptr->get_is_ssl_();
+            // sslRead counts a bare FIN (no close_notify) as a clean end of stream,
+            // which is what most HTTP clients do: request completeness comes from
+            // HTTP framing, so the close style must not be reported as a read error.
             int n = is_ssl ? sock_ptr->sslRead(buf, sizeof(buf)) : sock_ptr->recv(buf, sizeof(buf), 0);
             if (n > 0) {
                 auto& read_buf = read_bufs_[sock_ptr];
@@ -402,7 +405,11 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         if (consumed > 0) read_buf.erase(0, consumed);
                         parsers_[sock_ptr].reset();
                         requests_[sock_ptr].clear();
-                        continue;  // Keep checking the buffer for further requests
+                        // Stop parsing: after a smuggling-class rejection the
+                        // rest of the buffer is untrusted, and send_error_response
+                        // already queued "Connection: close", so nothing further
+                        // on this connection should be handled.
+                        break;
                     }
                     else {
                         Logger::get()->trace("Parser waiting for more data, buffer size: {}", read_buf.size());
@@ -525,10 +532,15 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         be.body = "Bad Gateway";
         be.error = BackendError::ConnectFailed;
         int attempt_count = 0;
+        UpstreamTlsOptions tls;
+        tls.enable = server.tls;
+        tls.ca_file = server.tls_ca_file;
+        tls.server_name = server.tls_server_name;
+        tls.skip_verify = server.tls_skip_verify;
         while (true) {
             be = forward_request(server.host, server.port, req.method, req.path,
                                  req.headers, req.body,
-                                 route.upstream_target.timeout_ms);
+                                 route.upstream_target.timeout_ms, tls);
             if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
                 !should_retry_backend_request(req.method, be.error, attempt_count)) {
                 break;

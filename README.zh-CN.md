@@ -2,7 +2,7 @@
 
 # epollthread
 
-基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 91/91 通过）、集成测试（69 项断言）及 AddressSanitizer 支持。
+基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 101/101 通过）、集成测试（77 项断言）及 AddressSanitizer 支持。
 
 ## 特性
 - **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡，无锁竞争。
@@ -13,7 +13,7 @@
 - **配置驱动网关路由**：通过 `routes` 配置 method、path、host、tenant、鉴权、限流和执行目标；路由注册与执行分离，支持 `local`、`upstream`、`static` 三类目标。
 - **反向代理与上游负载均衡**：通过 `UpstreamTarget` 引用 upstream 服务组，由 `UpstreamManager` 进行轮询选路和主动 TCP 健康检查，自动摘除故障节点。
 - **上游访问控制与超时**：支持 route/API Key 的 host、tenant 绑定；连接、发送、读取阶段均具备超时控制，区分 502 与 504。
-- **上游连接池**：到各 upstream 的 keep-alive 连接进入池中复用（空闲超时 60s、每 upstream 最多 16 条空闲），每个代理请求省去一次 TCP 三次握手；响应按 Content-Length / chunked（含 trailer）/ EOF 精确分帧，后端已关闭的陈旧连接在取用时被预先探测并透明重建；请求发出后的失败仅对幂等方法自动重试，POST 绝不内部重发。
+- **上游连接池**：到各 upstream 的 keep-alive 连接进入池中复用（空闲超时 60s、每 upstream 最多 16 条空闲），每个代理请求省去一次 TCP 三次握手；响应按 Content-Length / chunked（含 trailer）/ EOF 精确分帧，后端已关闭的陈旧连接在取用时被预先探测并透明重建；请求发出后的失败仅对幂等方法自动重试，POST 绝不内部重发。池身份包含 TLS 校验策略，为一个后端名验证过的会话绝不会交给策略不同的 upstream 复用。
 - **上游错误分类**：区分连接失败、连接超时、发送失败、发送超时、读取失败、读取超时和非法响应，并通过 Prometheus 暴露错误计数，映射到 502/503/504。
 - **幂等重试**：仅对幂等方法（GET/HEAD 等）和可重试的临时错误发起重试，路由可通过 `max_retries` 配置额外重试次数，避免非幂等请求重复执行。
 - **基础熔断器**：按 upstream/backend 维度维护熔断状态，连续失败达到阈值后进入 OPEN，超时后进入恢复探测（half-open），探测成功自动关闭熔断，防止故障后端持续拖垮网关。
@@ -40,10 +40,10 @@
 - **外部配置驱动 + schema 校验**：通过 JSON 配置文件指定端口、线程数、Web 根目录、线程池参数、缓存大小、超时时间等，方便部署和调整；字段类型/范围、路由重名与冲突、upstream 引用存在性均被校验，非法配置在启动时直接拒绝（fail-fast）。
 - **Runtime Reload**：`SIGHUP` 触发热更新，信号处理器仅递增 generation，Worker 在安全检查点读取并应用新配置；reload 更新路由、upstream、API Key、限流、Keep-Alive 超时和 TLS 证书，非法配置会保留当前生效配置并记录 `AUDIT config_reload_rejected`。
 - **运维端点 + Admin API**（P4）：内置 `/healthz`、`/readyz`、`/version`；独立监听、强制鉴权的 Admin API 提供 `/admin/stats`、`/admin/upstreams`（后端健康 + 熔断状态）和 `POST /admin/reload`。详见下方「运维与健康检查」。
-- **配套非阻塞客户端**：独立的状态机客户端，支持连接、发送、接收全流程，展示 epoll 在客户端的使用方法。
+- **配套非阻塞客户端**：独立的状态机 HTTPS 客户端（TLS 握手、证书与主机名校验、连接/发送/接收全流程），展示 epoll 在客户端的使用方法。
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
-- **单元测试**：基于 Google Test，当前 CTest 91/91 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固、连接池语义、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
-- **集成测试**：69 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、chunked trailer、优雅停机），仅依赖 Python 3 标准库。
+- **单元测试**：基于 Google Test，当前 CTest 101/101 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固（含服务端/客户端共享策略与客户端校验配置）、连接池语义（含 scheme 与校验身份隔离）、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
+- **集成测试**：77 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、带主机名校验的配套客户端、含主机名不匹配拒绝的 upstream TLS 校验、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、chunked trailer、优雅停机），仅依赖 Python 3 标准库。
 - **性能基线**：`scripts/benchmark/run_benchmark.sh` 一键复现 wrk 压测（静态缓存命中 / 反向代理 / TLS 握手三场景），完整报告见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
 - **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
@@ -273,8 +273,10 @@ cmake --build build -j$(nproc)
     "upstreams": {                  // 上游服务定义
         "test-service": {
             "servers": [
-                {"host": "127.0.0.1", "port": 8081},
-                {"host": "127.0.0.1", "port": 8082}
+                {"host": "127.0.0.1", "port": 8081},       // 明文（回环场景足够）
+                {"host": "https://10.0.0.8", "port": 8082, // https:// 前缀启用上游 TLS
+                 "tls_ca_file": "certs/backend-ca.crt",    // 签发后端证书的 CA（留空 = 系统信任库）
+                 "tls_server_name": "backend.internal"}    // SNI + 主机名校验（留空 = 仅校验证书链）
             ],
             "algorithm": "round_robin"
         }
@@ -507,8 +509,9 @@ openssl s_client -connect localhost:5005 -tls1_1
 - **`routes`**：将匹配的「方法 + 路径」转发到指定的上游（路径支持 `*` 通配符）。
 - **健康检查**：每个 Worker 每秒主动对上游节点执行 TCP 连接探测，自动摘除故障节点并在恢复后重新加入。
 - **负载均衡**：`UpstreamManager` 采用轮询策略在健康节点间分发请求，转发逻辑由 `http_client::forward_request` 实现。
-- **连接池**：到各 upstream 的 keep-alive 连接进入池中复用（空闲超时 60s、每 upstream 最多 16 条空闲），每个请求省去一次 TCP 握手；响应按 Content-Length / chunked（含 trailer）/ EOF 精确分帧，后端已关闭的陈旧连接在使用前被探测并透明重建。
-- **超时与错误分类**：连接、发送、读取阶段均具备超时控制，通过结构化 `BackendError` 区分失败类型，映射到 502/503/504。
+- **连接池**：到各 upstream 的 keep-alive 连接进入池中复用（空闲超时 60s、每 upstream 最多 16 条空闲），每个请求省去一次 TCP 握手；响应按 Content-Length / chunked（含 trailer）/ EOF 精确分帧，后端已关闭的陈旧连接在使用前被探测并透明重建。池身份包含 TLS 校验策略，为一个后端名验证过的会话绝不会交给策略不同的 upstream 复用。
+- **上游 TLS**：服务器地址写为 `https://host` 即可让网关在转发前完成客户端侧 TLS 握手（与数据面同一套加固：最低 TLS 1.2、仅 AEAD 套件）。后端证书按 `tls_ca_file` 校验（留空 = 系统默认信任库），`tls_server_name` 作为 SNI 与主机名校验；`tls_skip_verify: true` 可彻底跳过校验（仅限实验环境）。明文 `http://` upstream 继续支持，回环场景仍是合理选择。
+- **超时与错误分类**：连接（含 TLS 握手）、发送、读取阶段均具备超时控制，通过结构化 `BackendError` 区分失败类型，映射到 502/503/504。
 - **重试**：仅幂等方法与可重试的临时错误会重试，路由可通过 `max_retries` 控制额外重试次数；连接池内部绝不重发 POST。
 - **熔断**：按 upstream/backend 维度统计连续失败，达到 `circuit_failure_threshold` 打开熔断，`circuit_recovery_timeout_ms` 后允许半开探测，成功后关闭熔断。
 
@@ -587,13 +590,30 @@ for i in $(seq 1 30); do curl -sk -o /dev/null -w "%{http_code}\n" https://local
 
 ## 客户端
 
-配套的非阻塞 TCP 客户端位于 `src/client/`，可独立编译运行：
+配套的非阻塞 HTTPS 客户端位于 `src/client/`，可独立编译运行。它默认校验证书（信任仓库自带的 CA）并发送一个真实的 HTTP/1.1 请求：
 
 ```bash
-./build/client
+./build/client                        # GET / → localhost:5005，用 certs/server.crt 校验
+./build/client --path /api/two/hello  # 任意路径
 ```
 
-> 注意：客户端默认连接 `192.168.189.138:5005`，如需修改请在 `src/client/main.cpp` 中调整目标地址。
+| 参数 | 说明 |
+| --- | --- |
+| `--host <name>` | 主机名或 IPv4 字面量（默认 `localhost`） |
+| `--port <n>` | 服务端端口（默认 `5005`） |
+| `--path <path>` | 请求路径（默认 `/`） |
+| `--ca <file>` | 校验服务端用的信任锚（默认 `certs/server.crt`） |
+| `--insecure` | 跳过证书校验，仅用于调试，不要对真实服务使用 |
+| `--no-tls` | 改用明文 HTTP（仅调试/对比用途） |
+| `-h`, `--help` | 查看用法 |
+
+只有收到**完整** HTTP 响应时退出码才为 `0`，因此它也可以直接当冒烟测试用：
+
+```bash
+./build/client --host localhost || echo "unreachable"
+```
+
+> 仓库自带证书是 `CN=localhost` 且没有 SAN，所以 `./build/client --host 127.0.0.1` 会校验失败——这是主机名校验在正常工作，不是 bug。网关是 TLS-only 的，`--no-tls` 连不上它（可拿去连明文服务）。
 
 ## 调试与诊断
 
@@ -653,7 +673,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 6. **信号处理与优雅关闭**：`SIGINT`/`SIGTERM` 置位全局原子标志，Worker 在每次超时返回时检查并主动退出事件循环；`SIGHUP` 触发 runtime reload；析构顺序保证 Tcpserver → DynamicThreadPool → Logger::Guard，日志最后关闭。
 7. **路由系统**：内置路由通过 `register_default_routes()` 注册，配置路由通过 `register_configured_routes()` 注册；一次请求只匹配一次，`ResolvedRoute` 在鉴权、限流和分发之间复用；支持 method/path/Host/Tenant 四维匹配和 `local`/`upstream`/`static` 三类目标，未命中网关路由时 GET/HEAD 回退到静态文件服务。
 8. **空闲超时**：每个连接维护最后活跃时间，epoll_wait 超时时扫描并清理过期连接，支持配置超时阈值。
-9. **单元与集成测试**：使用 Google Test，当前 91/91 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 69 项断言，基于真实服务器 + mock 上游端到端验证。
+9. **单元与集成测试**：使用 Google Test，当前 101/101 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固（服务端与客户端共享）、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 77 项断言，基于真实服务器 + mock 上游端到端验证（含 upstream TLS 校验）。
 
 ## 性能指标
 
@@ -676,6 +696,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 - runtime reload 采用 Worker 周期检查，各 Worker 不保证同一时刻切换配置。
 - 路由匹配为线性遍历，适合当前规模，未引入 Trie/索引。
 - 连接池仅维护进程内空闲连接（无跨进程共享）；异步 upstream 与 `round_robin` 之外的多负载均衡算法尚未实现。
+- 上游 TLS 会校验后端证书（证书链 + 主机名），但尚不携带客户端证书，无法与后端做 mTLS 双向认证；上游健康探测仍在 TCP 层（仅验证可达性，不校验 TLS 层）。
 - Admin API 为独立明文 HTTP 监听（默认回环地址），未提供内建 TLS（可由反向代理终结）。
 - 尚未接入 OpenTelemetry `traceparent`、分布式 Trace 和外部审计存储。
 

@@ -138,7 +138,7 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
 - [x] P2: TLS hardening (2026-09-17)
   - `build_hardened_ssl_ctx` (`tls_context.cpp`): minimum TLS 1.2, AEAD-only cipher whitelist (ECDHE+GCM/ChaCha20), no compression, session cache + tickets for resumption
   - TLS setup is fail-fast at startup; SIGHUP hot-reloads cert/key from the new `tls.cert_path`/`tls.key_path` config, AUDIT logs applied/rejected, old context kept on failure
-  - Integration tests: TLS 1.1 refused, cert hot reload verified via peer-certificate fingerprint; 6 unit tests for the context builder
+  - Integration tests: TLS 1.1 refused, cert hot reload verified via peer-certificate fingerprint; 4 unit tests for the context builder
 - [x] P2: Secret management (2026-09-17)
   - `api_keys` can now live outside the main config: `"api_keys_file": "api_keys.json"` (JSON array, same schema) or the `GW_API_KEYS` environment variable; precedence env > file > inline
   - Inline keys in config.json still work (backward compat) but log a security hint at startup; a missing/invalid keys file or env JSON fails fast with a schema error
@@ -156,7 +156,18 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Admin API: separate listener (`admin.enabled/port/bind`) with mandatory key auth (`X-API-Key`/Bearer, constant-time compare): `GET /admin/stats` (counters/latency/uptime/version), `GET /admin/upstreams` (per-backend health + circuit state), `POST /admin/reload` (validates first, rejects invalid config with 400, otherwise triggers the same worker reload path as SIGHUP)
   - `UpstreamManager` is now process-wide (shared by workers and admin) so health/circuit state has a single source of truth
   - systemd unit (`deploy/gateway.service`) + deployment/upgrade guide (`docs/DEPLOYMENT.md`)
-  - Tests: 91 unit / 69 integration assertions passing
+  - Tests: 100 unit / 72 integration assertions passing
+- [x] Companion client HTTPS support (2026-09-22)
+  - `src/client/` now runs a non-blocking TLS handshake inside its own epoll loop, verifies the server certificate (`--ca`, default `certs/server.crt`) including the hostname, and issues a real `GET <path> HTTP/1.1`; `--insecure` skips verification, `--no-tls` falls back to plaintext, and exit code 0 means a complete response was received (so `./build/client` is a usable smoke test)
+  - TLS hardening (minimum 1.2 + AEAD whitelist) extracted to `include/common/tls_utils.{h,cpp}` and shared by the server and client context builders
+  - Tests: 9 unit tests and 3 integration assertions, including a hostname-mismatch rejection that proves verification is not a silent no-op (needs `SSL_VERIFY_PEER` before `SSL_set1_host`)
+  - Bugs found while wiring it up: the client's event dispatch had no `TLS_HANDSHAKING` case (permanent stall under `EPOLLET | EPOLLONESHOT`), `Content-Length` parsing rejected the space after the colon, completion relied on EOF and so misfired against the 60 s keep-alive timeout, `SIGPIPE` was not ignored, TLS writes must not be half-closed with `shutdown(SHUT_WR)`, and OpenSSL 3.0's unexpected-EOF needed the lenient read path
+- [x] Upstream TLS (2026-09-24)
+  - Backends declared as `https://host:port` in `servers` get a client-side handshake before proxying (non-blocking, reusing the same hardening policy and `Socket`/`Poller` timeouts); per-upstream `tls_ca_file` (empty = system default trust store), `tls_server_name` (SNI + `SSL_set1_host` hostname binding) and `tls_skip_verify` (explicit escape hatch, off by default); verification defaults to on
+  - The connection pool key now embeds the verification policy (`scheme` = `tls/<server_name>`, `tls/insecure` or empty), so a session verified for one hostname can never be handed to a different policy on the same host:port — the hostname check would otherwise only run during the handshake that a reused connection skips
+  - Every SSL I/O call now starts with `ERR_clear_error()`: a failed upstream handshake leaves stale errors in OpenSSL's per-thread queue, and the next `SSL_get_error` on an unrelated socket in the same thread misclassified `WANT_READ` as fatal and dropped the client connection
+  - Tests: 101 unit / 77 integration passing, including 5 new upstream-TLS integration assertions (verified 200, pooled TLS reuse, hostname-mismatch 502, skip-verify escape hatch) and a pool-identity unit test
+  - Not yet: mTLS (client certificates to backends), TLS-layer health probes (health checks stay TCP-level)
 - [x] Outreach: English README (2026-09-16) — `README.md` is the English edition with a language switcher, kept in sync with `README.zh-CN.md`
 - [ ] Outreach: first architecture article — draft lives in [docs/articles/](articles/); publishing to Juejin/Zhihu/V2EX/HN still pending
 - [ ] Signals: interview 5 potential users

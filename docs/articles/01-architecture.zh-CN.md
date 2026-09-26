@@ -1,6 +1,6 @@
 # 从零用 C++17 写一个 API 网关：线程模型、控制面分离，以及三个真实 Bug
 
-> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 `docs/BENCHMARKS.md`，测试计数来自 CI 的实际输出（91 个单测 / 69 条集成断言）。
+> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 `docs/BENCHMARKS.md`，测试计数来自 CI 的实际输出（101 个单测 / 77 条集成断言）。
 
 ## 1. 为什么要再写一个网关
 
@@ -162,7 +162,7 @@ proxy        (c50)    836 QPS / 53.64ms → 1083 QPS / 42.22ms
 - 优雅停机时用一条正在处理 1.5 秒慢请求的连接，验证它在 drain 窗口内被完整服务；
 - 管理口密钥轮换后旧 key 401 / 新 key 200。
 
-当前状态：**91 个单测（CTest）+ 69 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
+当前状态：**101 个单测（CTest）+ 77 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
 
 ## 8. 现在还没做的（诚实清单）
 
@@ -177,7 +177,7 @@ proxy        (c50)    836 QPS / 53.64ms → 1083 QPS / 42.22ms
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                       # 构建 + 91 单测 + 69 条集成断言
+./ci.sh                       # 构建 + 101 单测 + 77 条集成断言
 scripts/benchmark/run_benchmark.sh   # wrk 压测（15s/场景）
 ```
 

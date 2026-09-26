@@ -4,6 +4,52 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-24
+
+### Added
+
+- Upstream TLS: backends can now be declared as `https://host:port` in the `servers` config, and the gateway runs the client-side handshake (non-blocking, integrated with the same `Socket`/`Poller` timeouts) before proxying. Per-upstream options: `tls_ca_file` (empty = the system default trust store, so public-CA backends need no extra config), `tls_server_name` (SNI + hostname binding via `SSL_set1_host`; empty = verify the chain only), and `tls_skip_verify` (an explicit escape hatch for experiments, off by default). Certificate verification is always on unless `tls_skip_verify` is set — the hardening policy (min TLS 1.2, AEAD-only suites) is shared with the server and companion-client contexts. Configuration rejects `tls_*` fields on a plaintext upstream (fail-fast). The connection pool is shared with plaintext upstreams; the client-side `SSL_CTX`s are cached per (CA, server-name, skip-verify) tuple. mTLS (client certificates) and TLS health probes remain future work.
+- 5 integration assertions (`test_upstream_tls`): a verified `https://` backend returns 200 and reaches the mock, a second request reuses the pooled TLS connection, a wrong `tls_server_name` is rejected with 502 (proving hostname verification is not a silent no-op), and `tls_skip_verify` connects where verification would fail. 1 new unit test pins the pool-identity split. Test totals: 101 unit / 77 integration.
+
+### Fixed
+
+- Two defects surfaced only once a second, independent TLS client lived in the same process:
+  - The connection pool key was `host:port` only, so a pooled connection verified for one hostname/verification policy could be handed to a different upstream on the same host:port — the hostname check happened only during the handshake, and a reused connection never handshakes. The pool key is now `scheme + host + port`, where the scheme embeds the verification policy (`tls/<server_name>` vs `tls/insecure` vs empty for plaintext), so a session verified for one name can never be reused under another.
+  - OpenSSL keeps a per-thread error queue: a failed `SSL_connect`/`SSL_shutdown` on an upstream socket left errors behind, and the next `SSL_get_error` on an unrelated client socket in the same thread read that stale error, misclassifying an ordinary `WANT_READ` as fatal and dropping a perfectly good client connection. `sslRead`/`sslWrite` now call `ERR_clear_error()` before every SSL I/O call (the handshake/peek helpers already did).
+- `sslRead` lost its `lenient_eof` parameter entirely: both call sites passed `true`, so the lenient-EOF policy moved into the function body and its documentation on `Socket::sslRead` instead of being a knob every caller had to remember to set.
+
+## 2026-09-22
+
+### Added
+
+- The companion client (`src/client/`) now speaks TLS and works as a real smoke test. It resolves its target through `getaddrinfo` (the default host is `localhost`, which the old `inet_pton` call could not accept), runs a non-blocking `SSL_connect` inside its own epoll state machine, verifies the server certificate against `certs/server.crt` (hostname check included) and sends a real `GET <path> HTTP/1.1` request with `Connection: close`. New flags: `--host`, `--port`, `--path`, `--ca`, `--insecure` (skip verification — debugging only) and `--no-tls` (plaintext, for targets that are not this gateway); the exit code is 0 only when a complete HTTP response was received. Before this the client sent the literal string `Hello, server!` over plaintext and could not talk to the TLS-only data plane at all, which made the `./build/client` line in both READMEs incorrect.
+- `include/common/tls_utils.{h,cpp}`: the hardening policy (minimum TLS 1.2, AEAD-only cipher whitelist, compression off) is now shared by the server and client context builders instead of living inside `tls_context.cpp`, so both sides of the wire are pinned to the same suites.
+- 9 unit tests (`test_tls_utils.cpp`: the shared policy on server and client contexts; `test_client_tls.cpp`: CA required, empty/missing CA rejected, `--insecure` bypass) and 3 integration assertions that run the built client against the real server, including a hostname-mismatch rejection that proves verification is not a silent no-op.
+
+### Fixed
+
+- The client never dispatched the handshake state: `TLS_HANDSHAKING` had no `switch` case, so after the first wait-for-read re-arm the fd stayed disarmed under `EPOLLET | EPOLLONESHOT`. Every run exchanged zero bytes and died on the 10 s idle timeout, even though the TCP connection and the request were fine.
+- Client response framing read `Content-Length` without skipping the space after the colon, so an ordinary `Content-Length: 226` parsed as "no digits" and was reported as an incomplete body — the client printed a perfectly good 200 and exited non-zero.
+- Client completion depended only on EOF, which needs the peer to close: with the documented default `keepalive_timeout` of 60 s, a valid response would have been reported as a receive timeout (and a truncated one as a failure). The client now finishes as soon as the declared body is complete, keeping the EOF + completeness check as the fallback for close-delimited and chunked responses.
+- `sslRead` treated a peer that closes the TCP connection without `close_notify` as a fatal error. OpenSSL 3.0 reports that as `SSL_ERROR_SSL` + `SSL_R_UNEXPECTED_EOF_WHILE_READING` rather than `SSL_ERROR_SYSCALL` with a 0 return, so a response already on the wire was thrown away. The read path now maps both spellings to end-of-stream, because completeness is decided by HTTP framing rather than by the peer's close style.
+- The client did not ignore `SIGPIPE`: `SSL_write`/`SSL_shutdown` take no `MSG_NOSIGNAL`, so writing to an already-closed socket during teardown would have killed the process instead of returning an error.
+- A self-review pass over the new client code found three more defects before they could bite:
+  - `do_send`/`do_receive` assumed their read/write wrappers throw on fatal errors, but `Socket::send` maps `EPIPE` to a -1 return and the SSL wrappers return -1 with `errno=EIO`. The loops treated any non-EAGAIN -1 as "keep going" and would spin at 100% CPU until SIGINT. Both loops now treat an unexpected -1 as fatal.
+  - `handle_event` bailed out on `EPOLLHUP`/`EPOLLRDHUP` before reading. A plaintext peer that closes right after responding reports HUP together with `EPOLLIN`, and the still-buffered response was being discarded and reported as a failure. HUP now falls through to the read path, which drains the bytes and lets the framing check decide DONE vs ERROR; only `EPOLLERR` is immediately fatal.
+  - The idle timeout counter was never reset when events arrived (its reset sat on an unreachable branch), so a transfer that went silent once for over 10 seconds mid-way was aborted even if it resumed. The budget now restarts on every event batch.
+- The client no longer mirrors log warnings to stdout (the shared logger's console sink is removed in the client process only), so `./build/client | <filter>` sees the HTTP response and nothing else; logs still go to `logs/client.log`.
+- The client's send path no longer calls `shutdown(SHUT_WR)` when the connection is TLS. It emits a bare TCP FIN instead of `close_notify` and permanently closes the write side, so the `SSL_shutdown` in teardown always failed with `EPIPE`. Plaintext keeps the half-close.
+- A pre-publication review of the server data plane found and fixed three issues:
+  - The server-side `sslRead` kept the strict EOF policy, so clients that close TCP without `close_notify` (some Java/PHP HTTP stacks) generated error-level SSL logs on every disconnect even though their request was fully handled and the response already sent. The server read path now uses the same lenient-EOF mode as the client — request completeness is driven by framing, not by the peer's close style. With both callers wanting the same policy, the `lenient_eof` parameter was removed as a knob nobody turned and the rule now lives as documentation on `Socket::sslRead`; genuine protocol errors (bad record MAC, handshake failure) stay fatal. The diagnostic for the bare-FIN case also moved from warn to debug, since it fires on every disconnect from a client that never sends `close_notify`.
+  - After rejecting a malformed request (400/413) the read loop `continue`d parsing the rest of the buffer. `send_error_response` already queues `Connection: close`, but the loop could still process (and queue responses for) further pipelined requests on a connection that is about to die — and after a smuggling-class rejection the remaining bytes are untrusted anyway. The loop now stops parsing immediately on rejection.
+  - `TcpWorker::check_timeout` probed `last_active_` records with `fcntl(fd)`: a closed fd number can be reused by a new connection, so a stale record could in theory pass the probe and kill an innocent connection. All lifecycle paths already insert/erase `conns_` and `last_active_` together, so membership in `conns_` is now the source of truth and the fd probe is gone.
+
+### Changed
+
+- The client owns its `SSL_CTX` through a `unique_ptr` declared before the socket, so the session is released before the context it was created from, and the defaulted move operations are gone — they would have copied a raw context pointer.
+- Client CLI errors (unknown flag, missing value, port out of range) now print usage and exit 2, distinct from the 1 returned when no complete response arrived.
+- README test counts (both languages), the companion-client sections, PROJECT_STATUS and ROADMAP counts now say 100 unit / 72 integration assertions; ROADMAP's P2 note claiming "6 unit tests for the context builder" matched neither the old nor the new file (it has 4) and is corrected.
+
 ## 2026-09-21
 
 ### Added

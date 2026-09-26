@@ -31,6 +31,8 @@ set(COMMON_SOURCES
     src/common/fd_cache.cpp
     src/common/file_cache.cpp
     src/common/http_parser.cpp
+    src/common/tls_utils.cpp
+    src/common/client_tls.cpp
 )
 add_library(common STATIC ${COMMON_SOURCES})
 target_include_directories(common PUBLIC include/common)

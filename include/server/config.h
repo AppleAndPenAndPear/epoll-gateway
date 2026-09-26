@@ -25,6 +25,13 @@ struct ApiKeyConfig {
 struct UpstreamServer {
     std::string host;
     int port;
+    // TLS to the backend: "https://host" in the config enables it, "http://"
+    // or a bare host keeps plaintext. Loopback backends may keep plaintext
+    // (the traffic never leaves the kernel); anything cross-host should be TLS.
+    bool tls = false;
+    std::string tls_ca_file;        // CA bundle verifying the backend cert; empty = system default trust store
+    std::string tls_server_name;    // SNI + hostname check; empty = verify the chain only
+    bool tls_skip_verify = false;   // disable verification entirely (insecure, lab use only)
     bool healthy = true;          // Whether currently healthy
     int consecutive_failures = 0; // Consecutive failure count
 };
@@ -187,6 +194,8 @@ struct Config {
                 if (s.host.empty()) errors.push_back(at + ".host: must not be empty");
                 if (s.port <= 0 || s.port > 65535)
                     errors.push_back(at + ".port: must be in [1, 65535]");
+                if (!s.tls && (!s.tls_ca_file.empty() || !s.tls_server_name.empty() || s.tls_skip_verify))
+                    errors.push_back(at + ": tls_ca_file/tls_server_name/tls_skip_verify require tls (or an https:// host)");
             }
         }
 
@@ -466,6 +475,19 @@ struct Config {
                                                         ".servers[" + std::to_string(index++) + "].";
                                 UpstreamServer s;
                                 read_str(srv, "host", s.host, ctx);
+                                // The address scheme decides TLS: "https://host"
+                                // enables it, "http://" or a bare host keeps
+                                // plaintext (backwards compatible).
+                                if (s.host.rfind("https://", 0) == 0) {
+                                    s.tls = true;
+                                    s.host.erase(0, 8);
+                                } else if (s.host.rfind("http://", 0) == 0) {
+                                    s.host.erase(0, 7);
+                                }
+                                read_bool(srv, "tls", s.tls, ctx);
+                                read_str(srv, "tls_ca_file", s.tls_ca_file, ctx);
+                                read_str(srv, "tls_server_name", s.tls_server_name, ctx);
+                                read_bool(srv, "tls_skip_verify", s.tls_skip_verify, ctx);
                                 long long p = 80;
                                 if (read_int(srv, "port", 1, 65535, p, ctx)) s.port = static_cast<int>(p);
                                 up.servers.push_back(s);

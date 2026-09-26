@@ -4,7 +4,7 @@
 
 > Lightweight, self-contained API gateway in C++17 — a single binary built on epoll, with auth, rate limiting, circuit breaking and Prometheus metrics built in.
 
-epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload), keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (91/91 passing on CTest), integration tests (69/69 assertions) and AddressSanitizer support.
+epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload) on both the client-facing and upstream hops, keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (101/101 passing on CTest), integration tests (77/77 assertions) and AddressSanitizer support.
 
 ## Features
 
@@ -55,9 +55,9 @@ epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and net
 - **Runtime reload** — `SIGHUP` triggers a hot reload: the signal handler only increments a generation counter, and workers read and apply the new config at safe checkpoints. Reload updates routes, upstreams, API keys, rate limiting, the keep-alive timeout and the TLS certificate; an invalid file never overwrites the running config and is recorded as an AUDIT event.
 - **Ops endpoints + Admin API** — `/healthz`, `/readyz`, `/version` built in; a separate authenticated admin listener serves `/admin/stats`, `/admin/upstreams` (health + circuit-breaker state) and `POST /admin/reload`. See [Operations](#operations--health).
 - **Graceful shutdown** — SIGTERM stops accepting first, closes idle keep-alive connections, and drains in-flight requests (up to `shutdown_drain_timeout`, default 30 s) before exiting; pairs with systemd `TimeoutStopSec`.
-- **Companion non-blocking client** — an independent state-machine client covering connect/send/receive, demonstrating epoll from the client side.
-- **Unit tests** — Google Test, currently 91/91 via CTest, covering the HTTP parser (incl. smuggling vectors), LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy (incl. key-source precedence), rate-limit isolation, config schema validation, TLS context hardening, connection-pool semantics, HTTP client timeouts, idempotent retries, upstream health checks, status snapshots and the circuit breaker.
-- **Integration tests** — 69 end-to-end assertions against a real server + mock upstreams (TLS policy, cert hot reload, auth from a keys file, rate limiting, failover, circuit breaking, reload, ops endpoints, admin API, admin key rotation, connection reuse, chunked trailers, graceful shutdown), runnable with nothing but the Python 3 standard library.
+- **Companion non-blocking client** — an independent state-machine HTTPS client (TLS handshake, certificate and hostname verification, connect/send/receive), demonstrating epoll from the client side.
+- **Unit tests** — Google Test, currently 101/101 via CTest, covering the HTTP parser (incl. smuggling vectors), LRU cache, response serialization, route matching, 404/405 semantics, path-traversal protection, API-key policy (incl. key-source precedence), rate-limit isolation, config schema validation, TLS context hardening (incl. the shared client/server policy and the client trust settings), connection-pool semantics (incl. scheme/verification-identity separation), HTTP client timeouts, idempotent retries, upstream health checks, status snapshots and the circuit breaker.
+- **Integration tests** — 77 end-to-end assertions against a real server + mock upstreams (TLS policy, cert hot reload, the companion client with hostname verification, upstream TLS with certificate/hostname verification incl. a mismatch-rejection case, auth from a keys file, rate limiting, failover, circuit breaking, reload, ops endpoints, admin API, admin key rotation, connection reuse, chunked trailers, graceful shutdown), runnable with nothing but the Python 3 standard library.
 - **AddressSanitizer** — enabled automatically in Debug builds to catch memory leaks and out-of-bounds accesses.
 - **Docker** — multi-stage `Dockerfile` builds a lean image for one-command deployment anywhere.
 
@@ -183,8 +183,10 @@ Edit `config.json` to suit your deployment (every field has a default; if the fi
     "upstreams": {                  // Upstream service definitions
         "test-service": {
             "servers": [
-                {"host": "127.0.0.1", "port": 8081},
-                {"host": "127.0.0.1", "port": 8082}
+                {"host": "127.0.0.1", "port": 8081},        // plaintext (fine on loopback)
+                {"host": "https://10.0.0.8", "port": 8082,  // https:// enables upstream TLS
+                 "tls_ca_file": "certs/backend-ca.crt",     // CA that signed the backend cert (empty = system store)
+                 "tls_server_name": "backend.internal"}     // SNI + hostname check (empty = chain only)
             ],
             "algorithm": "round_robin"
         }
@@ -342,8 +344,9 @@ Reverse proxying is configured through the `upstreams` and `routes` sections of 
 - **`routes`** — forwards matching "method + path" pairs to a named upstream (paths support `*` wildcards).
 - **Health checks** — every worker actively probes upstream nodes over TCP once per second, ejecting failed nodes and re-admitting them after recovery.
 - **Load balancing** — `UpstreamManager` round-robins across healthy nodes; forwarding is implemented in `http_client::forward_request`.
-- **Connection pooling** — keep-alive connections to each upstream are pooled (60 s idle timeout, max 16 idle per upstream) and reused across requests, saving one TCP handshake per request; responses are framed precisely (Content-Length / chunked incl. trailers / close-delimited) and connections closed by the backend while idle are detected before use and transparently replaced.
-- **Timeouts & error classification** — connect, send and read phases each have timeout control; structured `BackendError` values distinguish failure types and map to 502/503/504.
+- **Connection pooling** — keep-alive connections to each upstream are pooled (60 s idle timeout, max 16 idle per upstream) and reused across requests, saving one TCP handshake per request; responses are framed precisely (Content-Length / chunked incl. trailers / close-delimited) and connections closed by the backend while idle are detected before use and transparently replaced. Pool identity includes the TLS verification policy, so a session verified for one backend name is never handed to an upstream with a different policy.
+- **Upstream TLS** — a server address written as `https://host` makes the gateway complete a client-side TLS handshake (same hardening as the data plane: minimum TLS 1.2, AEAD-only ciphers) before forwarding. The backend certificate is verified against `tls_ca_file` (empty = system default trust store) with `tls_server_name` as SNI + hostname check; `tls_skip_verify: true` disables verification for lab setups. Plaintext `http://` upstreams remain supported and are the sensible choice on loopback.
+- **Timeouts & error classification** — connect (incl. the TLS handshake), send and read phases each have timeout control; structured `BackendError` values distinguish failure types and map to 502/503/504.
 - **Retries** — only idempotent methods and retryable transient errors are retried; `max_retries` controls the extra attempts per route, and the pool never resends POSTs internally.
 - **Circuit breaking** — consecutive failures are tracked per upstream/backend; `circuit_failure_threshold` opens the circuit, half-open probes are allowed after `circuit_recovery_timeout_ms`, and success closes it.
 
@@ -502,13 +505,30 @@ The certificate can be swapped at runtime: update the files (or point `tls.cert_
 
 ## Companion Client
 
-A standalone non-blocking TCP client lives in `src/client/` and builds alongside the server:
+A standalone non-blocking HTTPS client lives in `src/client/` and builds alongside the server. It verifies the server certificate against the bundled CA and sends a real HTTP/1.1 request:
 
 ```bash
-./build/client
+./build/client                        # GET / on localhost:5005, verified against certs/server.crt
+./build/client --path /api/two/hello  # any path
 ```
 
-> The client connects to `192.168.189.138:5005` by default; adjust the target address in `src/client/main.cpp` if needed.
+| Flag | Meaning |
+| --- | --- |
+| `--host <name>` | Hostname or IPv4 literal (default `localhost`) |
+| `--port <n>` | Server port (default `5005`) |
+| `--path <path>` | Request path (default `/`) |
+| `--ca <file>` | Trust anchor used to verify the server (default `certs/server.crt`) |
+| `--insecure` | Skip certificate verification — debugging only, never against a real server |
+| `--no-tls` | Send plaintext HTTP instead of HTTPS (debugging/comparison only) |
+| `-h`, `--help` | Usage |
+
+The exit code is `0` only when a complete HTTP response was received, so the client doubles as a smoke test:
+
+```bash
+./build/client --host localhost || echo "unreachable"
+```
+
+> The bundled certificate has `CN=localhost` and no SAN, so `./build/client --host 127.0.0.1` fails the name check by design — that is hostname verification working, not a bug. The gateway is TLS-only, so `--no-tls` cannot talk to it (use it against plaintext servers).
 
 ## Debugging & Diagnostics
 
@@ -540,7 +560,7 @@ Debug builds enable AddressSanitizer automatically, detecting:
 6. **Signals & graceful shutdown** — `SIGINT`/`SIGTERM` set a global atomic flag; workers check it on every epoll_wait timeout and exit their event loop; `SIGHUP` triggers runtime reload; destruction order guarantees Tcpserver → DynamicThreadPool → Logger::Guard, with logs closed last.
 7. **Routing** — built-in routes are registered by `register_default_routes()` and config-driven routes by `register_configured_routes()`; each request is matched exactly once and the `ResolvedRoute` is reused across auth, rate limiting and dispatch; matching covers method/path/Host/Tenant with `local`/`upstream`/`static` targets, and GET/HEAD fall back to static file serving when no gateway route matches.
 8. **Idle timeout** — each connection tracks its last-active time; when epoll_wait times out, expired connections are swept and closed, with a configurable threshold.
-9. **Unit & integration tests** — Google Test, currently 91/91 passing, covering parsing (incl. smuggling vectors), caching, routing, auth, rate limiting, config schema validation, TLS hardening, connection-pool semantics, upstream timeouts/retries/health checks, status snapshots and the circuit breaker; one command via `ctest`. Integration tests (69 assertions) cover end-to-end behavior with a real server + mock upstreams.
+9. **Unit & integration tests** — Google Test, currently 101/101 passing, covering parsing (incl. smuggling vectors), caching, routing, auth, rate limiting, config schema validation, TLS hardening (shared across server and client), connection-pool semantics, upstream timeouts/retries/health checks, status snapshots and the circuit breaker; one command via `ctest`. Integration tests (77 assertions) cover end-to-end behavior with a real server + mock upstreams, including upstream TLS verification.
 
 ## Tech Stack
 
@@ -582,6 +602,7 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 - Runtime reload is polled by workers at checkpoints; workers do not switch config at the exact same instant.
 - Route matching is a linear scan — fine at the current scale, with no Trie/index structure yet.
 - The connection pool keeps only in-process idle connections; async upstream I/O and multi-algorithm load balancing (beyond `round_robin`) are not implemented yet.
+- Upstream TLS verifies the backend certificate (chain + hostname) but does not yet present a client certificate, so mTLS-style mutual authentication with backends is not available; upstream health probes stay at the TCP level (reachability only, not TLS-layer checks).
 - The admin API is a separate plain-HTTP listener (loopback by default) without built-in TLS (terminate TLS in a reverse proxy if it must be exposed).
 - OpenTelemetry `traceparent`, distributed tracing and external audit storage are not integrated yet.
 

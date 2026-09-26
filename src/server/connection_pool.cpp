@@ -5,9 +5,19 @@ ConnectionPool& global_connection_pool() {
     return pool;
 }
 
+namespace {
+// The scheme is part of the identity: the same host:port must never hand back
+// a plaintext connection for an https upstream (or vice versa), nor a session
+// verified for one server name to an upstream verifying another.
+std::string pool_key(const std::string& host, int port, const std::string& scheme) {
+    return scheme + host + ":" + std::to_string(port);
+}
+}  // namespace
+
 std::optional<ConnectionPool::PooledConnection> ConnectionPool::checkout(const std::string& host,
-                                                                         int port) {
-    const std::string key = host + ":" + std::to_string(port);
+                                                                         int port,
+                                                                         const std::string& scheme) {
+    const std::string key = pool_key(host, port, scheme);
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = idle_.find(key);
     if (it == idle_.end()) return std::nullopt;
@@ -26,8 +36,9 @@ std::optional<ConnectionPool::PooledConnection> ConnectionPool::checkout(const s
     return std::nullopt;
 }
 
-void ConnectionPool::checkin(const std::string& host, int port, PooledConnection conn) {
-    const std::string key = host + ":" + std::to_string(port);
+void ConnectionPool::checkin(const std::string& host, int port, const std::string& scheme,
+                             PooledConnection conn) {
+    const std::string key = pool_key(host, port, scheme);
     std::lock_guard<std::mutex> lock(mutex_);
     auto& dq = idle_[key];
     if (dq.size() >= max_idle_per_upstream()) {
@@ -37,8 +48,8 @@ void ConnectionPool::checkin(const std::string& host, int port, PooledConnection
     dq.push_back(std::move(conn));
 }
 
-void ConnectionPool::invalidate(const std::string& host, int port) {
-    const std::string key = host + ":" + std::to_string(port);
+void ConnectionPool::invalidate(const std::string& host, int port, const std::string& scheme) {
+    const std::string key = pool_key(host, port, scheme);
     std::lock_guard<std::mutex> lock(mutex_);
     idle_.erase(key);
 }

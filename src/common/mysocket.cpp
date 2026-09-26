@@ -1,8 +1,10 @@
 #include "mysocket.h"
 #include <unistd.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/x509_vfy.h>
 
 
 using namespace std;
@@ -203,6 +205,20 @@ bool Socket::initSSL(SSL_CTX* ctx) {
   return true;
 }
 
+bool Socket::initSSLClient(SSL_CTX* ctx, const std::string& hostname) {
+  if (!initSSL(ctx)) return false;
+  if (hostname.empty()) return true;
+  // SNI carries a DNS name only; sending it for an IP literal is not valid.
+  in_addr probe{};
+  if (inet_pton(AF_INET, hostname.c_str(), &probe) != 1) {
+    SSL_set_tlsext_host_name(ssl_, hostname.c_str());
+  }
+  // Certificate name check. This only takes effect when the context has
+  // SSL_VERIFY_PEER set, so the caller must configure that first.
+  SSL_set1_host(ssl_, hostname.c_str());
+  return true;
+}
+
 bool Socket::sslAccept() {
   int ret = SSL_accept(ssl_);
   if (ret == 1) return true;
@@ -216,6 +232,39 @@ bool Socket::sslAccept() {
   return false;
 }
 
+SSLHandshakeStatus Socket::sslConnect() {
+  ERR_clear_error();
+  int ret = SSL_connect(ssl_);
+  if (ret == 1) {
+    last_want_ = SSLWant::NONE;
+    return SSLHandshakeStatus::COMPLETE;
+  }
+  int err = SSL_get_error(ssl_, ret);
+  if (err == SSL_ERROR_WANT_READ) {
+    last_want_ = SSLWant::READ;
+    return SSLHandshakeStatus::WANT_READ;
+  }
+  if (err == SSL_ERROR_WANT_WRITE) {
+    last_want_ = SSLWant::WRITE;
+    return SSLHandshakeStatus::WANT_WRITE;
+  }
+  last_want_ = SSLWant::NONE;
+  // A failed verification is by far the most common cause here, and the generic
+  // error string alone ("certificate verify failed") does not say why.
+  long verify = SSL_get_verify_result(ssl_);
+  std::string reason = ERR_error_string(ERR_get_error(), nullptr);
+  if (verify != X509_V_OK) {
+    reason += ": ";
+    reason += X509_verify_cert_error_string(verify);
+  }
+  Logger::get()->error("SSL_connect failed: {}", reason);
+  return SSLHandshakeStatus::FAILED;
+}
+
+SSLWant Socket::last_ssl_want() const {
+  return last_want_;
+}
+
 void Socket::closeSSL() {
     if (ssl_) {
         SSL_shutdown(ssl_);
@@ -226,33 +275,90 @@ void Socket::closeSSL() {
 }
 
 ssize_t Socket::sslRead(char* buf, size_t size) {
+    // The OpenSSL error queue is per-thread: a failure on one SSL object
+    // (e.g. an aborted upstream handshake) would otherwise be picked up by
+    // SSL_get_error on the NEXT object this thread touches and misreport a
+    // plain WANT_READ as a fatal error.
+    ERR_clear_error();
     int n = SSL_read(ssl_, buf, size);
-    if (n > 0) return n;
+    if (n > 0) {
+        last_want_ = SSLWant::NONE;
+        return n;
+    }
     int err = SSL_get_error(ssl_, n);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+    if (err == SSL_ERROR_WANT_READ) {
+        last_want_ = SSLWant::READ;
         errno = EAGAIN;
         return -1;
     }
-    if (err == SSL_ERROR_ZERO_RETURN) {
-        return 0;  // peer closed
+    if (err == SSL_ERROR_WANT_WRITE) {
+        last_want_ = SSLWant::WRITE;
+        errno = EAGAIN;
+        return -1;
     }
-    // other errors
+    last_want_ = SSLWant::NONE;
+    if (err == SSL_ERROR_ZERO_RETURN) {
+        return 0;  // peer sent close_notify
+    }
+    // The peer closed the TCP connection without close_notify. Strictly that is a
+    // protocol violation, but close_notify exists to expose truncation, and every
+    // caller here frames its own messages (Content-Length / chunked), which
+    // detects truncation anyway. Failing instead would reject perfectly good
+    // exchanges with the many HTTP stacks that never send close_notify.
+    // OpenSSL 3.0 reports this as SSL_ERROR_SSL + SSL_R_UNEXPECTED_EOF_WHILE_READING;
+    // OpenSSL 1.1.1 as SSL_ERROR_SYSCALL with a 0 return and an empty error queue.
+    unsigned long code = ERR_peek_error();
+    if (err == SSL_ERROR_SYSCALL && n == 0 && code == 0) {
+        return 0;
+    }
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    if (err == SSL_ERROR_SSL && code != 0 &&
+        ERR_GET_REASON(code) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        Logger::get()->debug("peer closed without close_notify; treating as end of stream");
+        return 0;
+    }
+#endif
+    // Genuine protocol errors (bad record MAC, handshake failure, ...) stay fatal.
     Logger::get()->error("SSL_read error: {}", ERR_error_string(ERR_get_error(), nullptr));
     errno = EIO;
     return -1;
 }
 
 ssize_t Socket::sslWrite(char* buf, size_t size) {
+    ERR_clear_error();  // same per-thread queue concern as sslRead
     int n = SSL_write(ssl_, buf, size);
-    if (n > 0) return n;
+    if (n > 0) {
+        last_want_ = SSLWant::NONE;
+        return n;
+    }
     int err = SSL_get_error(ssl_, n);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+    if (err == SSL_ERROR_WANT_READ) {
+        last_want_ = SSLWant::READ;
         errno = EAGAIN;
         return -1;
     }
+    if (err == SSL_ERROR_WANT_WRITE) {
+        last_want_ = SSLWant::WRITE;
+        errno = EAGAIN;
+        return -1;
+    }
+    last_want_ = SSLWant::NONE;
     Logger::get()->error("SSL_write error: {}", ERR_error_string(ERR_get_error(), nullptr));
     errno = EIO;
     return -1;
+}
+
+bool Socket::sslAlive() {
+    char c;
+    ERR_clear_error();
+    // SSL_peek (unlike recv) leaves anything read available for the next
+    // SSL_read, so a probe can never consume the peer's bytes.
+    const int n = SSL_peek(ssl_, &c, 1);
+    if (n > 0) return true;
+    const int err = SSL_get_error(ssl_, n);
+    // ZERO_RETURN = close_notify, SSL_ERROR_SSL = e.g. unexpected EOF (OpenSSL 3),
+    // SSL_ERROR_SYSCALL = bare FIN — all mean the pooled session is dead.
+    return err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
 }
 
 bool Socket::get_is_ssl_() {

@@ -1,6 +1,8 @@
 #include "http_client.h"
 #include "connection_pool.h"
+#include "client_tls.h"
 #include "mysocket.h"
+#include "mylogger.h"
 #include "poller.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -13,6 +15,34 @@
 #include <stdexcept>
 
 namespace {
+
+// Per-upstream SSL_CTX cache, keyed by the verification policy (not by
+// host): building a context loads the CA material and pays ECDH setup, so
+// it must not happen per request. Contexts live until process exit, like
+// global_connection_pool().
+SSL_CTX* get_upstream_ssl_ctx(const UpstreamTlsOptions& tls) {
+    static std::mutex mu;
+    static std::unordered_map<std::string, SSL_CTX*> cache;
+    const std::string key =
+        std::string(tls.skip_verify ? "1|" : "0|") + tls.ca_file + "|" + tls.server_name;
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    ClientTlsConfig cfg;
+    cfg.enable_tls = true;
+    cfg.insecure = tls.skip_verify;
+    cfg.ca_path = tls.ca_file;      // empty → system default trust store
+    cfg.verify_host = tls.server_name;  // empty → chain-only verification
+    std::string error;
+    SSL_CTX* ctx = build_client_ssl_ctx(cfg, &error);
+    if (!ctx) {
+        Logger::get()->error("upstream TLS: {}", error);
+        return nullptr;
+    }
+    cache[key] = ctx;
+    return ctx;
+}
 
 BackendResponse make_error_response(int status_code, BackendError error, const std::string& body) {
     BackendResponse response;
@@ -123,15 +153,22 @@ bool should_retry_backend_request(const std::string& method,
 namespace {
 enum class SendResult { Ok, Timeout, Failed };
 
-SendResult send_all(Socket& sock, const std::string& request, int timeout_ms) {
+SendResult send_all(Socket& sock, bool is_ssl, const std::string& request, int timeout_ms) {
     size_t sent = 0;
     while (sent < request.size()) {
-        const auto wait_result = Poller::wait(sock.getFd(), Poller::Event::Write, timeout_ms);
+        // TLS can ask for a read mid-write (protocol housekeeping), so the
+        // poll direction follows last_ssl_want(); plaintext always wants write.
+        const Poller::Event event = (is_ssl && sock.last_ssl_want() == SSLWant::READ)
+                                        ? Poller::Event::Read : Poller::Event::Write;
+        const auto wait_result = Poller::wait(sock.getFd(), event, timeout_ms);
         if (wait_result == Poller::WaitResult::Timeout) return SendResult::Timeout;
         if (wait_result != Poller::WaitResult::Ready) return SendResult::Failed;
-        const ssize_t written = sock.send(request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+        const ssize_t written = is_ssl
+            ? sock.sslWrite(const_cast<char*>(request.data() + sent), request.size() - sent)
+            : sock.send(request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
         if (written < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN) continue;  // WANT_READ/WANT_WRITE; re-poll with the right direction
             return SendResult::Failed;
         }
         if (written == 0) return SendResult::Failed;
@@ -146,13 +183,18 @@ BackendResponse forward_request(const std::string& host, int port,
                                 const std::string& path,
                                 const std::unordered_map<std::string, std::string>& req_headers,
                                 const std::string& req_body,
-                                int timeout_ms) {
+                                int timeout_ms,
+                                const UpstreamTlsOptions& tls) {
     if (timeout_ms <= 0) {
         return make_error_response(504, BackendError::ConnectTimeout, "Gateway Timeout");
     }
 
     ConnectionPool& pool = global_connection_pool();
     const bool idempotent = method == "GET" || method == "HEAD" || method == "OPTIONS";
+    // Pool identity includes the verification policy: a session verified for
+    // one server name is only reusable by upstreams with the same policy.
+    const std::string pool_scheme = !tls.enable ? ""
+        : tls.skip_verify ? "tls/insecure|" : "tls/" + tls.server_name + "|";
 
     // Two rounds: first try a pooled keep-alive connection (it may have been
     // closed by the backend while idle), then a brand-new connection. Failures
@@ -166,17 +208,23 @@ BackendResponse forward_request(const std::string& host, int port,
         Socket* upstream_socket = nullptr;
         bool used_pooled = false;
 
-        if (attempt == 0) pooled = pool.checkout(host, port);
+        if (attempt == 0) pooled = pool.checkout(host, port, tls.enable);
         if (pooled) {
             // Liveness probe (0-timeout): a closed pooled socket shows up as
             // immediately readable with EOF. This catches the stale-connection
             // race up front, before anything is sent — safe for every method.
+            // TLS sessions are probed with SSL_peek: a raw recv MSG_PEEK could
+            // not tell a close_notify alert record apart from app data.
             const auto ready = Poller::wait(pooled->socket->getFd(), Poller::Event::Read, 0);
             if (ready == Poller::WaitResult::Ready) {
-                char peek;
-                if (pooled->socket->recv(&peek, 1, MSG_PEEK) <= 0) {
-                    pooled.reset();  // backend closed it while idle; use a fresh one
+                bool alive;
+                if (pooled->socket->get_is_ssl_()) {
+                    alive = pooled->socket->sslAlive();
+                } else {
+                    char peek;
+                    alive = pooled->socket->recv(&peek, 1, MSG_PEEK) > 0;
                 }
+                if (!alive) pooled.reset();  // backend closed it while idle; use a fresh one
             }
         }
         if (pooled) {
@@ -208,6 +256,29 @@ BackendResponse forward_request(const std::string& host, int port,
                     return resp;
                 }
             }
+            // TLS handshake on the fresh connection: SSL_connect drives the
+            // state machine step by step, each incomplete step re-arms the
+            // poller in the direction the SSL layer asked for (WANT_READ or
+            // WANT_WRITE). A verification failure lands in FAILED and 502s.
+            if (tls.enable) {
+                SSL_CTX* ctx = get_upstream_ssl_ctx(tls);
+                if (!ctx) return resp;
+                if (!fresh->initSSLClient(ctx, tls.server_name)) return resp;
+                bool handshake_ok = false;
+                for (;;) {
+                    const auto status = fresh->sslConnect();
+                    if (status == SSLHandshakeStatus::COMPLETE) { handshake_ok = true; break; }
+                    if (status == SSLHandshakeStatus::FAILED) return resp;
+                    const Poller::Event event = status == SSLHandshakeStatus::WANT_READ
+                                                    ? Poller::Event::Read : Poller::Event::Write;
+                    const auto wait_result = Poller::wait(fresh->getFd(), event, timeout_ms);
+                    if (wait_result == Poller::WaitResult::Timeout) {
+                        return make_error_response(504, BackendError::ConnectTimeout, "Gateway Timeout");
+                    }
+                    if (wait_result != Poller::WaitResult::Ready) return resp;
+                }
+                if (!handshake_ok) return resp;
+            }
             upstream_socket = &*fresh;
         }
 
@@ -225,17 +296,18 @@ BackendResponse forward_request(const std::string& host, int port,
         }
         req_stream << "\r\n" << req_body;
 
-        const SendResult send_result = send_all(*upstream_socket, req_stream.str(), timeout_ms);
+        const SendResult send_result =
+            send_all(*upstream_socket, upstream_socket->get_is_ssl_(), req_stream.str(), timeout_ms);
         if (send_result == SendResult::Timeout) {
             if (used_pooled) {
-                pool.invalidate(host, port);
+                pool.invalidate(host, port, tls.enable);
                 if (idempotent) continue;  // request already (partially) sent
             }
             return make_error_response(504, BackendError::WriteTimeout, "Gateway Timeout");
         }
         if (send_result == SendResult::Failed) {
             if (used_pooled) {
-                pool.invalidate(host, port);  // stale pooled socket
+                pool.invalidate(host, port, tls.enable);  // stale pooled socket
                 if (idempotent) continue;
             }
             return resp;
@@ -304,11 +376,16 @@ BackendResponse forward_request(const std::string& host, int port,
                 }
             }
 
+            const bool is_ssl = upstream_socket->get_is_ssl_();
+            // TLS renegotiation can request a write mid-read, so the poll
+            // direction follows last_ssl_want() like the send path does.
+            const Poller::Event event = (is_ssl && upstream_socket->last_ssl_want() == SSLWant::WRITE)
+                                            ? Poller::Event::Write : Poller::Event::Read;
             const auto wait_result =
-                Poller::wait(upstream_socket->getFd(), Poller::Event::Read, timeout_ms);
+                Poller::wait(upstream_socket->getFd(), event, timeout_ms);
             if (wait_result == Poller::WaitResult::Timeout) {
                 if (used_pooled) {
-                    pool.invalidate(host, port);
+                    pool.invalidate(host, port, tls.enable);
                     if (idempotent) {
                         stale_pooled = true;
                         break;
@@ -321,9 +398,11 @@ BackendResponse forward_request(const std::string& host, int port,
             }
             {
                 char buf[65536];
-                const ssize_t n = upstream_socket->recv(buf, sizeof(buf), 0);
+                const ssize_t n = is_ssl ? upstream_socket->sslRead(buf, sizeof(buf))
+                                         : upstream_socket->recv(buf, sizeof(buf), 0);
                 if (n < 0) {
                     if (errno == EINTR) continue;
+                    if (errno == EAGAIN) continue;  // WANT_*; re-poll in the right direction
                     break;  // read failed
                 }
                 if (n == 0) {
@@ -345,7 +424,7 @@ BackendResponse forward_request(const std::string& host, int port,
 
         if (!complete || framing_error) {
             if (used_pooled) {
-                pool.invalidate(host, port);
+                pool.invalidate(host, port, tls.enable);
                 if (attempt == 0 && idempotent) {
                     continue;  // stale/invalid pooled socket; retry on a fresh one
                 }
@@ -402,12 +481,12 @@ BackendResponse forward_request(const std::string& host, int port,
         if (response_uses_keepalive && !peer_closed) {
             if (used_pooled) {
                 pooled->leftover = response.substr(body_end);
-                pool.checkin(host, port, std::move(*pooled));
+                pool.checkin(host, port, tls.enable, std::move(*pooled));
             } else {
                 ConnectionPool::PooledConnection conn;
                 conn.socket = std::make_shared<Socket>(std::move(*fresh));
                 conn.leftover = response.substr(body_end);
-                pool.checkin(host, port, std::move(conn));
+                pool.checkin(host, port, tls.enable, std::move(conn));
             }
         }
 

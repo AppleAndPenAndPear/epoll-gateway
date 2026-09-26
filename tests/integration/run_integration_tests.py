@@ -20,6 +20,7 @@ Covered scenarios (ROADMAP P1):
   12. Corrupt config reload rejected, old config kept
   13. /metrics endpoint
   14. Chunked responses
+  15. Upstream TLS: https:// backend, hostname verification (positive/negative)
 
 Only depends on the Python3 standard library and the built server binary.
 """
@@ -39,6 +40,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_BIN = os.path.join(REPO, "build", "server")
+CLIENT_BIN = os.path.join(REPO, "build", "client")
 MOCK_BACKEND = os.path.join(HERE, "mock_backend.py")
 
 SERVER_PORT = 5605
@@ -46,6 +48,7 @@ BACKEND_A = 5611   # Failover test node 1 (will be killed)
 BACKEND_B = 5612   # Failover test node 2 (stays alive)
 BACKEND_FAIL = 5613  # Circuit breaker test backend (can be switched to reject via a control file)
 BACKEND_LIMIT = 5614  # Rate limit test backend
+BACKEND_TLS = 5616   # TLS test backend (https upstream)
 
 BASE = "127.0.0.1"
 ADMIN_PORT = 5615   # Admin API listener (separate from the data plane)
@@ -128,6 +131,18 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_ke
          "target_type": "upstream",
          "upstream_target": {"name": "limit", "timeout_ms": 3000},
          "auth_required": True, "allowed_api_keys": ["limited-key-1", "burst-key-1"]},
+        {"name": "proxy-tls", "method": "GET", "path": "/api/tls/*",
+         "target_type": "upstream",
+         "upstream_target": {"name": "tls_single", "timeout_ms": 3000},
+         "auth_required": False, "allow_anonymous": True},
+        {"name": "proxy-tls-bad", "method": "GET", "path": "/api/tls-bad/*",
+         "target_type": "upstream",
+         "upstream_target": {"name": "tls_bad", "timeout_ms": 3000},
+         "auth_required": False, "allow_anonymous": True},
+        {"name": "proxy-tls-insecure", "method": "GET", "path": "/api/tls-insecure/*",
+         "target_type": "upstream",
+         "upstream_target": {"name": "tls_insecure", "timeout_ms": 3000},
+         "auth_required": False, "allow_anonymous": True},
     ]
     if with_reloaded_route:
         routes.append(
@@ -152,6 +167,23 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_ke
                        "algorithm": "round_robin"},
             "limit": {"servers": [{"host": BASE, "port": BACKEND_LIMIT}],
                       "algorithm": "round_robin"},
+            # https:// scheme in the host enables upstream TLS. tls_single pins
+            # the name to the cert's CN (localhost); tls_bad uses a name the
+            # certificate does not carry and must fail verification; tls_insecure
+            # exercises the documented skip-verify escape hatch with that same
+            # bad name and must succeed.
+            "tls_single": {"servers": [{"host": "https://" + BASE, "port": BACKEND_TLS,
+                                        "tls_ca_file": "certs/server.crt",
+                                        "tls_server_name": "localhost"}],
+                           "algorithm": "round_robin"},
+            "tls_bad": {"servers": [{"host": "https://" + BASE, "port": BACKEND_TLS,
+                                     "tls_ca_file": "certs/server.crt",
+                                     "tls_server_name": "wrong.example.com"}],
+                        "algorithm": "round_robin"},
+            "tls_insecure": {"servers": [{"host": "https://" + BASE, "port": BACKEND_TLS,
+                                          "tls_skip_verify": True,
+                                          "tls_server_name": "wrong.example.com"}],
+                             "algorithm": "round_robin"},
         },
         "upstream_health_check_timeout_ms": 300,
         "routes": routes,
@@ -204,6 +236,28 @@ def peer_cert_fingerprint():
         return None
 
 
+def test_upstream_tls():
+    print("\n[16] Upstream TLS (https:// backend, hostname verification)")
+    # Positive: the gateway completes a client-side TLS handshake with the
+    # backend, verifies its certificate against tls_ca_file, and forwards.
+    status, _, body = request("/api/tls/hello")
+    check("https upstream 200", status == 200, "got %s %r" % (status, body[:120]))
+    ok = status == 200 and ("127.0.0.1:%d" % BACKEND_TLS).encode() in body
+    check("https upstream hit the TLS backend", bool(ok), body[:120])
+    # A second round trip exercises the pooled TLS connection (SSL_peek probe
+    # + connection reuse must work with the TLS session intact).
+    status, _, body = request("/api/tls/again")
+    check("https upstream 200 on pooled connection", status == 200,
+          "got %s %r" % (status, body[:120]))
+    # Negative: certificate does not carry the configured server name —
+    # verification must fail and the gateway must answer 502, never downgrade.
+    status, _, _ = request("/api/tls-bad/hello")
+    check("hostname mismatch rejected with 502", status == 502, "got %s" % status)
+    # Escape hatch: tls_skip_verify disables verification entirely.
+    status, _, _ = request("/api/tls-insecure/hello")
+    check("tls_skip_verify reaches the backend", status == 200, "got %s" % status)
+
+
 def test_tls_cert_hot_reload(ws_dir):
     print("\n[16] TLS certificate hot reload")
     if shutil.which("openssl") is None:
@@ -245,6 +299,34 @@ def test_tls_cert_hot_reload(ws_dir):
 
 
 # ──────────────────────────── Test cases ────────────────────────────
+
+def test_companion_client():
+    print("\n[15b] Companion C++ client (TLS + certificate verification)")
+    if not os.path.exists(CLIENT_BIN):
+        print("  SKIP: %s not built" % CLIENT_BIN)
+        return
+
+    ca = os.path.join(REPO, "certs", "server.crt")
+    # The bundled certificate has CN=localhost and no SAN, so this is the only
+    # name that verifies against the repo CA
+    good = subprocess.run(
+        [CLIENT_BIN, "--host", "localhost", "--port", str(SERVER_PORT),
+         "--path", "/", "--ca", ca],
+        cwd=REPO, capture_output=True, timeout=30)
+    check("client exits 0 on a verified response", good.returncode == 0,
+          "rc=%s stderr=%s" % (good.returncode, good.stderr[-200:]))
+    check("client received HTTP 200", b"HTTP/1.1 200" in good.stdout,
+          "stdout=%s" % good.stdout[:120])
+
+    # An IP literal can never match CN, so this proves the hostname check is
+    # really enabled (SSL_set1_host is a no-op without SSL_VERIFY_PEER)
+    bad = subprocess.run(
+        [CLIENT_BIN, "--host", "127.0.0.1", "--port", str(SERVER_PORT),
+         "--path", "/", "--ca", ca],
+        cwd=REPO, capture_output=True, timeout=30)
+    check("hostname mismatch is rejected", bad.returncode != 0,
+          "rc=%s stdout=%s" % (bad.returncode, bad.stdout[:120]))
+
 
 def test_tls_and_static():
     print("\n[1] TLS handshake + static files")
@@ -653,8 +735,8 @@ def main():
     fail_control_dir = tempfile.mkdtemp(prefix="epoll-mock-fail-")
 
     try:
-        def start_mock(port):
-            p = subprocess.Popen([sys.executable, MOCK_BACKEND, str(port), fail_control_dir],
+        def start_mock(port, *extra):
+            p = subprocess.Popen([sys.executable, MOCK_BACKEND, str(port), fail_control_dir, *extra],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             mock_procs.append(p)
             return p
@@ -663,12 +745,15 @@ def main():
         start_mock(BACKEND_B)
         start_mock(BACKEND_FAIL)
         start_mock(BACKEND_LIMIT)
+        start_mock(BACKEND_TLS,
+                   os.path.join(REPO, "certs", "server.crt"),
+                   os.path.join(REPO, "certs", "server.key"))
         # Wait for each mock to actually bind instead of sleeping a fixed time.
         # The server starts accepting right after this, so any proxy test that
         # runs before a backend is listening sees a refused upstream connection
         # and fails with an intermittent 502 (the backend probe connection is
         # counted, but test_connection_reuse snapshots the counter later).
-        for port in (BACKEND_A, BACKEND_B, BACKEND_FAIL, BACKEND_LIMIT):
+        for port in (BACKEND_A, BACKEND_B, BACKEND_FAIL, BACKEND_LIMIT, BACKEND_TLS):
             if not wait_for_port(port):
                 print("mock backend on port %d never came up" % port)
                 return 1
@@ -699,6 +784,7 @@ def main():
         test_proxy()
         test_connection_reuse(fail_control_dir)
         test_chunked_trailer()
+        test_upstream_tls()
         test_auth()
         test_rate_limit()
         test_failover(kill_backend_a)
@@ -710,6 +796,7 @@ def main():
         test_ops_endpoints()
         test_rate_limit_exemption()
         test_tls_hardening()
+        test_companion_client()
         test_tls_cert_hot_reload(ws)
         test_admin_api(ws)
 

@@ -7,10 +7,10 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 ## Current Validation
 
 - C++17 Release build passes.
-- CTest: 91/91 passing.
-- Integration tests: 69/69 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
-- Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening, connection-pool reuse and eviction, upstream health/circuit status snapshots.
-- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
+- CTest: 101/101 passing.
+- Integration tests: 77/77 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots.
+- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
 - Deployment: [DEPLOYMENT.md](DEPLOYMENT.md) — systemd unit, rolling upgrade with graceful drain, admin API usage.
 - Debug builds support AddressSanitizer.
@@ -147,7 +147,7 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 
 ### 9. Testing and Engineering
 
-- Google Test suite currently 91/91 passing.
+- Google Test suite currently 101/101 passing.
 - Covered:
 	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body
@@ -160,11 +160,13 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 	- Rate limiter and per-key isolation
 	- Config schema validation
 	- TLS context builder hardening
+	- Shared TLS hardening policy (minimum version, AEAD whitelist, compression off) for both server and client contexts
+	- Companion client TLS context (CA file required, rejection of a missing/empty CA, `--insecure` bypass)
 	- Connection pool reuse, bucketing, idle eviction, cap truncation, invalidation
 	- Upstream timeouts, connection failures, and idempotent retries
 	- Upstream health checks
 	- Circuit breaker open/reject/recovery probing
-- Integration suite (42 assertions) proves end-to-end behavior including connection reuse and TLS policy.
+- Integration suite (72 assertions) proves end-to-end behavior including connection reuse, TLS policy, and the companion client's certificate/hostname verification.
 - Benchmark harness `scripts/benchmark/run_benchmark.sh` + report in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Request Flow

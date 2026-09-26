@@ -22,16 +22,22 @@ public:
         std::chrono::steady_clock::time_point last_used;
     };
 
-    // Returns an idle connection for host:port, or nullopt when none is
-    // available. Expired entries are evicted lazily on checkout.
-    std::optional<PooledConnection> checkout(const std::string& host, int port);
+    // Returns an idle connection for the upstream identified by
+    // (scheme, host, port), or nullopt when none is available. Expired
+    // entries are evicted lazily on checkout. The scheme doubles as the
+    // verification identity: a TLS connection checked under "tls/localhost"
+    // was validated for that name and must never be reused by an upstream
+    // that verified a different name (or skipped verification).
+    std::optional<PooledConnection> checkout(const std::string& host, int port,
+                                             const std::string& scheme);
 
     // Returns a healthy keep-alive connection to the pool. Anything beyond
     // max_idle_per_upstream() for that upstream is dropped (closed).
-    void checkin(const std::string& host, int port, PooledConnection conn);
+    void checkin(const std::string& host, int port, const std::string& scheme,
+                 PooledConnection conn);
 
     // Drops a connection that is suspected broken (send/read error, peer close).
-    void invalidate(const std::string& host, int port);
+    void invalidate(const std::string& host, int port, const std::string& scheme);
 
     static constexpr size_t max_idle_per_upstream() { return 16; }
     static constexpr std::chrono::seconds idle_timeout() { return std::chrono::seconds(60); }

@@ -34,48 +34,67 @@ TEST(ConnectionPoolTest, CheckoutReturnsCheckedInConnection) {
     auto conn = make_conn();
     int fd = conn.socket->getFd();
 
-    pool.checkin("backend", 8080, std::move(conn));
-    auto out = pool.checkout("backend", 8080);
+    pool.checkin("backend", 8080, "", std::move(conn));
+    auto out = pool.checkout("backend", 8080, "");
     ASSERT_TRUE(out.has_value());
     EXPECT_EQ(out->socket->getFd(), fd);
 
     // pool is empty again
-    EXPECT_FALSE(pool.checkout("backend", 8080).has_value());
+    EXPECT_FALSE(pool.checkout("backend", 8080, "").has_value());
 }
 
 TEST(ConnectionPoolTest, KeysAreSeparatedByHostPort) {
     ConnectionPool pool;
-    pool.checkin("backend", 8080, make_conn());
+    pool.checkin("backend", 8080, "", make_conn());
 
-    EXPECT_FALSE(pool.checkout("backend", 9090).has_value());
-    EXPECT_FALSE(pool.checkout("other", 8080).has_value());
-    EXPECT_TRUE(pool.checkout("backend", 8080).has_value());
+    EXPECT_FALSE(pool.checkout("backend", 9090, "").has_value());
+    EXPECT_FALSE(pool.checkout("other", 8080, "").has_value());
+    EXPECT_TRUE(pool.checkout("backend", 8080, "").has_value());
+}
+
+TEST(ConnectionPoolTest, KeysAreSeparatedByScheme) {
+    // Same host:port must not leak a plaintext connection to an https
+    // upstream (or vice versa): the scheme is part of the pool key.
+    ConnectionPool pool;
+    pool.checkin("backend", 8080, "", make_conn());
+
+    EXPECT_FALSE(pool.checkout("backend", 8080, "tls/localhost").has_value());
+
+    pool.checkin("backend", 8080, "tls/localhost", make_conn());
+    EXPECT_TRUE(pool.checkout("backend", 8080, "tls/localhost").has_value());
+    EXPECT_TRUE(pool.checkout("backend", 8080, "").has_value());
+
+    // Two different verification names on the same host:port are also
+    // distinct pools: a session validated for "a" must not serve "b".
+    pool.checkin("backend", 8080, "tls/a|", make_conn());
+    EXPECT_FALSE(pool.checkout("backend", 8080, "tls/b|").has_value());
+    EXPECT_TRUE(pool.checkout("backend", 8080, "tls/a|").has_value());
 }
 
 TEST(ConnectionPoolTest, IdleTimeoutEvictsEntries) {
     ConnectionPool pool;
     pool.set_idle_timeout_for_testing(std::chrono::seconds(0));
-    pool.checkin("backend", 8080, make_conn());
+    pool.checkin("backend", 8080, "", make_conn());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    EXPECT_FALSE(pool.checkout("backend", 8080).has_value());
+    EXPECT_FALSE(pool.checkout("backend", 8080, "").has_value());
 }
 
 TEST(ConnectionPoolTest, MaxIdlePerUpstreamDropsExcess) {
     ConnectionPool pool;
     for (size_t i = 0; i <= ConnectionPool::max_idle_per_upstream(); ++i) {
-        pool.checkin("backend", 8080, make_conn());
+        pool.checkin("backend", 8080, "", make_conn());
     }
     // exactly max entries survive; checking them all out empties the bucket
     size_t found = 0;
-    while (pool.checkout("backend", 8080).has_value()) ++found;
+    while (pool.checkout("backend", 8080, "").has_value()) ++found;
     EXPECT_EQ(found, ConnectionPool::max_idle_per_upstream());
 }
 
 TEST(ConnectionPoolTest, InvalidateDropsAllIdleEntries) {
     ConnectionPool pool;
-    pool.checkin("backend", 8080, make_conn());
-    pool.checkin("backend", 8080, make_conn());
-    pool.invalidate("backend", 8080);
-    EXPECT_FALSE(pool.checkout("backend", 8080).has_value());
+    pool.checkin("backend", 8080, "", make_conn());
+    pool.checkin("backend", 8080, "", make_conn());
+    pool.invalidate("backend", 8080, "");
+    EXPECT_FALSE(pool.checkout("backend", 8080, "").has_value());
 }

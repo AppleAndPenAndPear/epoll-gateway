@@ -16,9 +16,13 @@ public:
     std::string get_response() const;
 
     bool is_done() const;
+
+    // True only when a complete HTTP response was received
+    bool succeeded() const;
 private:
     enum State {
         CONNECTING,
+        TLS_HANDSHAKING,
         SENDING,
         RECEIVING,
         DONE,
@@ -28,4 +32,8 @@ private:
     std::string send_buf_;
     std::string recv_buf_;
     bool done_ = false;
+
+    void do_tls_handshake(Socket& sock, Epoll& epoll);
+    void do_send(Socket& sock, Epoll& epoll);
+    void do_receive(Socket& sock, Epoll& epoll);
 };

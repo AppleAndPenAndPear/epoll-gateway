@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mock upstream backend for integration tests.
 
-Usage: mock_backend.py <port> <control_dir>
+Usage: mock_backend.py <port> <control_dir> [cert key]
 
 Behavior:
 - Default: returns 200 + JSON for any request (with a backend marker used to
@@ -10,6 +10,7 @@ Behavior:
   the request, then closes without returning a response. The TCP health probe
   still passes (connect succeeds) but actual forwarding fails, driving the
   circuit breaker's consecutive failure count.
+- With a cert/key pair: serves TLS (for the gateway's https-upstream tests).
 """
 
 import http.server
@@ -20,6 +21,8 @@ import time
 
 PORT = int(sys.argv[1])
 CONTROL_DIR = sys.argv[2] if len(sys.argv) > 2 else ""
+CERT_PATH = sys.argv[3] if len(sys.argv) > 4 else ""
+KEY_PATH = sys.argv[4] if len(sys.argv) > 4 else ""
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -95,6 +98,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     server.allow_reuse_address = True
+    if CERT_PATH and KEY_PATH:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
 
 

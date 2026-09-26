@@ -1,6 +1,6 @@
 # Writing an API gateway from scratch in C++17: the threading model, control-plane separation, and three real bugs
 
-> A architecture retrospective, not a tutorial. Every number, bug and conclusion below comes from one real project ([epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)): a single-binary API gateway in C++17 with no etcd/Postgres/Redis runtime dependency. Code references point at real files, benchmark numbers come from `docs/BENCHMARKS.md`, and test counts are actual CI output (91 unit tests / 69 integration assertions).
+> A architecture retrospective, not a tutorial. Every number, bug and conclusion below comes from one real project ([epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)): a single-binary API gateway in C++17 with no etcd/Postgres/Redis runtime dependency. Code references point at real files, benchmark numbers come from `docs/BENCHMARKS.md`, and test counts are actual CI output (101 unit tests / 77 integration assertions).
 
 ## 1. Why write another gateway
 
@@ -162,7 +162,7 @@ But none of the three bugs above is unit-testable — they are products of real 
 - graceful shutdown is exercised with a connection mid-way through a 1.5 s request, which must still be served inside the drain window;
 - after admin key rotation, the old key gets 401 and the new key 200.
 
-Current state: **91 unit tests (CTest) + 69 integration assertions**, all through one `./ci.sh` that builds, runs unit tests and then integration; an AddressSanitizer build is also supported.
+Current state: **101 unit tests (CTest) + 77 integration assertions**, all through one `./ci.sh` that builds, runs unit tests and then integration; an AddressSanitizer build is also supported.
 
 ## 8. What is intentionally not done yet
 
@@ -177,7 +177,7 @@ Current state: **91 unit tests (CTest) + 69 integration assertions**, all throug
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                              # build + 91 unit tests + 69 integration assertions
+./ci.sh                              # build + 101 unit tests + 77 integration assertions
 scripts/benchmark/run_benchmark.sh   # wrk benchmark (15 s per scenario)
 ```
 

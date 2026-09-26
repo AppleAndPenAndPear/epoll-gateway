@@ -9,6 +9,8 @@ add_executable(runTests
     test_upstream_manager.cpp
     test_config_validation.cpp
     test_tls_context.cpp
+    test_tls_utils.cpp
+    test_client_tls.cpp
     ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
     ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
     ${CMAKE_SOURCE_DIR}/src/server/connection_pool.cpp
@@ -25,7 +27,10 @@ target_link_libraries(runTests PRIVATE
     GTest::Main       # Provides the main entry point
 )
 
-target_include_directories(runTests PRIVATE ${CMAKE_SOURCE_DIR}/include/server)
+target_include_directories(runTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/server
+    ${CMAKE_SOURCE_DIR}/include/client
+)
 
 include(GoogleTest)
 gtest_discover_tests(runTests)
