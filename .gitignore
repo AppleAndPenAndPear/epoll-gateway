@@ -21,6 +21,9 @@ __pycache__/
 .vscode/
 *.swp
 
+# 运行时日志
+logs/
+
 # 系统文件
 .DS_Store
 Thumbs.db
