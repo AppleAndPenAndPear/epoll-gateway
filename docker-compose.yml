@@ -7,7 +7,10 @@ services:
       - "5005:5005"
     volumes:
       - ./www:/app/www
-      - ./config.json:/app/config.json 
+      - ./config.json:/app/config.json
+      # TLS-only data plane: the keypair is generated locally
+      # (./scripts/gen_dev_certs.sh) and never baked into the image.
+      - ./certs:/app/certs:ro
 
   prometheus:
     image: prom/prometheus:latest

@@ -24,6 +24,9 @@ __pycache__/
 # 运行时日志
 logs/
 
+# 开发自签证书（由 scripts/gen_dev_certs.sh 生成，不入库）
+certs/
+
 # 系统文件
 .DS_Store
 Thumbs.db

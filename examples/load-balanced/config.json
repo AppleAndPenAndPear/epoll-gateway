@@ -1,0 +1,48 @@
+{
+    "port": 5005,
+    "backlog": 1024,
+    "num_workers": 2,
+    "www_root": "./www",
+    "thread_pool": {"min": 2, "max": 10, "scale_up": 2, "scale_down": 1},
+    "cache_max_entries": 1024,
+    "cache_max_file_size_mb": 1,
+    "keepalive_timeout": 5,
+    "tls": {
+        "cert_path": "certs/server.crt",
+        "key_path": "certs/server.key"
+    },
+    "admin": {
+        "enabled": true,
+        "port": 8105,
+        "bind": "127.0.0.1",
+        "api_keys": ["admin-demo-key"]
+    },
+    "rate_limit": {
+        "capacity": 20,
+        "refill_per_second": 10
+    },
+    "upstreams": {
+        "demo-service": {
+            "servers": [
+                {"host": "127.0.0.1", "port": 8091},
+                {"host": "127.0.0.1", "port": 8092}
+            ],
+            "algorithm": "round_robin"
+        }
+    },
+    "routes": [
+        {
+            "name": "demo-api",
+            "method": "GET",
+            "path": "/demo/*",
+            "auth_required": false,
+            "upstream_target": {
+                "name": "demo-service",
+                "timeout_ms": 5000
+            }
+        }
+    ],
+    "api_keys": [
+        {"key": "test-key-123", "name": "Test Client"}
+    ]
+}

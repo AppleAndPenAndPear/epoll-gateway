@@ -307,8 +307,8 @@ def test_companion_client():
         return
 
     ca = os.path.join(REPO, "certs", "server.crt")
-    # The bundled certificate has CN=localhost and no SAN, so this is the only
-    # name that verifies against the repo CA
+    # The generated dev certificate carries CN=localhost and SAN DNS:localhost,
+    # so "localhost" is the only name that verifies against the repo CA
     good = subprocess.run(
         [CLIENT_BIN, "--host", "localhost", "--port", str(SERVER_PORT),
          "--path", "/", "--ca", ca],

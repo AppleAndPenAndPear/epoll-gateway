@@ -208,7 +208,7 @@ BackendResponse forward_request(const std::string& host, int port,
         Socket* upstream_socket = nullptr;
         bool used_pooled = false;
 
-        if (attempt == 0) pooled = pool.checkout(host, port, tls.enable);
+        if (attempt == 0) pooled = pool.checkout(host, port, pool_scheme);
         if (pooled) {
             // Liveness probe (0-timeout): a closed pooled socket shows up as
             // immediately readable with EOF. This catches the stale-connection
@@ -300,14 +300,14 @@ BackendResponse forward_request(const std::string& host, int port,
             send_all(*upstream_socket, upstream_socket->get_is_ssl_(), req_stream.str(), timeout_ms);
         if (send_result == SendResult::Timeout) {
             if (used_pooled) {
-                pool.invalidate(host, port, tls.enable);
+                pool.invalidate(host, port, pool_scheme);
                 if (idempotent) continue;  // request already (partially) sent
             }
             return make_error_response(504, BackendError::WriteTimeout, "Gateway Timeout");
         }
         if (send_result == SendResult::Failed) {
             if (used_pooled) {
-                pool.invalidate(host, port, tls.enable);  // stale pooled socket
+                pool.invalidate(host, port, pool_scheme);  // stale pooled socket
                 if (idempotent) continue;
             }
             return resp;
@@ -385,7 +385,7 @@ BackendResponse forward_request(const std::string& host, int port,
                 Poller::wait(upstream_socket->getFd(), event, timeout_ms);
             if (wait_result == Poller::WaitResult::Timeout) {
                 if (used_pooled) {
-                    pool.invalidate(host, port, tls.enable);
+                    pool.invalidate(host, port, pool_scheme);
                     if (idempotent) {
                         stale_pooled = true;
                         break;
@@ -424,7 +424,7 @@ BackendResponse forward_request(const std::string& host, int port,
 
         if (!complete || framing_error) {
             if (used_pooled) {
-                pool.invalidate(host, port, tls.enable);
+                pool.invalidate(host, port, pool_scheme);
                 if (attempt == 0 && idempotent) {
                     continue;  // stale/invalid pooled socket; retry on a fresh one
                 }
@@ -481,12 +481,12 @@ BackendResponse forward_request(const std::string& host, int port,
         if (response_uses_keepalive && !peer_closed) {
             if (used_pooled) {
                 pooled->leftover = response.substr(body_end);
-                pool.checkin(host, port, tls.enable, std::move(*pooled));
+                pool.checkin(host, port, pool_scheme, std::move(*pooled));
             } else {
                 ConnectionPool::PooledConnection conn;
                 conn.socket = std::make_shared<Socket>(std::move(*fresh));
                 conn.leftover = response.substr(body_end);
-                pool.checkin(host, port, tls.enable, std::move(conn));
+                pool.checkin(host, port, pool_scheme, std::move(conn));
             }
         }
 

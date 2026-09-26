@@ -4,6 +4,19 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-26
+
+### Added
+
+- First-run experience: a **5-minute quickstart** at the top of both READMEs — clone, `gen_dev_certs.sh`, `build.sh`, `start.sh`, then curl the built-in echo route, the ops endpoints, the key-protected admin API (401 without / 200 with `X-API-Key: admin-demo-key`) and `/metrics`, with no backend to start. The default `config.json` now ships an explicit `tls` section, an enabled admin listener for the auth demo, and no phantom upstreams (`/readyz` used to answer 503 out of the box because its upstream pointed at ports nothing listened on).
+- Runnable example scenarios under `examples/`: `load-balanced/` (two mock backends, round-robin alternating responses visible per request, health-check ejection on kill) and `tls-backend/` (verified `https://` upstream with `tls_ca_file` + `tls_server_name`, reusing the dev certificate). Both are copy-paste runnable against the mock backend from the integration suite.
+- `scripts/gen_dev_certs.sh`: generates the self-signed dev certificate (CN=localhost, SAN DNS:localhost only — deliberately no IP SAN so IP-literal connections still fail hostname verification, which the integration suite relies on to prove the check is enabled). `certs/` is now gitignored and the previously committed private key is out of the repository; `ci.sh` generates a keypair on demand, and the Docker quickstart mounts `./certs` read-only instead of baking keys into the image.
+- The server accepts an optional config path argument (`./build/server examples/load-balanced/config.json`) in addition to the cwd default. A failed config validation now also prints a summary line with the file name and error count.
+
+### Fixed
+
+- The previous release commit was cut without a final CI run and shipped code that did not compile: `http_client.cpp` still passed the old `bool` TLS flag to the connection pool whose signature had already moved to a `scheme` string (the file had been partially reverted by an outside edit between the last green run and the commit). All call sites now pass `pool_scheme`; the lesson is recorded — `./ci.sh` right before every commit, not just before the last one of a session.
+
 ## 2026-09-24
 
 ### Added

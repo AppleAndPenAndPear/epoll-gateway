@@ -12,32 +12,23 @@
     "cache_max_entries": 1024,
     "cache_max_file_size_mb": 1,
     "keepalive_timeout": 5,
-    "upstreams": {
-        "test-service": {
-            "servers": [
-                {"host": "127.0.0.1", "port": 8081},
-                {"host": "127.0.0.1", "port": 8082}
-            ],
-            "algorithm": "round_robin"
-        }
+    "tls": {
+        "cert_path": "certs/server.crt",
+        "key_path": "certs/server.key"
     },
-    "routes": [
-        {
-            "name": "test-service-api",
-            "method": "GET",
-            "path": "/api/test/*",
-            "upstream_target": {
-                "name": "test-service",
-                "timeout_ms": 5000
-            }
-        }
-    ],
+    "admin": {
+        "enabled": true,
+        "port": 8105,
+        "bind": "127.0.0.1",
+        "api_keys": ["admin-demo-key"]
+    },
     "rate_limit": {
-        "capacity": 5,
-        "refill_per_second": 1
+        "capacity": 20,
+        "refill_per_second": 10
     },
     "api_keys": [
         {"key": "test-key-123", "name": "Test Client", "rate_limit": {"capacity": 10, "refill_per_second": 3}},
         {"key": "premium-key-456", "name": "Premium Client", "rate_limit": {"capacity": 1000, "refill_per_second": 100}}
-    ]
+    ],
+    "routes": []
 }

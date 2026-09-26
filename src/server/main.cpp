@@ -15,7 +15,7 @@ void signal_handler(int signal) {
         config_reload_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
-int main(){
+int main(int argc, char** argv){
     // 1. Initialize logging (must be called first)
     Logger::Guard g("logs/epollserver.log");
     auto logger = Logger::get();
@@ -23,8 +23,11 @@ int main(){
     // Load the config file (falls back to defaults if missing), then validate it.
     // A config that fails validation aborts startup instead of silently running
     // on defaults (which could leave security policies unset).
+    // An optional argv[1] overrides the config path, e.g.
+    //   ./build/server examples/load-balanced/config.json
+    const char* config_path = argc > 1 ? argv[1] : "config.json";
     std::vector<std::string> config_errors;
-    Config config = Config::from_file("config.json", &config_errors);
+    Config config = Config::from_file(config_path, &config_errors);
     for (const std::string& e : Config::validate(config)) {
         config_errors.push_back(e);
     }
@@ -33,6 +36,8 @@ int main(){
             logger->error("Config validation failed: {}", e);
             std::cerr << "Config error: " << e << '\n';
         }
+        std::cerr << "Found " << config_errors.size() << " config error(s) in '"
+                  << config_path << "'; startup aborted.\n";
         return 1;
     }
 

@@ -26,6 +26,11 @@ do_unit() {
 
 do_integration() {
     echo "==> [3/3] Integration tests (starts the real server + mock upstream)"
+    # certs/ is not tracked by git; the TLS-only server (and the mock TLS
+    # upstream) need a dev keypair, so generate one on demand.
+    if [[ ! -f certs/server.crt || ! -f certs/server.key ]]; then
+        ./scripts/gen_dev_certs.sh
+    fi
     python3 tests/integration/run_integration_tests.py
 }
 

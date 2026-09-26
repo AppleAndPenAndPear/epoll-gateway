@@ -4,6 +4,45 @@
 
 基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 101/101 通过）、集成测试（77 项断言）及 AddressSanitizer 支持。
 
+## 5 分钟快速体验
+
+```bash
+git clone https://github.com/AppleAndPenAndPear/epoll-gateway
+cd epoll-gateway
+./scripts/gen_dev_certs.sh   # 生成自签开发证书（数据面仅 TLS）
+./build.sh                   # 或 ./ci.sh：构建并跑完整测试套件
+./start.sh                   # 网关监听 https://localhost:5005（Ctrl+C 停止）
+```
+
+不需要任何后端——内置路由开箱即答：
+
+```bash
+# Echo（内置路由，无需 upstream）：POST 任意 JSON，原样回显
+curl -sk -X POST https://localhost:5005/api/echo -H 'Content-Type: application/json' -d '{"hello":"gateway"}'
+# {"echo":{"hello":"gateway"}}
+
+# 运维端点（永久免鉴权）
+curl -sk https://localhost:5005/healthz
+curl -sk https://localhost:5005/version
+
+# Admin API 独立监听在回环地址，强制密钥鉴权：
+curl -s http://127.0.0.1:8105/admin/stats                                   # 401
+curl -s -H 'X-API-Key: admin-demo-key' http://127.0.0.1:8105/admin/stats    # 200
+
+# Prometheus 指标
+curl -sk https://localhost:5005/metrics | head
+```
+
+或者使用 Docker（密钥只留在宿主机，绝不打进镜像）：
+
+```bash
+./scripts/gen_dev_certs.sh
+docker compose up -d
+```
+
+要代理真实后端——负载均衡 + 健康检查，或带证书/主机名校验的 `https://`
+upstream——见 [examples/](examples/) 下的可运行场景。
+
 ## 特性
 - **多线程 Reactor 模型**：每个 Worker 线程独立运行 epoll 事件循环，持有独立的 listen socket（`SO_REUSEPORT`），实现内核级负载均衡，无锁竞争。
 - **HTTP/1.1 协议支持**：内置状态机 HTTP 解析器，支持 GET / HEAD / POST / PUT / DELETE 方法，解析请求行、头部、查询字符串、消息体，含 Chunked 传输编码解析。

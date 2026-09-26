@@ -168,6 +168,12 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Every SSL I/O call now starts with `ERR_clear_error()`: a failed upstream handshake leaves stale errors in OpenSSL's per-thread queue, and the next `SSL_get_error` on an unrelated socket in the same thread misclassified `WANT_READ` as fatal and dropped the client connection
   - Tests: 101 unit / 77 integration passing, including 5 new upstream-TLS integration assertions (verified 200, pooled TLS reuse, hostname-mismatch 502, skip-verify escape hatch) and a pool-identity unit test
   - Not yet: mTLS (client certificates to backends), TLS-layer health probes (health checks stay TCP-level)
+- [x] First-run experience productization (2026-09-26)
+  - 5-minute quickstart at the top of both READMEs: built-in echo routes answer with no backend, admin auth demo (401 → 200 with key), ops endpoints and /metrics; default `config.json` no longer carries phantom upstreams that made `/readyz` answer 503 out of the box
+  - Runnable `examples/`: load balancing with visible round-robin and health-check ejection, and a verified `https://` upstream (upstream TLS) — both copy-paste runnable against the integration mock backend
+  - Dev certificates generated locally (`scripts/gen_dev_certs.sh`, SAN DNS:localhost only so IP-literal mismatches still fail), `certs/` gitignored and the committed private key removed; Docker mounts the keypair read-only instead of baking it into the image
+  - Server accepts an optional config path argument; config validation failures print a file-name + error-count summary
+  - Process lesson recorded: the previous commit shipped non-compiling code because CI was not re-run right before the commit (an outside edit partially reverted `http_client.cpp` between the last green run and the commit); CI now runs immediately before every commit
 - [x] Outreach: English README (2026-09-16) — `README.md` is the English edition with a language switcher, kept in sync with `README.zh-CN.md`
 - [ ] Outreach: first architecture article — draft lives in [docs/articles/](articles/); publishing to Juejin/Zhihu/V2EX/HN still pending
 - [ ] Signals: interview 5 potential users

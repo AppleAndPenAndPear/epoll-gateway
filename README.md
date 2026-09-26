@@ -6,6 +6,45 @@
 
 epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload) on both the client-facing and upstream hops, keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` request tracing, dual AUDIT/CLF logging, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment — plus unit tests (101/101 passing on CTest), integration tests (77/77 assertions) and AddressSanitizer support.
 
+## 5-Minute Quickstart
+
+```bash
+git clone https://github.com/AppleAndPenAndPear/epoll-gateway
+cd epoll-gateway
+./scripts/gen_dev_certs.sh   # self-signed dev certificate (the data plane is TLS-only)
+./build.sh                   # or ./ci.sh to build AND run the full test suite
+./start.sh                   # gateway on https://localhost:5005 (Ctrl+C to stop)
+```
+
+No backend needed — built-in routes answer immediately:
+
+```bash
+# Echo (built-in, no upstream): POST any JSON and get it reflected back
+curl -sk -X POST https://localhost:5005/api/echo -H 'Content-Type: application/json' -d '{"hello":"gateway"}'
+# {"echo":{"hello":"gateway"}}
+
+# Ops endpoints (always auth-exempt)
+curl -sk https://localhost:5005/healthz
+curl -sk https://localhost:5005/version
+
+# Admin API on its own loopback port, behind key auth:
+curl -s http://127.0.0.1:8105/admin/stats                                   # 401
+curl -s -H 'X-API-Key: admin-demo-key' http://127.0.0.1:8105/admin/stats    # 200
+
+# Prometheus metrics
+curl -sk https://localhost:5005/metrics | head
+```
+
+Or with Docker (the keypair stays on the host, never baked into the image):
+
+```bash
+./scripts/gen_dev_certs.sh
+docker compose up -d
+```
+
+To proxy to real backends — load balancing with health checks, or verified
+`https://` upstreams — see the runnable scenarios in [examples/](examples/).
+
 ## Features
 
 ### Networking & concurrency
