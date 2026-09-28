@@ -89,9 +89,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --title "${{ github.ref_name }}" \
-            --generate-notes
+          ls -la dist/
+          if ! gh release create "${{ github.ref_name }}" dist/*.tar.xz dist/*.sha256 \
+              --title "${{ github.ref_name }}" \
+              --generate-notes 2>&1 | tee /tmp/rel.log; then
+            {
+              echo "## gh release create error"
+              echo '```'
+              cat /tmp/rel.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -v '^$' /tmp/rel.log | head -8 | while read -r l; do
+              echo "::error title=gh::$l"
+            done || true
+            exit 1
+          fi
 
   docker:
     needs: build
