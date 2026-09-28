@@ -90,9 +90,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la dist/
+          # NOTE: no pipe here — Actions' default shell lacks pipefail, so
+          # `if ! gh ... | tee` would test tee's status and swallow errors.
           if ! gh release create "${{ github.ref_name }}" dist/*.tar.xz dist/*.sha256 \
               --title "${{ github.ref_name }}" \
-              --generate-notes 2>&1 | tee /tmp/rel.log; then
+              --generate-notes > /tmp/rel.log 2>&1; then
             {
               echo "## gh release create error"
               echo '```'
