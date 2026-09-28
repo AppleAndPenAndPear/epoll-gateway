@@ -82,6 +82,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Required: without a checkout there is no .git here, and
+      # `gh release create` (plus --generate-notes) needs the repository
+      # context to know which repo to publish to.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with: { merge-multiple: true, path: dist }
 
@@ -90,6 +95,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la dist/
+          # Fail loudly if the artifact round-trip lost the files, rather
+          # than letting gh report a confusing glob error.
+          ls dist/*.tar.xz >/dev/null 2>&1 || { echo "::error title=release::no tarball found in dist/"; exit 1; }
           # NOTE: no pipe here — Actions' default shell lacks pipefail, so
           # `if ! gh ... | tee` would test tee's status and swallow errors.
           if ! gh release create "${{ github.ref_name }}" dist/*.tar.xz dist/*.sha256 \
