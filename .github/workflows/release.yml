@@ -47,21 +47,29 @@ jobs:
           STAGE=$(echo dist/epollthread-*/)
           cd "$STAGE"
           ./scripts/gen_dev_certs.sh
-          timeout 5 ./bin/epollthread > /tmp/smoke.log 2>&1 || true
-          if ! grep -q "Starting epoll server on port" /tmp/smoke.log; then
-            # Dump the failure into the (public) job summary and as an
-            # annotation so it is readable without authentication.
+          nohup ./bin/epollthread > /tmp/smoke.log 2>&1 &
+          PID=$!
+          OK=1
+          for i in $(seq 1 40); do
+            if curl -sk --max-time 2 https://localhost:5005/healthz 2>/dev/null | grep -q ok; then OK=0; break; fi
+            sleep 0.5
+          done
+          kill $PID 2>/dev/null || true
+          if [ $OK -ne 0 ]; then
+            # Dump the failure into the (public) job summary and as
+            # annotations so it is readable without authentication.
             {
               echo "## Packaged binary smoke log"
               echo '```'
               cat /tmp/smoke.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            head -5 /tmp/smoke.log | while read -r l; do
+            grep -v '^$' /tmp/smoke.log | head -8 | while read -r l; do
               echo "::error title=smoke::$l"
             done || true
             exit 1
           fi
+          echo "smoke OK: /healthz responded"
 
       - uses: actions/upload-artifact@v4
         with:
