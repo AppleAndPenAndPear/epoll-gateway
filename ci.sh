@@ -23,8 +23,12 @@ do_unit() {
     echo "==> [2/3] Unit tests (CTest)"
     # Keep the full output: failures are mirrored into the GitHub step
     # summary so they stay readable on the public run page.
+    # Temporarily disable set -e: a failing pipeline here must not abort
+    # the script before the failure-extraction block below runs.
+    set +e
     ctest --test-dir "$BUILD_DIR" --output-on-failure 2>&1 | tee /tmp/ctest.log
-    local rc=${PIPESTATUS[0]}
+    local rc=$?
+    set -e
     if [[ $rc -ne 0 ]]; then
         # Surface each failed test as a check-run annotation (::error::
         # workflow command) — readable via the API without authentication.
