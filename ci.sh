@@ -28,18 +28,18 @@ do_unit() {
     if [[ $rc -ne 0 ]]; then
         # Surface each failed test as a check-run annotation (::error::
         # workflow command) — readable via the API without authentication.
-        grep -E "^\s*[0-9]+/[0-9]+ Test\s+#" /tmp/ctest.log | grep "Failed" | \
-            sed -E 's/.*Test\s+#[0-9]+: //' | while read -r t; do
-            echo "::error title=CTest failed::$t"
-        done
-        grep -E "\[  FAILED  \]" /tmp/ctest.log | head -20 | while read -r line; do
-            echo "::error title=GoogleTest::$line"
-        done
-        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        # NOTE: grep may legitimately match nothing here; guard every one
+        # with `|| true` because of `set -e`.
+        awk '/The following tests FAILED/{f=1;next} f&&NF{print $1}' /tmp/ctest.log | head -20 | \
+            while read -r t; do echo "::error title=CTest failed::$t"; done || true
+        grep -E "\[  FAILED  \]" /tmp/ctest.log | head -20 | \
+            while read -r line; do echo "::error title=GoogleTest::$line"; done || true
+        grep -B 2 -A 12 "The following tests FAILED" /tmp/ctest.log | tail -60 > /tmp/ctest-fail.txt || true
+        if [[ -s /tmp/ctest-fail.txt && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
             {
                 echo "## Unit test failures"
                 echo '```'
-                grep -B 2 -A 12 "\[  FAILED  \]\|The following tests FAILED" /tmp/ctest.log | tail -120
+                cat /tmp/ctest-fail.txt
                 echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
         fi
