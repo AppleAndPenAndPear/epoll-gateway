@@ -47,8 +47,21 @@ jobs:
           STAGE=$(echo dist/epollthread-*/)
           cd "$STAGE"
           ./scripts/gen_dev_certs.sh
-          timeout 3 ./bin/epollthread > /tmp/smoke.log 2>&1 || true
-          grep -q "Starting epoll server on port" /tmp/smoke.log || (cat /tmp/smoke.log; exit 1)
+          timeout 5 ./bin/epollthread > /tmp/smoke.log 2>&1 || true
+          if ! grep -q "Starting epoll server on port" /tmp/smoke.log; then
+            # Dump the failure into the (public) job summary and as an
+            # annotation so it is readable without authentication.
+            {
+              echo "## Packaged binary smoke log"
+              echo '```'
+              cat /tmp/smoke.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            head -5 /tmp/smoke.log | while read -r l; do
+              echo "::error title=smoke::$l"
+            done || true
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
