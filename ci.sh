@@ -19,8 +19,18 @@ do_build() {
     cmake --build "$BUILD_DIR" -j"$(nproc)"
 }
 
+ensure_certs() {
+    # certs/ is not tracked by git; the TLS-only server, the mock TLS
+    # upstream AND the TLS unit tests need a dev keypair, so generate
+    # one on demand.
+    if [[ ! -f certs/server.crt || ! -f certs/server.key ]]; then
+        ./scripts/gen_dev_certs.sh
+    fi
+}
+
 do_unit() {
     echo "==> [2/3] Unit tests (CTest)"
+    ensure_certs
     # Keep the full output: failures are mirrored into the GitHub step
     # summary so they stay readable on the public run page.
     # Temporarily disable set -e: a failing pipeline here must not abort
@@ -53,11 +63,7 @@ do_unit() {
 
 do_integration() {
     echo "==> [3/3] Integration tests (starts the real server + mock upstream)"
-    # certs/ is not tracked by git; the TLS-only server (and the mock TLS
-    # upstream) need a dev keypair, so generate one on demand.
-    if [[ ! -f certs/server.crt || ! -f certs/server.key ]]; then
-        ./scripts/gen_dev_certs.sh
-    fi
+    ensure_certs
     python3 tests/integration/run_integration_tests.py
 }
 
