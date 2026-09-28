@@ -27,6 +27,10 @@ logs/
 # 开发自签证书（由 scripts/gen_dev_certs.sh 生成，不入库）
 certs/
 
+# Release 打包产物
+dist/
+build-release/
+
 # 系统文件
 .DS_Store
 Thumbs.db

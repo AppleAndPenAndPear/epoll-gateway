@@ -174,6 +174,10 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Dev certificates generated locally (`scripts/gen_dev_certs.sh`, SAN DNS:localhost only so IP-literal mismatches still fail), `certs/` gitignored and the committed private key removed; Docker mounts the keypair read-only instead of baking it into the image
   - Server accepts an optional config path argument; config validation failures print a file-name + error-count summary
   - Process lesson recorded: the previous commit shipped non-compiling code because CI was not re-run right before the commit (an outside edit partially reverted `http_client.cpp` between the last green run and the commit); CI now runs immediately before every commit
+- [x] Release channel (2026-09-28, v0.2.0)
+  - `scripts/package_release.sh`: self-contained tarball per arch (x86_64 / aarch64) — binary with `$ORIGIN` rpath, libspdlog bundled, openssl/zlib system-wide, config/www/examples/cert-script/docs inside, no keys or logs; `ldd` gate + end-to-end smoke (healthz/echo/admin) before shipping
+  - `.github/workflows/release.yml`: tag `v*` → per-arch builds (ubuntu-22.04 glibc baseline for x86_64, native arm runner for aarch64) → GitHub Release with sha256 → multi-arch image on ghcr.io; Gitee receives the tag
+  - README quickstarts lead with the prebuilt path; source build remains Option B — the evaluator funnel no longer starts at "install a toolchain"
 - [x] Outreach: English README (2026-09-16) — `README.md` is the English edition with a language switcher, kept in sync with `README.zh-CN.md`
 - [ ] Outreach: first architecture article — draft lives in [docs/articles/](articles/); publishing to Juejin/Zhihu/V2EX/HN still pending
 - [ ] Signals: interview 5 potential users

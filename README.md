@@ -8,6 +8,16 @@ epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and net
 
 ## 5-Minute Quickstart
 
+**Option A — prebuilt release** (x86_64 + aarch64 tarballs, libspdlog bundled, no toolchain needed; multi-arch image on ghcr.io):
+
+```bash
+curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/latest/download/epollthread-0.2.0-x86_64.tar.xz
+tar -xJf epollthread-0.2.0-x86_64.tar.xz && cd epollthread-0.2.0-x86_64
+./scripts/gen_dev_certs.sh && ./start.sh   # gateway on https://localhost:5005
+```
+
+**Option B — build from source:**
+
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway

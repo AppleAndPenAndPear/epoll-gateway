@@ -4,6 +4,14 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-28
+
+### Added
+
+- **Release channel (v0.2.0)**: `scripts/package_release.sh` builds a Release binary and assembles a self-contained tarball — `bin/epollthread` with an `$ORIGIN` rpath, `lib/libspdlog` bundled (the only non-universal shared dependency; openssl/zlib stay system-wide), plus `config.json`, `www/`, `examples/`, `scripts/gen_dev_certs.sh`, `start.sh`, README×2, LICENSE and the core docs. The archive carries no private keys and no logs. An `ldd` sanity check fails packaging if anything is unresolved; the tarball is smoke-tested end to end (healthz / echo / admin 200) before shipping.
+- `.github/workflows/release.yml`: pushing a `v*` tag builds per-arch tarballs (x86_64 on ubuntu-22.04 for the older glibc baseline, aarch64 on the native arm runner), smoke-tests each, publishes a GitHub Release with checksums, and pushes a multi-arch image to ghcr.io. Gitee gets the tag; artifacts are attached manually there.
+- Version bumped 0.1.0 → 0.2.0 (upstream TLS, first-run experience, release channel). Both README quickstarts now lead with the prebuilt-download path — the "clone and compile" step stays available but is no longer the front door.
+
 ## 2026-09-26
 
 ### Added

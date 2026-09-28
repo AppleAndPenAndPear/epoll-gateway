@@ -6,6 +6,16 @@
 
 ## 5 分钟快速体验
 
+**方式 A——预编译发行包**（x86_64 + aarch64 tar 包，已捆绑 libspdlog，无需工具链；ghcr.io 提供多架构镜像）：
+
+```bash
+curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/latest/download/epollthread-0.2.0-x86_64.tar.xz
+tar -xJf epollthread-0.2.0-x86_64.tar.xz && cd epollthread-0.2.0-x86_64
+./scripts/gen_dev_certs.sh && ./start.sh   # 网关监听 https://localhost:5005
+```
+
+**方式 B——源码构建：**
+
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
