@@ -44,8 +44,10 @@ jobs:
 
       - name: Smoke test the packaged binary
         run: |
-          cd dist/epollthread-*/ && ./scripts/gen_dev_certs.sh
-          ( cd dist/epollthread-*/ && timeout 3 ./bin/epollthread > /tmp/smoke.log 2>&1 || true )
+          STAGE=$(echo dist/epollthread-*/)
+          cd "$STAGE"
+          ./scripts/gen_dev_certs.sh
+          timeout 3 ./bin/epollthread > /tmp/smoke.log 2>&1 || true
           grep -q "Starting epoll server on port" /tmp/smoke.log || (cat /tmp/smoke.log; exit 1)
 
       - uses: actions/upload-artifact@v4

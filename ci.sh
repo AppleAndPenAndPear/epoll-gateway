@@ -21,7 +21,19 @@ do_build() {
 
 do_unit() {
     echo "==> [2/3] Unit tests (CTest)"
-    ctest --test-dir "$BUILD_DIR" --output-on-failure
+    # Keep the full output: failures are mirrored into the GitHub step
+    # summary so they stay readable on the public run page.
+    ctest --test-dir "$BUILD_DIR" --output-on-failure 2>&1 | tee /tmp/ctest.log
+    local rc=${PIPESTATUS[0]}
+    if [[ $rc -ne 0 && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "## Unit test failures"
+            echo '```'
+            grep -B 2 -A 12 "\[  FAILED  \]\|The following tests FAILED" /tmp/ctest.log | tail -120
+            echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    fi
+    return "$rc"
 }
 
 do_integration() {
