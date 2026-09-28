@@ -25,13 +25,24 @@ do_unit() {
     # summary so they stay readable on the public run page.
     ctest --test-dir "$BUILD_DIR" --output-on-failure 2>&1 | tee /tmp/ctest.log
     local rc=${PIPESTATUS[0]}
-    if [[ $rc -ne 0 && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-        {
-            echo "## Unit test failures"
-            echo '```'
-            grep -B 2 -A 12 "\[  FAILED  \]\|The following tests FAILED" /tmp/ctest.log | tail -120
-            echo '```'
-        } >> "$GITHUB_STEP_SUMMARY"
+    if [[ $rc -ne 0 ]]; then
+        # Surface each failed test as a check-run annotation (::error::
+        # workflow command) — readable via the API without authentication.
+        grep -E "^\s*[0-9]+/[0-9]+ Test\s+#" /tmp/ctest.log | grep "Failed" | \
+            sed -E 's/.*Test\s+#[0-9]+: //' | while read -r t; do
+            echo "::error title=CTest failed::$t"
+        done
+        grep -E "\[  FAILED  \]" /tmp/ctest.log | head -20 | while read -r line; do
+            echo "::error title=GoogleTest::$line"
+        done
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+                echo "## Unit test failures"
+                echo '```'
+                grep -B 2 -A 12 "\[  FAILED  \]\|The following tests FAILED" /tmp/ctest.log | tail -120
+                echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+        fi
     fi
     return "$rc"
 }
