@@ -59,7 +59,10 @@ report_failure() {
         cat "$log"
         echo '```'
     } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-    grep -v '^[[:space:]]*$' "$log" | head -12 | while read -r line; do
+    # The reason is at the end of the log; drop docker's pull progress noise
+    # so the annotations are not spent on "Pull complete" lines.
+    grep -vE '^[0-9a-f]{12}: |Pulling fs layer|Pull complete|Download complete|Verifying Checksum|Waiting|Already exists|Pulling from|Unable to find image' "$log" |
+        grep -v '^[[:space:]]*$' | tail -12 | while read -r line; do
         echo "::error title=verify ${img}::${line}"
     done || true
 }
@@ -90,6 +93,19 @@ for img in "${IMAGES[@]}"; do
         echo "distribution: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 
         # 1. Loader resolution against THIS distribution: the decisive check.
+        #    The declared runtime prerequisites (a glibc baseline plus the
+        #    distribution OpenSSL 3 and zlib) are deliberately NOT bundled,
+        #    and a minimal image need not ship them — the Debian base image
+        #    has no OpenSSL at all, because its apt uses GnuTLS. Provision
+        #    exactly those declared prerequisites, then assert that nothing
+        #    ELSE is missing: that assertion is what catches a gap in our own
+        #    bundle (the v0.2.0 libfmt case), which no apt package fills in.
+        if ldd ./bin/epollthread | grep -q "not found"; then
+            echo "provisioning declared prerequisites from this distribution:"
+            ldd ./bin/epollthread | grep "not found" | sed 's/^/    /'
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq --no-install-recommends libssl3 zlib1g >/dev/null 2>&1 || true
+        fi
         ldd ./bin/epollthread
         if ldd ./bin/epollthread | grep -q "not found"; then
             echo "FAIL: unresolved shared libraries on this distribution" >&2
