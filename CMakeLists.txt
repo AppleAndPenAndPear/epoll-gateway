@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(epollthread VERSION 0.2.0 LANGUAGES CXX)
+project(epollthread VERSION 0.2.1 LANGUAGES CXX)
 
 # Use AddressSanitizer to detect memory leaks and out-of-bounds accesses
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address -fno-omit-frame-pointer")

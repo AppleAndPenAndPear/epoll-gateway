@@ -6,11 +6,11 @@
 
 ## 5 分钟快速体验
 
-**方式 A——预编译发行包**（x86_64 + aarch64 tar 包，已捆绑 libspdlog，无需工具链；ghcr.io 提供多架构镜像）：
+**方式 A——预编译发行包**（x86_64 + aarch64 tar 包；已捆绑 libspdlog 与 libfmt、C++ 运行时静态链接，无需任何工具链；环境要求 glibc ≥ 2.35 且系统自带 OpenSSL 3，即 Ubuntu 22.04+ / Debian 12+；ghcr.io 提供多架构镜像）：
 
 ```bash
-curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/latest/download/epollthread-0.2.0-x86_64.tar.xz
-tar -xJf epollthread-0.2.0-x86_64.tar.xz && cd epollthread-0.2.0-x86_64
+curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/latest/download/epollthread-0.2.1-x86_64.tar.xz
+tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
 ./scripts/gen_dev_certs.sh && ./start.sh   # 网关监听 https://localhost:5005
 ```
 

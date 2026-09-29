@@ -1,7 +1,7 @@
 name: Release
 
 # Cut a release by pushing a version tag:
-#   git tag v0.2.0 && git push origin v0.2.0 && git push gh v0.2.0
+#   git tag v0.2.1 && git push origin v0.2.1 && git push gh v0.2.1
 #
 # Produces per-arch tarballs (x86_64 + aarch64) with sha256 checksums on
 # the GitHub Release, plus a multi-arch Docker image on ghcr.io.
@@ -70,6 +70,14 @@ jobs:
             exit 1
           fi
           echo "smoke OK: /healthz responded"
+
+      # The smoke test above runs on the build machine, which by definition
+      # has every library the build needs — it cannot catch a soname that a
+      # target distribution lacks. This runs the finished tarball in clean
+      # containers (22.04 / 24.04 / debian 12) and fails the job, and
+      # therefore the release, if it does not start there.
+      - name: Verify the artifact on target distributions
+        run: ./scripts/verify_artifact.sh dist/*.tar.xz
 
       - uses: actions/upload-artifact@v4
         with:

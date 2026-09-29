@@ -35,3 +35,31 @@ jobs:
 
       - name: Integration tests
         run: ./ci.sh integration
+
+  package:
+    # Builds the release tarball on the same glibc baseline as the release
+    # workflow and runs it in clean containers of every supported
+    # distribution. Only this catches a bundled-dependency gap: v0.2.0
+    # shipped a tarball linking libfmt.so.8, which Ubuntu 24.04 (libfmt.so.9)
+    # does not have, and both the ldd gate and the smoke test passed anyway
+    # because they ran on the build host, which has everything.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++ cmake \
+            libspdlog-dev \
+            nlohmann-json3-dev \
+            zlib1g-dev \
+            libssl-dev
+
+      - name: Package release
+        run: ./scripts/package_release.sh dist
+
+      - name: Verify the artifact on target distributions
+        run: ./scripts/verify_artifact.sh dist/*.tar.xz

@@ -4,6 +4,23 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-09-29
+
+### Fixed
+
+- **The v0.2.0 tarball could not run on Ubuntu 24.04.** The binary linked `libfmt.so.8` (what Ubuntu 22.04 provides) while 24.04 ships only `libfmt.so.9`, so it died immediately with `error while loading shared libraries: libfmt.so.8: cannot open shared object file`. The cause: packaging bundled `libspdlog` by name and therefore missed its own transitive dependency `libfmt`. Bundling is now a **whitelist plus transitive closure** — every library the binary needs that is not part of the per-distribution baseline gets bundled, so a dependency of a bundled dependency can no longer be forgotten. A missing bundle fails packaging instead of shipping.
+- The `ldd` gate and the CI smoke test could not have caught this: both ran on the build machine, which by definition has every library the build needs. Added `scripts/verify_artifact.sh`, wired into `ci.yml` and `release.yml`, which extracts the finished tarball and runs it inside clean `ubuntu:22.04`, `ubuntu:24.04` and `debian:12` containers — loader resolution plus a real start-up (listener accepting connections). Failing there now blocks the release.
+- The binary is linked with `-static-libstdc++ -static-libgcc`, removing the `GLIBCXX_3.4.x` ABI floor that an Ubuntu 22.04 build would otherwise impose on older `libstdc++`.
+
+### Changed
+
+- Bundling policy is now explicit in `package_release.sh` and stated in both READMEs: `libspdlog`/`libfmt` (unstable sonames across distributions) are bundled, while the glibc core and `libssl`/`libcrypto`/`libz` stay system-wide on purpose — this is a security product, so crypto must keep taking CVE patches from the distribution rather than be frozen inside the tarball, and `libssl.so.3` is the stable soname of the entire OpenSSL 3.x line. The supported floor is glibc ≥ 2.35 with a system OpenSSL 3 (Ubuntu 22.04+ / Debian 12+).
+- Version bumped 0.2.0 → 0.2.1.
+
+### Notes
+
+- Process lesson: a check that runs in the same environment as the build verifies itself and structurally cannot fail for the class of bug it targets. "It worked on the machine that produced it" is not verification — a packaging check only means something when it runs somewhere the build environment is absent.
+
 ## 2026-09-28
 
 ### Added

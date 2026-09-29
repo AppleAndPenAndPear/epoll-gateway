@@ -31,6 +31,9 @@ certs/
 dist/
 build-release/
 
+# 本地临时脚本/工具数据
+.trae/
+
 # 系统文件
 .DS_Store
 Thumbs.db
