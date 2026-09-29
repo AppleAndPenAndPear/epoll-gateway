@@ -59,10 +59,17 @@ report_failure() {
         cat "$log"
         echo '```'
     } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-    # The reason is at the end of the log; drop docker's pull progress noise
-    # so the annotations are not spent on "Pull complete" lines.
+    # Annotations are limited and an ldd table can fill them on its own, so
+    # lead with the lines that carry the reason and add a little tail context.
+    # (The build-host log is unreadable without authentication, so these are
+    # often the only way to see why a distribution failed.)
+    local filtered="${log}.filtered"
     grep -vE '^[0-9a-f]{12}: |Pulling fs layer|Pull complete|Download complete|Verifying Checksum|Waiting|Already exists|Pulling from|Unable to find image' "$log" |
-        grep -v '^[[:space:]]*$' | tail -12 | while read -r line; do
+        grep -v '^[[:space:]]*$' > "${filtered}" || true
+    {
+        grep -iE 'not found|FAIL|version .*not found|cannot|No such file|error' "${filtered}" | head -8 || true
+        tail -4 "${filtered}" || true
+    } | while read -r line; do
         echo "::error title=verify ${img}::${line}"
     done || true
 }
@@ -104,7 +111,7 @@ if ldd ./bin/epollthread | grep -q "not found"; then
     apt-get update -qq >/dev/null 2>&1 || true
     apt-get install -y -qq --no-install-recommends libssl3 zlib1g >/dev/null 2>&1 || true
 fi
-ldd ./bin/epollthread
+ldd ./bin/epollthread || true
 if ldd ./bin/epollthread | grep -q "not found"; then
     echo "FAIL: unresolved shared libraries on this distribution" >&2
     exit 1

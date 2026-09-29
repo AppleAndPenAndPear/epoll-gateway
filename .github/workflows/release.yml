@@ -21,8 +21,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - { arch: x86_64, runs-on: ubuntu-22.04 }   # older glibc = wider compatibility
-          - { arch: aarch64, runs-on: ubuntu-24.04-arm }
+          - { arch: x86_64, runs-on: ubuntu-22.04 }      # older glibc = wider compatibility
+          - { arch: aarch64, runs-on: ubuntu-22.04-arm } # same baseline as x86_64: different
+                                                         # runners would give the two
+                                                         # architectures different glibc floors
+                                                         # under one documented claim
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 20
     steps:
