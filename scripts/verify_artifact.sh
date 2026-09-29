@@ -48,9 +48,33 @@ if [[ ! -f certs/server.crt || ! -f certs/server.key ]]; then
 fi
 
 echo "==> Verifying ${NAME} (${PLATFORM}) on: ${IMAGES[*]}"
+
+# Failures have to be readable from the public run page: the raw job log needs
+# authentication, while a step summary and ::error:: annotations do not.
+report_failure() {
+    local img="$1" log="$2"
+    {
+        echo "## verify_artifact: ${img} failed"
+        echo '```'
+        cat "$log"
+        echo '```'
+    } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    grep -v '^[[:space:]]*$' "$log" | head -12 | while read -r line; do
+        echo "::error title=verify ${img}::${line}"
+    done || true
+}
+
+# Distinguish "no usable container runtime here" from "the artifact is broken".
+if ! docker info >/dev/null 2>&1; then
+    echo "::error title=verify artifact::docker daemon is not usable in this environment" >&2
+    docker info 2>&1 | head -5 >&2
+    exit 1
+fi
+
 fail=0
 for img in "${IMAGES[@]}"; do
     echo "--- ${img}"
+    log="${WORK}/$(echo "${img}" | tr '/:' '__').log"
     if docker run --rm \
             -e PKG="/src/${NAME}" \
             -v "${WORK}:/src:ro" \
@@ -62,6 +86,8 @@ for img in "${IMAGES[@]}"; do
         cd /tmp/run
         mkdir -p certs
         cp /certs/server.crt /certs/server.key certs/
+
+        echo "distribution: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 
         # 1. Loader resolution against THIS distribution: the decisive check.
         ldd ./bin/epollthread
@@ -89,10 +115,13 @@ for img in "${IMAGES[@]}"; do
             exit 1
         fi
         echo "OK: loads and serves on this distribution"
-    '; then
+    '>"${log}" 2>&1; then
+        sed 's/^/    /' "${log}"
         echo "    ${img}: OK"
     else
-        echo "    ${img}: FAILED" >&2
+        echo "    ${img}: FAILED (exit $?)" >&2
+        cat "${log}" >&2
+        report_failure "${img}" "${log}"
         fail=1
     fi
 done
