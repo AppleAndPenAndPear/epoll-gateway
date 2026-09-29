@@ -74,6 +74,64 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
+# What runs inside the container. Kept in a *quoted* heredoc because its
+# content must reach the container literally: written as an inline
+# single-quoted string, any single quote in here (a `sed 's/^/  /'`, an
+# apostrophe in prose) would close the outer quoting and hand `bash -c` a
+# truncated script split across several arguments — which is exactly what
+# silently happened here once, and failed every image for the wrong reason.
+CONTAINER_SCRIPT=$(cat <<'CONTAINER_SCRIPT_EOF'
+# Run from a writable copy: the mounted source tree is read-only and the run
+# test needs to drop a certs/ next to config.json.
+cp -a "$PKG" /tmp/run
+cd /tmp/run
+mkdir -p certs
+cp /certs/server.crt /certs/server.key certs/
+
+echo "distribution: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+
+# 1. Loader resolution against THIS distribution: the decisive check.
+#    The declared runtime prerequisites (a glibc baseline plus the
+#    distribution OpenSSL 3 and zlib) are deliberately NOT bundled, and a
+#    minimal image need not ship them: the Debian base image has no OpenSSL
+#    at all, because its apt uses GnuTLS. Provision exactly those declared
+#    prerequisites, then assert that nothing ELSE is missing — that assertion
+#    is what catches a gap in our own bundle (the v0.2.0 libfmt case), which
+#    no distribution package would fill in.
+if ldd ./bin/epollthread | grep -q "not found"; then
+    echo "provisioning declared prerequisites from this distribution:"
+    ldd ./bin/epollthread | grep "not found" | sed 's/^/    /'
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq --no-install-recommends libssl3 zlib1g >/dev/null 2>&1 || true
+fi
+ldd ./bin/epollthread
+if ldd ./bin/epollthread | grep -q "not found"; then
+    echo "FAIL: unresolved shared libraries on this distribution" >&2
+    exit 1
+fi
+
+# 2. Actually start it and prove the listener comes up. A raw TCP connect is
+#    enough: it means the binary loaded, the TLS context built and the socket
+#    is accepting.
+./bin/epollthread > /tmp/server.log 2>&1 &
+pid=$!
+ok=1
+for _ in $(seq 1 60); do
+    if (exec 3<>/dev/tcp/127.0.0.1/5005) 2>/dev/null; then ok=0; break; fi
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.25
+done
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+if [ "$ok" -ne 0 ]; then
+    echo "FAIL: server never accepted a connection; log follows" >&2
+    cat /tmp/server.log >&2
+    exit 1
+fi
+echo "OK: loads and serves on this distribution"
+CONTAINER_SCRIPT_EOF
+)
+
 fail=0
 for img in "${IMAGES[@]}"; do
     echo "--- ${img}"
@@ -82,56 +140,7 @@ for img in "${IMAGES[@]}"; do
             -e PKG="/src/${NAME}" \
             -v "${WORK}:/src:ro" \
             -v "${PWD}/certs:/certs:ro" \
-            "${img}" bash -euc '
-        # Run from a writable copy: the mounted source tree is read-only and
-        # the run test needs to drop a certs/ next to config.json.
-        cp -a "$PKG" /tmp/run
-        cd /tmp/run
-        mkdir -p certs
-        cp /certs/server.crt /certs/server.key certs/
-
-        echo "distribution: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
-
-        # 1. Loader resolution against THIS distribution: the decisive check.
-        #    The declared runtime prerequisites (a glibc baseline plus the
-        #    distribution OpenSSL 3 and zlib) are deliberately NOT bundled,
-        #    and a minimal image need not ship them — the Debian base image
-        #    has no OpenSSL at all, because its apt uses GnuTLS. Provision
-        #    exactly those declared prerequisites, then assert that nothing
-        #    ELSE is missing: that assertion is what catches a gap in our own
-        #    bundle (the v0.2.0 libfmt case), which no apt package fills in.
-        if ldd ./bin/epollthread | grep -q "not found"; then
-            echo "provisioning declared prerequisites from this distribution:"
-            ldd ./bin/epollthread | grep "not found" | sed 's/^/    /'
-            apt-get update -qq >/dev/null 2>&1 || true
-            apt-get install -y -qq --no-install-recommends libssl3 zlib1g >/dev/null 2>&1 || true
-        fi
-        ldd ./bin/epollthread
-        if ldd ./bin/epollthread | grep -q "not found"; then
-            echo "FAIL: unresolved shared libraries on this distribution" >&2
-            exit 1
-        fi
-
-        # 2. Actually start it and prove the listener comes up. A raw TCP
-        #    connect is enough: it means the binary loaded, the TLS context
-        #    built and the socket is accepting.
-        ./bin/epollthread > /tmp/server.log 2>&1 &
-        pid=$!
-        ok=1
-        for _ in $(seq 1 60); do
-            if (exec 3<>/dev/tcp/127.0.0.1/5005) 2>/dev/null; then ok=0; break; fi
-            if ! kill -0 "$pid" 2>/dev/null; then break; fi
-            sleep 0.25
-        done
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        if [ "$ok" -ne 0 ]; then
-            echo "FAIL: server never accepted a connection; log follows" >&2
-            cat /tmp/server.log >&2
-            exit 1
-        fi
-        echo "OK: loads and serves on this distribution"
-    '>"${log}" 2>&1; then
+            "${img}" bash -euc "${CONTAINER_SCRIPT}" >"${log}" 2>&1; then
         sed 's/^/    /' "${log}"
         echo "    ${img}: OK"
     else
