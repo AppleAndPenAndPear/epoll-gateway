@@ -78,6 +78,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "backend": "127.0.0.1:%d" % PORT,
             "path": self.path,
             "method": self.command,
+            # Echoed back so tests can assert the gateway injected the caller
+            # identity on the upstream hop (X-Forwarded-For / X-Real-IP).
+            "xff": self.headers.get("X-Forwarded-For", ""),
+            "real_ip": self.headers.get("X-Real-IP", ""),
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

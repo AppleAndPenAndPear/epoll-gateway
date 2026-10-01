@@ -56,7 +56,7 @@ private:
     FileCache cache_;   // File cache
 
     void send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched);
-    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) const;
+    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp) const;
     ResolvedRoute resolve_route(const HttpRequest& req) const;
     void register_default_routes();
     void register_configured_routes();

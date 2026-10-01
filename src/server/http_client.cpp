@@ -96,8 +96,11 @@ std::string find_header_value(const std::string& headers_part, const std::string
 enum class ChunkScan { Incomplete, Complete, Error };
 
 // Scans a chunked body starting at body_start. On Complete, body_end points
-// just past the terminating CRLF of the last-chunk trailer.
-ChunkScan scan_chunked_body(const std::string& buf, size_t body_start, size_t& body_end) {
+// just past the terminating CRLF of the last-chunk trailer. When `decoded` is
+// given, the real (de-chunked) payload bytes are appended to it as chunks are
+// recognized; trailer fields are dropped.
+ChunkScan scan_chunked_body(const std::string& buf, size_t body_start, size_t& body_end,
+                            std::string* decoded = nullptr) {
     size_t pos = body_start;
     for (;;) {
         const size_t line_end = buf.find("\r\n", pos);
@@ -132,6 +135,7 @@ ChunkScan scan_chunked_body(const std::string& buf, size_t body_start, size_t& b
         }
         if (buf.size() < pos + size + 2) return ChunkScan::Incomplete;
         if (buf.compare(pos + size, 2, "\r\n") != 0) return ChunkScan::Error;
+        if (decoded) decoded->append(buf, pos, size);
         pos += size + 2;
     }
 }
@@ -283,15 +287,23 @@ BackendResponse forward_request(const std::string& host, int port,
         }
 
         // Build the HTTP request; framing stays keep-alive (HTTP/1.1 default)
-        // so the connection can be returned to the pool afterwards.
+        // so the connection can be returned to the pool afterwards. Framing
+        // and hop-by-hop headers are never forwarded: the body was parsed
+        // (chunked de-chunked, CL-checked) and is re-framed by Content-Length.
         std::ostringstream req_stream;
         req_stream << method << " " << path << " HTTP/1.1\r\n";
         req_stream << "Host: " << host << ":" << port << "\r\n";
         for (const auto& [k, v] : req_headers) {
-            if (k == "host" || k == "connection") continue;  // hop-by-hop, we manage framing
+            if (k == "host" || k == "connection" || k == "keep-alive" ||
+                k == "content-length" || k == "transfer-encoding") continue;
             req_stream << k << ": " << v << "\r\n";
         }
-        if (!req_body.empty()) {
+        // Send framing whenever a body is possible: non-empty body, or the
+        // client explicitly framed an empty body (Content-Length: 0) — without
+        // a CL, a keep-alive backend would wait for a body that never comes.
+        const bool needs_content_length = !req_body.empty() ||
+            req_headers.count("content-length") || req_headers.count("transfer-encoding");
+        if (needs_content_length) {
             req_stream << "Content-Length: " << req_body.size() << "\r\n";
         }
         req_stream << "\r\n" << req_body;
@@ -325,6 +337,8 @@ BackendResponse forward_request(const std::string& host, int port,
         bool stale_pooled = false;  // pooled socket died mid-request; retry on a fresh one
         size_t body_end = std::string::npos;  // past the end of the message body
         bool response_uses_keepalive = false;
+        bool response_is_chunked = false;
+        std::string decoded_body;  // de-chunked payload when the backend sent chunked
 
         while (!complete && response.size() <= kMaxResponseSize) {
             const size_t header_end = response.find("\r\n\r\n");
@@ -339,8 +353,10 @@ BackendResponse forward_request(const std::string& host, int port,
 
                 const std::string te = find_header_value(headers_part, "transfer-encoding");
                 if (te.find("chunked") != std::string::npos) {
+                    response_is_chunked = true;
                     size_t end = std::string::npos;
-                    const ChunkScan scan = scan_chunked_body(response, header_end + 4, end);
+                    decoded_body.clear();  // the scan restarts from scratch as data arrives
+                    const ChunkScan scan = scan_chunked_body(response, header_end + 4, end, &decoded_body);
                     if (scan == ChunkScan::Complete) {
                         body_end = end;
                         complete = true;
@@ -454,10 +470,14 @@ BackendResponse forward_request(const std::string& host, int port,
         {
             const size_t header_end = response.find("\r\n\r\n");
             const std::string headers_part = response.substr(0, header_end);
-            resp.body = response.substr(header_end + 4,
-                                        body_end == std::string::npos
-                                            ? std::string::npos
-                                            : body_end - (header_end + 4));
+            if (response_is_chunked) {
+                resp.body = std::move(decoded_body);  // real payload; the gateway re-frames for the client
+            } else {
+                resp.body = response.substr(header_end + 4,
+                                            body_end == std::string::npos
+                                                ? std::string::npos
+                                                : body_end - (header_end + 4));
+            }
             size_t line_start = headers_part.find("\r\n") + 2;  // skip the status line
             while (line_start < headers_part.size()) {
                 const size_t line_end = headers_part.find("\r\n", line_start);

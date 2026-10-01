@@ -416,15 +416,49 @@ def test_connection_reuse(control_dir):
 
 def test_chunked_trailer():
     print("\n[07c] Chunked response with trailer (pool-safe framing)")
-    status, _, body = request("/api/two/chunked-trailer")
+    status, hdrs, body = request("/api/two/chunked-trailer")
     check("chunked+trailer response proxied with full body",
           status == 200 and body == b"abcde", "status=%s body=%r" % (status, body[:60]))
+    # The proxied response must be re-framed by the gateway: forwarding the
+    # backend's Transfer-Encoding while also stamping a Content-Length produced
+    # a forbidden CL+TE combination (the response-side smuggling vector).
+    check("proxied chunked response carries no TE header",
+          "transfer-encoding" not in hdrs, "hdrs=%r" % hdrs)
+    check("proxied chunked response framed by Content-Length",
+          hdrs.get("content-length") == str(len(body)),
+          "content-length=%r len=%d" % (hdrs.get("content-length"), len(body)))
     # The pooled connection must survive the trailer: a second request on the
     # same upstream must still work (would time out/garble if leftover CRLF
     # from the trailer were kept on the connection).
     status2, _, body2 = request("/api/two/chunked-trailer")
     check("connection reusable after chunked trailer",
           status2 == 200 and body2 == b"abcde", "status=%s" % status2)
+
+
+def test_forwarded_headers():
+    print("\n[07d] Caller identity injected on the upstream hop")
+    status, _, body = request("/api/two/echo-headers")
+    ok = False
+    try:
+        doc = json.loads(body.decode())
+        # The backend echoes what it received; the gateway must have appended
+        # the real peer address so backends can see the caller.
+        ok = doc.get("xff") == "127.0.0.1" and doc.get("real_ip") == "127.0.0.1"
+    except (ValueError, UnicodeDecodeError):
+        pass
+    check("backend sees X-Forwarded-For / X-Real-IP", status == 200 and ok,
+          "status=%s body=%r" % (status, body[:160]))
+    # A client-supplied chain is preserved, with our hop appended last.
+    status2, _, body2 = request("/api/two/echo-headers",
+                                headers={"X-Forwarded-For": "203.0.113.9"})
+    ok2 = False
+    try:
+        doc2 = json.loads(body2.decode())
+        ok2 = doc2.get("xff") == "203.0.113.9, 127.0.0.1"
+    except (ValueError, UnicodeDecodeError):
+        pass
+    check("client X-Forwarded-For chain is extended, not replaced",
+          status2 == 200 and ok2, "status=%s body=%r" % (status2, body2[:160]))
 
 
 def test_auth():
@@ -784,6 +818,7 @@ def main():
         test_proxy()
         test_connection_reuse(fail_control_dir)
         test_chunked_trailer()
+        test_forwarded_headers()
         test_upstream_tls()
         test_auth()
         test_rate_limit()

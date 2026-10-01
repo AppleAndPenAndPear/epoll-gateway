@@ -492,7 +492,7 @@ HttpHandler::ResolvedRoute HttpHandler::resolve_route(const HttpRequest& req) co
     return matched;
 }
 
-void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) const {
+void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp) const {
     if (!matched.route) {
         resp.status_code = 404;
         resp.status_message = "Not Found";
@@ -537,9 +537,19 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         tls.ca_file = server.tls_ca_file;
         tls.server_name = server.tls_server_name;
         tls.skip_verify = server.tls_skip_verify;
+        // The backend must be able to see the real caller: append this hop to
+        // X-Forwarded-For (a client-supplied chain is preserved but our IP is
+        // always appended last) and pin X-Real-IP to the connection peer.
+        std::unordered_map<std::string, std::string> upstream_headers = req.headers;
+        if (!client_ip.empty()) {
+            auto xff = upstream_headers.find("x-forwarded-for");
+            if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
+            else upstream_headers["X-Forwarded-For"] = client_ip;
+            upstream_headers["X-Real-IP"] = client_ip;
+        }
         while (true) {
             be = forward_request(server.host, server.port, req.method, req.path,
-                                 req.headers, req.body,
+                                 upstream_headers, req.body,
                                  route.upstream_target.timeout_ms, tls);
             if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
                 !should_retry_backend_request(req.method, be.error, attempt_count)) {
@@ -564,7 +574,19 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         resp.status_code = be.status_code;
         resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
         resp.body = be.body;
+        // Framing is re-computed here, never forwarded: copying the upstream's
+        // Content-Length/Transfer-Encoding verbatim produced CL+TE conflicts on
+        // chunked backends (the response-side smuggling vector the request
+        // parser rejects). Connection/Keep-Alive are hop-by-hop and our own
+        // keep-alive decision governs the client hop.
+        auto header_key_lower = [](std::string k) {
+            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+            return k;
+        };
         for (const auto& [k, v] : be.headers) {
+            const std::string lk = header_key_lower(k);
+            if (lk == "content-length" || lk == "transfer-encoding" ||
+                lk == "connection" || lk == "keep-alive") continue;
             resp.headers[k] = v;
         }
         resp.headers["Content-Length"] = std::to_string(resp.body.size());
@@ -623,7 +645,9 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
     bool path_handled = false;
 
     if (matched.route) {
-        dispatch_route(req, matched, resp);
+        auto ip_it = client_ip_map_.find(sock);
+        const std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "";
+        dispatch_route(req, matched, client_ip, resp);
         resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
         path_handled = true;
     }
