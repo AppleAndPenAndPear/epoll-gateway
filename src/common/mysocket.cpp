@@ -219,17 +219,22 @@ bool Socket::initSSLClient(SSL_CTX* ctx, const std::string& hostname) {
   return true;
 }
 
-bool Socket::sslAccept() {
+SSLHandshakeStatus Socket::sslAccept() {
+  // One step of the non-blocking handshake. Distinguishing "not finished yet"
+  // from a fatal error is load-bearing: the caller keeps the connection and
+  // re-arms epoll only for WANT_*, and must tear the connection down on
+  // FAILED — otherwise a dead fd is re-polled and re-accepted forever, one
+  // error log per turn.
+  ERR_clear_error();
   int ret = SSL_accept(ssl_);
-  if (ret == 1) return true;
+  if (ret == 1) return SSLHandshakeStatus::COMPLETE;
   int err = SSL_get_error(ssl_, ret);
-  if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-    // handshake not finished; wait for events
-    return false;
-  }
-  // other errors
+  if (err == SSL_ERROR_WANT_READ) return SSLHandshakeStatus::WANT_READ;
+  if (err == SSL_ERROR_WANT_WRITE) return SSLHandshakeStatus::WANT_WRITE;
+  // other errors: the error queue was cleared above, so this string reflects
+  // THIS failure only.
   Logger::get()->error("SSL_accept failed: {}", ERR_error_string(ERR_get_error(), nullptr));
-  return false;
+  return SSLHandshakeStatus::FAILED;
 }
 
 SSLHandshakeStatus Socket::sslConnect() {

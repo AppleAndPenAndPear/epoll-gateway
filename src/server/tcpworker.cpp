@@ -259,12 +259,30 @@ void TcpWorker::handle_client(int fd, uint32_t events) {
   auto& conn = it->second;
 
   if (conn.ssl_state == SSLState::HANDSHAKING) {
-    if (conn.sock->sslAccept()) {
+    // A peer that disconnects mid-handshake surfaces as ERR/HUP/RDHUP. These
+    // events must be handled BEFORE another SSL_accept attempt: running the
+    // handshake on a dead fd fails fatally, and re-arming the events makes
+    // the dead fd spin forever (one error log per turn).
+    if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+      conns_.erase(fd);
+      last_active_.erase(fd);
+      client_ips_.erase(fd);
+      return;
+    }
+    auto status = conn.sock->sslAccept();
+    if (status == SSLHandshakeStatus::COMPLETE) {
       conn.ssl_state = SSLState::READY;
       epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);  // Only watch reads
       Logger::get()->info("SSL handshake done on fd {}", fd);
+    } else if (status == SSLHandshakeStatus::FAILED) {
+      // Fatal handshake error: the fd is dead, tear it down instead of
+      // re-arming and retrying forever.
+      conns_.erase(fd);
+      last_active_.erase(fd);
+      client_ips_.erase(fd);
     } else {
-      // Handshake not finished, re-register the events (include EPOLLOUT, since the SSL handshake may need to write)
+      // WANT_READ/WANT_WRITE: handshake not finished, re-register the events
+      // (include EPOLLOUT, since the SSL handshake may need to write)
       // EPOLLONESHOT requires re-registration after every event
       epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
     }

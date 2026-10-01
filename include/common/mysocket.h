@@ -86,7 +86,7 @@ public:
   // Client-side setup: attaches a client SSL_CTX, sends SNI and pins the
   // expected hostname for certificate verification (empty hostname skips it).
   bool initSSLClient(SSL_CTX* ctx, const std::string& hostname);
-  bool sslAccept();                     // perform the SSL handshake (server-side accept)
+  SSLHandshakeStatus sslAccept();       // one non-blocking step of the server-side accept
   SSLHandshakeStatus sslConnect();      // one non-blocking step of the client handshake
   void closeSSL();                      // gracefully shut down the SSL connection
   // Returns >0 bytes read, 0 on clean end of stream, or -1 with errno==EAGAIN
