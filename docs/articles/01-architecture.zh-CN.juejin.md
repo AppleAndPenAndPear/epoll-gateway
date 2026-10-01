@@ -1,6 +1,6 @@
 # 从零用 C++17 写一个 API 网关：线程模型、控制面分离，以及三个真实 Bug
 
-> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/docs/BENCHMARKS.md)，测试计数来自 CI 的实际输出（101 个单测 / 77 条集成断言）。
+> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md)，测试计数来自 CI 的实际输出（101 个单测 / 77 条集成断言）。
 
 想直接上手的话，三条命令就能跑起来（预编译包已捆绑 libspdlog/libfmt，静态链接 C++ 运行时，环境要求 glibc ≥ 2.35 且系统自带 OpenSSL 3，即 Ubuntu 22.04+ / Debian 12+）：
 
@@ -22,7 +22,7 @@ tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
 - **非目标**：通用七层负载均衡（大流量静态分发交给 Nginx/CDN）、服务网格（不做 sidecar）、动态服务发现（upstream 列表在配置里，不在 etcd 里）。
 - **约束**：C++17、Linux、epoll，代码量控制在一个人能读懂的范围内——这一点直接决定了很多后面的取舍。
 
-用数据校准一下预期，免得误会成"比 Nginx 更轻更快"的轮子文。我们在同一台 2 vCPU 机器上和 Nginx 1.24 做过同条件对比——同一张证书、同一条路由、同一组 4 个后端、客户端/网关/后端同机挤 2 个核：**内存基本持平**（稳态 RSS 26.0 MB vs 26.4 MB），**吞吐低 2.5~2.7 倍**（c8 608 vs 1549 RPS，完整表格见 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/docs/BENCHMARKS.md) 的对比章节）。所以这个项目的差异化不在性能或内存，而在**部署与运维面**：单二进制、零运行时依赖（不用装 Postgres/etcd/Redis）、一个 JSON 覆盖鉴权/限流/熔断/热加载/优雅停机，外加一份一个人能读完的代码。要极限吞吐，Nginx 仍然是对的答案；要的是"十分钟内在内网/边缘机器上跑起一套带完整上线语义的网关"，这才是本项目想去的位置。
+用数据校准一下预期，免得误会成"比 Nginx 更轻更快"的轮子文。我们在同一台 2 vCPU 机器上和 Nginx 1.24 做过同条件对比——同一张证书、同一条路由、同一组 4 个后端、客户端/网关/后端同机挤 2 个核：**内存基本持平**（稳态 RSS 26.0 MB vs 26.4 MB），**吞吐低 2.5~2.7 倍**（c8 608 vs 1549 RPS，完整表格见 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md) 的对比章节）。所以这个项目的差异化不在性能或内存，而在**部署与运维面**：单二进制、零运行时依赖（不用装 Postgres/etcd/Redis）、一个 JSON 覆盖鉴权/限流/熔断/热加载/优雅停机，外加一份一个人能读完的代码。要极限吞吐，Nginx 仍然是对的答案；要的是"十分钟内在内网/边缘机器上跑起一套带完整上线语义的网关"，这才是本项目想去的位置。
 
 ## 2. 线程模型：SO_REUSEPORT + One Loop Per Thread
 
@@ -38,7 +38,7 @@ tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
               └────── 内核按连接散列分发（SO_REUSEPORT）─┘
 ```
 
-每个 `TcpWorker` 自己 `socket()`+`bind()`+`listen()` 一个带 `SO_REUSEPORT` 的监听套接字，然后跑自己的 epoll 循环（[server.cpp](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/src/server/server.cpp#L28)、[tcpworker.cpp](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/src/server/tcpworker.cpp)）。这样做的收益：
+每个 `TcpWorker` 自己 `socket()`+`bind()`+`listen()` 一个带 `SO_REUSEPORT` 的监听套接字，然后跑自己的 epoll 循环（[server.cpp](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/src/server/server.cpp#L28)、[tcpworker.cpp](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/src/server/tcpworker.cpp)）。这样做的收益：
 
 - 没有共享 accept 队列，也就没有多线程争抢 accept 的惊群问题——内核直接把连接散列到某个监听套接字；
 - 连接一旦落到某个 worker，之后所有读写都在这个线程里完成，**同一 fd 任意时刻只被一个线程碰**，不需要给连接加锁；
@@ -57,7 +57,7 @@ if (has_pending_send) epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT
 else                  epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);
 ```
 
-（片段见 [tcpworker.cpp:247-267](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/src/server/tcpworker.cpp#L247-L267)）
+（片段见 [tcpworker.cpp:247-267](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/src/server/tcpworker.cpp#L247-L267)）
 
 这个组合换来的是"不会被同一事件唤醒多次"，但也带来两条铁律：
 
@@ -82,7 +82,7 @@ accept → 非阻塞读 → HTTP 状态机解析 → 路由匹配（只匹配一
 两个实现细节值得单独说：
 
 - **路由只匹配一次**：`ResolvedRoute` 在鉴权、限流、分发之间复用，避免"每个阶段各匹配一次"造成的语义漂移。
-- **sendfile 只在非 TLS 路径可用**。`sendfile(2)` 绕不过 OpenSSL 加密层，所以 TLS 连接必须走 OpenSSL 的写队列；代码里两条路径是分开的（[http_handler.cpp:1008-1048](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/src/server/http_handler.cpp#L1008-L1048)）。这是零拷贝在 HTTPS 世界里的真实边界，很多文章不会提。
+- **sendfile 只在非 TLS 路径可用**。`sendfile(2)` 绕不过 OpenSSL 加密层，所以 TLS 连接必须走 OpenSSL 的写队列；代码里两条路径是分开的（[http_handler.cpp:1008-1048](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/src/server/http_handler.cpp#L1008-L1048)）。这是零拷贝在 HTTPS 世界里的真实边界，很多文章不会提。
 
 ## 4. 可靠性三件容易被忽略的事
 
@@ -135,7 +135,7 @@ proxy        (c50)    836 QPS / 53.64ms → 1083 QPS / 42.22ms
 
 根因是 Nagle 算法与 delayed ACK 的经典组合：服务端把响应分成多个小段写（TLS 场景下尤其明显：头部一个记录、body 一个记录），第一个小包发出后，Nagle 会把后续小包攒着等 ACK；而对端因为只有一个未确认段，正在等 40ms 的 delayed-ACK 定时器——双方就这么互等到定时器超时。
 
-修复就是在 accepted socket 和 upstream socket 上都设 `TCP_NODELAY`（[mysocket.cpp](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/src/common/mysocket.cpp) 的 `setnodelay()`）。**轻载延迟改善约 5.4 倍，握手吞吐约 4.3 倍**。
+修复就是在 accepted socket 和 upstream socket 上都设 `TCP_NODELAY`（[mysocket.cpp](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/src/common/mysocket.cpp) 的 `setnodelay()`）。**轻载延迟改善约 5.4 倍，握手吞吐约 4.3 倍**。
 
 这个 Bug 的教训不在"要开 TCP_NODELAY"，而在：**当延迟数字稳定到不像话时，它是协议行为而不是你的代码在慢**。
 
@@ -177,7 +177,7 @@ void drain_request_body(int fd, const ParsedAdminRequest& req) {
 }
 ```
 
-（完整实现见 [admin_server.cpp:44](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/src/server/admin_server.cpp#L44-L69)）
+（完整实现见 [admin_server.cpp:44](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/src/server/admin_server.cpp#L44-L69)）
 
 这个 Bug 的有趣之处在于它的触发条件是"客户端多发了你不关心的数据"，而**当时没有任何测试覆盖它**——所有集成测试和文档示例里的 POST 都不带 body。现在有一条断言专门覆盖这个组合。
 
@@ -231,7 +231,7 @@ cd epoll-gateway
 scripts/benchmark/run_benchmark.sh   # wrk 压测（15s/场景）
 ```
 
-延伸阅读：[README（能力清单）](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/README.zh-CN.md)、[完整压测报告](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/docs/BENCHMARKS.md)、[systemd 部署与滚动升级](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/docs/DEPLOYMENT.md)、[当前状态快照](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/main/docs/PROJECT_STATUS.md)。
+延伸阅读：[README（能力清单）](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/README.zh-CN.md)、[完整压测报告](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md)、[systemd 部署与滚动升级](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/DEPLOYMENT.md)、[当前状态快照](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/PROJECT_STATUS.md)。
 
 ---
 
