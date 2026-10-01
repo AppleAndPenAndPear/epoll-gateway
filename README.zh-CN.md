@@ -2,7 +2,7 @@
 
 # epollthread
 
-基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 101/101 通过）、集成测试（77 项断言）及 AddressSanitizer 支持。
+基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 请求追踪、AUDIT/CLF 双通道日志、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（CTest 101/101 通过）、集成测试（81 项断言）及 AddressSanitizer 支持。
 
 ## 5 分钟快速体验
 
@@ -61,6 +61,7 @@ upstream——见 [examples/](examples/) 下的可运行场景。
 - **RESTful 路由系统**：可注册任意方法+路径模式（如 `/users/{id}`）的处理函数，支持动态路由参数提取与分发，轻松构建 JSON API。
 - **配置驱动网关路由**：通过 `routes` 配置 method、path、host、tenant、鉴权、限流和执行目标；路由注册与执行分离，支持 `local`、`upstream`、`static` 三类目标。
 - **反向代理与上游负载均衡**：通过 `UpstreamTarget` 引用 upstream 服务组，由 `UpstreamManager` 进行轮询选路和主动 TCP 健康检查，自动摘除故障节点。
+- **上游侧的调用方身份**：把客户端 IP 追加到 `X-Forwarded-For`（保留客户端已有的链路，本跳始终在末尾），并写入 `X-Real-IP`，让后端能看到真实调用方；上游的分帧头不再原样透传、代理响应由网关重新分帧（chunked 后端不会向客户端泄漏 `Transfer-Encoding` 与 `Content-Length` 并存的非法组合）。
 - **上游访问控制与超时**：支持 route/API Key 的 host、tenant 绑定；连接、发送、读取阶段均具备超时控制，区分 502 与 504。
 - **上游连接池**：到各 upstream 的 keep-alive 连接进入池中复用（空闲超时 60s、每 upstream 最多 16 条空闲），每个代理请求省去一次 TCP 三次握手；响应按 Content-Length / chunked（含 trailer）/ EOF 精确分帧，后端已关闭的陈旧连接在取用时被预先探测并透明重建；请求发出后的失败仅对幂等方法自动重试，POST 绝不内部重发。池身份包含 TLS 校验策略，为一个后端名验证过的会话绝不会交给策略不同的 upstream 复用。
 - **上游错误分类**：区分连接失败、连接超时、发送失败、发送超时、读取失败、读取超时和非法响应，并通过 Prometheus 暴露错误计数，映射到 502/503/504。
@@ -92,7 +93,7 @@ upstream——见 [examples/](examples/) 下的可运行场景。
 - **配套非阻塞客户端**：独立的状态机 HTTPS 客户端（TLS 握手、证书与主机名校验、连接/发送/接收全流程），展示 epoll 在客户端的使用方法。
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
 - **单元测试**：基于 Google Test，当前 CTest 101/101 通过，覆盖 HTTP 解析器（含走私攻击向量）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验、TLS 加固（含服务端/客户端共享策略与客户端校验配置）、连接池语义（含 scheme 与校验身份隔离）、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
-- **集成测试**：77 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、带主机名校验的配套客户端、含主机名不匹配拒绝的 upstream TLS 校验、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、chunked trailer、优雅停机），仅依赖 Python 3 标准库。
+- **集成测试**：81 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、带主机名校验的配套客户端、含主机名不匹配拒绝的 upstream TLS 校验、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、chunked trailer、调用方身份注入、优雅停机），仅依赖 Python 3 标准库。
 - **性能基线**：`scripts/benchmark/run_benchmark.sh` 一键复现 wrk 压测（静态缓存命中 / 反向代理 / TLS 握手三场景），完整报告见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
 - **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
@@ -722,7 +723,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 6. **信号处理与优雅关闭**：`SIGINT`/`SIGTERM` 置位全局原子标志，Worker 在每次超时返回时检查并主动退出事件循环；`SIGHUP` 触发 runtime reload；析构顺序保证 Tcpserver → DynamicThreadPool → Logger::Guard，日志最后关闭。
 7. **路由系统**：内置路由通过 `register_default_routes()` 注册，配置路由通过 `register_configured_routes()` 注册；一次请求只匹配一次，`ResolvedRoute` 在鉴权、限流和分发之间复用；支持 method/path/Host/Tenant 四维匹配和 `local`/`upstream`/`static` 三类目标，未命中网关路由时 GET/HEAD 回退到静态文件服务。
 8. **空闲超时**：每个连接维护最后活跃时间，epoll_wait 超时时扫描并清理过期连接，支持配置超时阈值。
-9. **单元与集成测试**：使用 Google Test，当前 101/101 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固（服务端与客户端共享）、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 77 项断言，基于真实服务器 + mock 上游端到端验证（含 upstream TLS 校验）。
+9. **单元与集成测试**：使用 Google Test，当前 101/101 通过，覆盖解析（含走私攻击向量）、缓存、路由、鉴权、限流、配置 schema 校验、TLS 加固（服务端与客户端共享）、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 81 项断言，基于真实服务器 + mock 上游端到端验证（含 upstream TLS 校验）。
 
 ## 性能指标
 

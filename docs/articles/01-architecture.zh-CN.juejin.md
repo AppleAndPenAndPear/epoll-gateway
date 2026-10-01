@@ -1,6 +1,6 @@
 # 从零用 C++17 写一个 API 网关：线程模型、控制面分离，以及三个真实 Bug
 
-> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md)，测试计数来自 CI 的实际输出（101 个单测 / 77 条集成断言）。
+> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md)，测试计数来自 CI 的实际输出（101 个单测 / 81 条集成断言）。
 
 想直接上手的话，三条命令就能跑起来（预编译包已捆绑 libspdlog/libfmt，静态链接 C++ 运行时，环境要求 glibc ≥ 2.35 且系统自带 OpenSSL 3，即 Ubuntu 22.04+ / Debian 12+）：
 
@@ -75,7 +75,8 @@ accept → 非阻塞读 → HTTP 状态机解析 → 路由匹配（只匹配一
       → 执行目标：
           static   → 响应缓存命中 / 大文件 sendfile 零拷贝
           upstream → 健康检查选节点 → 连接池取连接 → 精确分帧读响应
-      → 写回（TLS 走 OpenSSL BIO 队列，非 TLS 走 sendfile）
+                     （客户端 IP 追加进 X-Forwarded-For / X-Real-IP 再转发）
+      → 写回（TLS 走 OpenSSL BIO 队列，非 TLS 走 sendfile；上游分帧头被剥离，响应由网关重新分帧）
       → trace_id 贯穿 + AUDIT/CLF 双通道日志
 ```
 
@@ -189,6 +190,8 @@ void drain_request_body(int fd, const ParsedAdminRequest& req) {
 
 顺带一提，请求方向上的同类问题也做了处理：重复 `Content-Length`、`Content-Length` 与 `Transfer-Encoding` 并存、非 chunked 的 `Transfer-Encoding`、非数字长度、非法头部字符、超长请求行/头部块一律 400 + `Connection: close`——这是 HTTP 请求走私的经典入口，宁可拒绝也不猜。
 
+而响应方向上的对称问题，是在文章定稿前的一次发布前审计里才被翻出来的，算是"同一类错误的两副面孔"：早年代理路径把上游的 `Transfer-Encoding` 头**原样透传**，同时又自己盖了一个 `Content-Length`，于是凡是 chunked 后端，客户端都会收到 `Transfer-Encoding: chunked` 与 `Content-Length` **并存**的响应——这不只是 RFC 7230 明令禁止，更是请求方向上被我们拒掉的走私组合在响应侧的重演。它没被测试抓住的原因也很有意思：网关当时是把上游的原始分帧字节流整体透传的，盖上去的 `Content-Length` 恰好等于原始流长度，客户端按 chunked 解码依然正确，测试全绿——**数字恰好自洽，掩盖了协议违规**。修复是让代理层把上游 chunked 响应解成真实 body，转发时剥离分帧/逐跳头，再由网关按 `Content-Length` 重新分帧，并补上断言（转发后的响应不得出现 `Transfer-Encoding`，且 `Content-Length` 等于解码后长度）。同一轮审计还补上了 `X-Forwarded-For` / `X-Real-IP` 注入，让后端能看到真实调用方。
+
 ## 7. 测试策略：为什么集成测试要起真服务器
 
 单测覆盖纯逻辑：HTTP 解析器（含各种走私向量）、LRU 缓存、路由匹配、鉴权策略、限流隔离、配置 schema 校验、TLS 上下文构建、连接池语义、客户端超时与幂等重试、健康检查与熔断状态机。
@@ -201,7 +204,7 @@ void drain_request_body(int fd, const ParsedAdminRequest& req) {
 - 优雅停机时用一条正在处理 1.5 秒慢请求的连接，验证它在 drain 窗口内被完整服务；
 - 管理口密钥轮换后旧 key 401 / 新 key 200。
 
-当前状态：**101 个单测（CTest）+ 77 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
+当前状态：**101 个单测（CTest）+ 81 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
 
 ## 8. 现在还没做的（诚实清单）
 
@@ -227,7 +230,7 @@ tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                              # 构建 + 101 单测 + 77 条集成断言
+./ci.sh                              # 构建 + 101 单测 + 81 条集成断言
 scripts/benchmark/run_benchmark.sh   # wrk 压测（15s/场景）
 ```
 

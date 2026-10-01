@@ -4,6 +4,17 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-01
+
+### Fixed
+
+- **Proxied chunked responses leaked a forbidden `Transfer-Encoding` + `Content-Length` combination.** The proxy path forwarded the upstream's framing headers verbatim and then stamped its own `Content-Length` on top, so any chunked backend produced a client response carrying both — exactly the response-side form of the request-smuggling vector the parser rejects. It stayed green because the raw chunked stream was passed through wholesale, making the stamped `Content-Length` coincidentally equal the raw stream length. The upstream body is now de-chunked, framing/hop-by-hop headers are stripped, and the gateway re-frames by `Content-Length` (`http_client.cpp`, `http_handler.cpp`).
+- **The client IP was never forwarded to backends.** The proxy now appends the peer address to `X-Forwarded-For` (a client-supplied chain is preserved, our hop last) and pins `X-Real-IP`, so backends can identify the real caller (`http_handler.cpp`).
+
+### Changed
+
+- Integration suite grew from 77 to 81 assertions: a proxied chunked response must carry no `Transfer-Encoding` with a `Content-Length` matching the decoded body, and the backend must observe the injected `X-Forwarded-For`/`X-Real-IP` (with an existing chain extended rather than replaced).
+
 ## 2026-09-29
 
 ### Fixed

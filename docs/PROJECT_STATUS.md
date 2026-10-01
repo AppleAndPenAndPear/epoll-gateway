@@ -2,15 +2,15 @@
 
 ## Current Stage
 
-Building the core capability set of a commercial API gateway. P1 (regression safety net), P2 (config + security hardening), P3 (performance baseline) and P4 (operations productization: ops endpoints, admin API, graceful shutdown, deployment docs) are complete. Next: P5, commercial features shaped by customer feedback.
+Building the core capability set of a commercial API gateway. P1 (regression safety net), P2 (config + security hardening), P3 (performance baseline) and P4 (operations productization: ops endpoints, admin API, graceful shutdown, deployment docs) are complete. The 2026-09-29 Nginx comparison opened P6 (performance honesty follow-up: log switch, profiling the throughput gap); a 2026-10-01 correctness audit ([ROADMAP.md](ROADMAP.md)) found and fixed two pre-publication defects: proxied chunked responses leaked a forbidden `Transfer-Encoding`+`Content-Length` combination (upstream framing headers are now stripped and responses re-framed) and the client IP was not forwarded to backends (`X-Forwarded-For`/`X-Real-IP` are now injected). CORS/`OPTIONS` is documented as a deliberate non-goal. Next: P6 (log switch + profiling), then P5 (commercial features shaped by customer feedback).
 
 ## Current Validation
 
 - C++17 Release build passes.
 - CTest: 101/101 passing.
-- Integration tests: 77/77 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Integration tests: 81/81 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
 - Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots.
-- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
+- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section and re-framed proxied responses), caller-identity injection (X-Forwarded-For chain extension + X-Real-IP), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
 - First-run experience: a 5-minute quickstart at the top of both READMEs (built-in echo routes answer with no backend; admin auth demo with `admin-demo-key`); runnable scenarios under [examples/](examples/) — load balancing with health checks and a verified `https://` upstream; dev certificates are generated locally by `scripts/gen_dev_certs.sh` and never committed (`certs/` is gitignored); the server accepts an optional config path argument (`./build/server examples/load-balanced/config.json`).
 - Deployment: [DEPLOYMENT.md](DEPLOYMENT.md) — systemd unit, rolling upgrade with graceful drain, admin API usage.
@@ -167,7 +167,7 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 	- Upstream timeouts, connection failures, and idempotent retries
 	- Upstream health checks
 	- Circuit breaker open/reject/recovery probing
-- Integration suite (72 assertions) proves end-to-end behavior including connection reuse, TLS policy, and the companion client's certificate/hostname verification.
+- Integration suite (81 assertions) proves end-to-end behavior including connection reuse, TLS policy, the companion client's certificate/hostname verification, and caller-identity injection on the upstream hop.
 - Benchmark harness `scripts/benchmark/run_benchmark.sh` + report in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Request Flow
@@ -194,22 +194,26 @@ Client connects
 
 ## Known Limitations
 
-- Circuit breaker state is currently maintained independently per worker, not as a global state shared across all workers.
-- The route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
+- API composition/fan-out is not implemented: a configured route targets one upstream service group and the proxy path performs a single-backend request. Upstream selection/failover among members of that group is not multi-service aggregation.
+- Upstream forwarding is synchronous in the request path; bounded parallel fan-out needs an async/non-blocking execution design so slow dependencies do not stall worker event loops.
+- Route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
 - Runtime reload uses periodic worker polling; workers are not guaranteed to switch configuration at exactly the same instant.
 - Route matching is still a linear scan — simple and reliable at the current scale, with no Trie or index structure for large route sets yet.
-- The upstream connection pool keeps only idle connections in memory (no cross-process sharing); async upstream I/O and multi-algorithm load balancing (beyond round_robin) are not implemented.
-- No `/healthz`/`/readyz` endpoints or admin API yet (planned for P4).
-- OpenTelemetry `traceparent`, distributed tracing, and external audit storage are not yet integrated.
-- A dynamic thread pool interface exists, but the main HTTP path still mostly runs on worker threads.
+- The upstream connection pool keeps only idle connections in memory (no cross-process sharing); upstream I/O is synchronous and load balancing currently supports `round_robin` only.
+- There is no shared rate-limit quota across processes/hosts. The current limiter is shared across workers in one process.
+- Inbound HTTP/2, gRPC and WebSocket support are not established; document and test any protocol before claiming it.
+- OpenTelemetry `traceparent` propagation and distributed tracing are not integrated; current `X-Trace-Id` is request/log correlation, not a full distributed trace.
+- Per-request access-log control, route/upstream latency histograms, and external audit export remain gaps; see [ROADMAP.md](ROADMAP.md) P6 and [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md).
+- AI-specific provider routing, token/cost quotas, verified SSE streaming, model-level telemetry and provider credential management are not implemented. The gateway must not claim AI-gateway capabilities yet.
+- The project has a release/deployment path, but does not yet claim a multi-instance control plane, cross-instance state consistency, a support lifecycle, or compliance certification.
 
 ## Next Steps
 
-1. P4: add `/healthz` (liveness) and `/readyz` (readiness) endpoints.
-2. P4: graceful-shutdown drain refinement (stop accepting first, wait for in-flight requests) and deployment docs.
-3. P4: admin API (separate listen address, authenticated) for hot config updates and upstream/breaker status.
-4. Complete per-route/host/tenant latency histograms and failure-rate metrics.
-5. Evaluate an implementation for cross-worker shared circuit breaker state.
+1. Keep [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md) as the capability register; use customer interviews to validate which optional capabilities deserve implementation.
+2. Build bounded API composition: parallel upstream calls, end-to-end deadline, cancellation, partial-failure policy, and per-dependency telemetry. Avoid blocking an epoll worker while waiting for multiple backends.
+3. Close the operations gaps: per-request access-log control (while preserving security audit), route/upstream metrics with bounded label cardinality, and `traceparent` propagation.
+4. Decide protocol, identity, mTLS, resource-limit, and cluster requirements from target-user evidence; do not imply support before integration tests and documentation exist.
+5. Start a narrow AI gateway pilot only after a real user validates demand; prioritize model routing, token/cost budgets, correct streaming and model-level observability.
 
 ## Recent Decisions
 
