@@ -10,6 +10,8 @@ The scope, up front, so this doesn't read as "yet another Nginx":
 - **Non-goals**: general-purpose L7 load balancing (front it with Nginx/CDN for bulk static), service mesh (no sidecar), dynamic service discovery (upstreams live in config, not in etcd).
 - **Constraint**: C++17, Linux, epoll, and a codebase one person can read. That constraint drove many of the decisions that follow.
 
+A data-based calibration of expectations, so this doesn't read as a "lighter than Nginx" piece either. We ran a same-conditions comparison against Nginx 1.24 on one 2 vCPU box — same certificate, same route, same four backends, client/gateway/backends sharing the two cores: **memory is a wash** (steady-state RSS 26.0 MB vs 26.4 MB) and **throughput is 2.5-2.7x lower** (608 vs 1549 RPS at c8; full table in the comparison section of [docs/BENCHMARKS.md](../BENCHMARKS.md)). So the differentiation is neither performance nor memory — it is the **deployment and operations surface**: a single binary with zero runtime dependencies (no Postgres/etcd/Redis to install), one JSON file covering auth/rate limiting/circuit breaking/hot reload/graceful shutdown, and a codebase one person can read end to end. If you need maximum throughput, Nginx is still the right answer; if what you want is a gateway with full production semantics running on an edge or internal-network box in ten minutes, that is where this project aims.
+
 ## 2. Threading model: SO_REUSEPORT + One Loop Per Thread
 
 There are three common shapes: single reactor plus a thread pool, many preforked processes, and what this project uses — **SO_REUSEPORT + One Loop Per Thread**.
@@ -170,6 +172,7 @@ Current state: **101 unit tests (CTest) + 77 integration assertions**, all throu
 - No plugin system or Lua — extend by changing code or fronting another upstream.
 - The admin listener's topology (enabled/port/bind) needs a process restart (keys rotate hot).
 - Benchmark numbers come from a 2 vCPU box where client, gateway and Python mock share the same machine: absolute values mean little, **ratios** carry the conclusion.
+- The same-conditions Nginx comparison (Section 1) showed memory parity and a 2.5-2.7x throughput gap. The specific sources of that gap — per-request access/AUDIT log writes, buffer copies in the proxy path, TLS record sizing — are not yet isolated, and per-request logging currently has no config switch to turn it off, which is itself the next config feature to add.
 - The connection pool's throughput win on loopback is within noise (a local TCP connect costs tens of microseconds). Its value scales with backend distance — it removes one RTT per request.
 
 ## 9. Reproducing

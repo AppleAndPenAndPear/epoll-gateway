@@ -1,6 +1,6 @@
 # ROADMAP
 
-The execution plan for taking this project from a personal project to a commercial product. Three parts: positioning and differentiation, the technical evolution plan (P1~P5), and the commercialization validation track.
+The execution plan for taking this project from a personal project to a commercial product. Three parts: positioning and differentiation, the technical evolution plan (P1~P6), and the commercialization validation track.
 
 > Companion documents: [PROJECT_STATUS.md](PROJECT_STATUS.md) records the current capability snapshot, [../CHANGELOG.md](../CHANGELOG.md) records completed changes, and this file plans what comes next.
 
@@ -18,23 +18,23 @@ The execution plan for taking this project from a personal project to a commerci
 | Higress | Envoy + Go control plane | K8s ecosystem | Deeply coupled to cloud native; unfriendly to bare metal/edge |
 | Nginx | C | Very light | Not an API gateway — auth/rate limiting/tenancy/metrics all require custom extension |
 
-**Market gap**: no competitor combines "Nginx-grade resource footprint with out-of-the-box API gateway semantics". APISIX grows toward the ecosystem, Nginx spreads as a pure proxy — the middle is where this project sits.
+**Market gap**: originally framed as "Nginx-grade resource footprint with out-of-the-box API gateway semantics". The 2026-09-29 same-conditions comparison against Nginx 1.24 ([BENCHMARKS.md](BENCHMARKS.md)) corrected this: memory is a wash (steady-state RSS 26.0 MB vs 26.4 MB) and throughput is 2.5-2.7x lower — so the gap we actually fill is **deployment and operations surface**: no competitor ships out-of-the-box gateway semantics (auth/tenancy/rate limiting/metrics/hot reload) as a single binary with one JSON config and zero runtime dependencies. APISIX grows toward the ecosystem, Nginx stays a pure proxy — the middle is still where this project sits, but the middle is defined by operational simplicity, not resource footprint.
 
 ### Three Verifiable Differentiators (every action maps back to them)
 
-1. **Extremely lightweight** — targets: single binary < 10MB, idle memory < 30MB, zero external dependencies (no etcd/Postgres/runtime), runs on ARM out of the box.
+1. **Single-binary deployability** — targets: single binary < 10MB, zero external dependencies (no etcd/Postgres/runtime), one JSON config covering the full production surface, runs on ARM out of the box. *Data note (2026-09-29): idle memory was measured at parity with Nginx (~26 MB each), so "lower memory" is NOT a differentiator and must not be used in marketing copy; binary size and dependency-free deployment remain.*
 2. **Fully auditable** — targets: core code kept within tens of thousands of lines, readable end-to-end by one senior engineer in a week. Aimed at Xinchuang (domestic IT), classified intranets, and security-sensitive customers.
 3. **Embeddable** — targets: runs as a standalone process and embeds into third-party products as a static library (gateway built into device firmware).
 
 ### One-line Positioning
 
-> For teams with no etcd, no K8s, and no ops department: one API gateway binary that runs lean, reads in a week, and embeds cleanly.
+> For teams with no etcd, no K8s, and no ops department: one API gateway binary — one JSON config, nothing else to install, a codebase you can read in a week, and it embeds cleanly.
 
 ### What We Deliberately Won't Do
 
 - No plugin marketplace, no sprawling dashboard, no all-protocol suite (competing on ecosystem is a losing game)
 - No show-off features like HTTP/3/QUIC (target customers don't care)
-- No contest over extreme benchmark numbers (we sell "good enough + light", not peak performance)
+- No contest over extreme benchmark numbers (we sell "good enough + deployable", not peak performance — the Nginx comparison quantified the gap at 2.5-2.7x and we say so publicly)
 
 ### Licensing Strategy (current decision: stay MIT for now)
 
@@ -44,7 +44,7 @@ The execution plan for taking this project from a personal project to a commerci
 
 ---
 
-## 2. Technical Evolution Plan (P1~P5)
+## 2. Technical Evolution Plan (P1~P6)
 
 | Phase | Theme | Exit Criteria (DoD) |
 |---|---|---|
@@ -53,6 +53,7 @@ The execution plan for taking this project from a personal project to a commerci
 | **P3** | Performance baseline | Load test report across three scenarios + connection pooling landed |
 | **P4** | Operations productization | Admin API + graceful shutdown + deployment docs |
 | **P5** | Commercial features | Shape branch decided by customer feedback |
+| **P6** | Performance honesty follow-up | Log switch landed; throughput gap vs Nginx profiled and top costs addressed |
 
 ### P1: Integration Tests and the Regression Safety Net
 
@@ -88,6 +89,16 @@ The execution plan for taking this project from a personal project to a commerci
 | Edge/OEM embedding | Device vendor outreach, concentrated ARM user feedback | C API/static library form, cross-compilation, offline activation |
 | Xinchuang compliance | Integrator/domestic-IT customer outreach | Kylin/UOS, Kunpeng/Phytium/Loongson adaptation and certification |
 | Self-hosting for small teams | Community growth, self-hosting issues clustering | Mini control plane (SQLite instead of etcd), multi-tenant quotas |
+
+### P6: Performance Honesty Follow-up (data-driven, from the 2026-09-29 Nginx comparison)
+
+The comparison in [BENCHMARKS.md](BENCHMARKS.md) established: memory parity, 2.5-2.7x throughput gap, and the gateway being CPU-bound in its own request path (run-to-run stable at 600-650 RPS while Nginx numbers floated with machine noise). Before any optimization, make the costs visible and controllable:
+
+- **Per-request log switch (do first)**: every request currently writes access (CLF) + AUDIT log lines with no config option to disable — an unfair handicap against `access_log off` in comparisons and a real operational need. Add a config field (e.g. `access_log: enabled|disabled`), keep AUDIT for auth/reload/security events regardless.
+- **Profile before touching the hot path**: isolate the gap's sources — log I/O volume, buffer copies in the proxy path, TLS record sizing, per-request allocations — with flame graphs / syscall counts on the existing bench setup. Optimize only what profiling proves.
+- **Re-run the comparison after each change**: same methodology (interleaved rounds, medians, RSS sampling) so regressions and wins are directly comparable to the recorded baseline.
+- **Complete the competitor matrix when the network allows**: Traefik and KrakenD release binaries (download was blocked from this network); they add the "batteries-included gateway" reference points the Nginx comparison lacks.
+- **DoD**: log switch shipped with tests; profiling report appended to BENCHMARKS.md naming the top cost; the gap re-measured after addressing it (or a written justification for why the gap is accepted).
 
 ---
 
@@ -187,5 +198,11 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
   - Decision recorded: OpenSSL stays system-wide even though it, not glibc, sets the real floor — a security product must let crypto take distribution CVE patches rather than freeze it in the tarball. Going below glibc 2.35 would mean shipping OpenSSL 3 ourselves (manylinux2014 container + source build), deferred until a concrete Xinchuang/legacy-system requirement appears
   - Process lesson: the `ldd` gate and the CI smoke test both ran on the build host, which has every library the build needs — a self-verifying check that structurally cannot detect the bug it exists for. Packaging verification must execute in an environment where the build environment is absent
 - [x] Outreach: English README (2026-09-16) — `README.md` is the English edition with a language switcher, kept in sync with `README.zh-CN.md`
+- [x] P3: competitor comparison baseline — Nginx (2026-09-29)
+  - Same-conditions comparison against Nginx 1.24 (same certificate, same route, same 4 mock backends, 2 vCPU box, interleaved wrk rounds with medians): memory parity (steady-state RSS 26.0 MB vs 26.4 MB) and a 2.5-2.7x throughput gap (608 vs 1549 RPS at c8) — methodology, numbers and measurement traps recorded in [BENCHMARKS.md](BENCHMARKS.md)
+  - Positioning corrected across docs/articles: the differentiator is single-binary deployment + one-JSON-config operations surface, NOT memory or performance (data note added to Differentiator #1)
+  - The benchmark uncovered a real bug: clients disconnecting mid-TLS-handshake spun dead fds forever (`SSL_accept` returning "not finished" on a dead fd re-armed and retried each event loop turn — 225k error lines in 25s). Fix implemented: `sslAccept()` returns a four-state `SSLHandshakeStatus`, the worker tears down on FAILED/HUP before attempting a handshake, `ERR_clear_error()` per operation — pending CI verification and commit
+  - Per-request access/AUDIT logging has no config switch (a fairness gap in comparisons); logged as the first item of P6
+  - Pending: Traefik/KrakenD reference points (release binary downloads blocked from this network)
 - [ ] Outreach: first architecture article — draft lives in [docs/articles/](articles/); publishing to Juejin/Zhihu/V2EX/HN still pending
 - [ ] Signals: interview 5 potential users

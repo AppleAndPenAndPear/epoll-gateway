@@ -106,3 +106,93 @@ request budget.
 scripts/benchmark/run_benchmark.sh          # 15s per scenario
 scripts/benchmark/run_benchmark.sh 30       # longer runs for smoother numbers
 ```
+
+---
+
+# Comparison: epoll-gateway vs nginx (in-place baseline)
+
+A competitive comparison against an incumbent gateway, run to validate the
+"low resource footprint" positioning with data instead of claims.
+
+## Environment
+
+Same box as the baseline above: 2 vCPU, client (wrk), gateway, and backends
+all sharing it. Absolute numbers are meaningless on a saturated shared box —
+only ratios between configs are comparable.
+
+| item | value |
+|---|---|
+| Backend | 4 × Python `ThreadingHTTPServer` (ports 9001-9004), HTTP/1.1 keep-alive, `TCP_NODELAY` |
+| Route | single `GET /bench` returning a small JSON body, TLS terminated at the gateway |
+| epoll-gateway | release build, 2 workers, same cert, access+audit logging on (not configurable off yet) |
+| nginx 1.24 | 2 workers, `keepalive 16` upstream pool, same cert, access log enabled with the same CLF fields for fairness |
+| direct | wrk hitting backend 9001 directly (single-backend reference) |
+| Load | wrk 4.1.0, `-t2`, c8 (light) and c50 (saturation), 10-12s per run, 3 interleaved rounds, medians below |
+
+Traefik and KrakenD were planned but their release binaries could not be
+downloaded from this network (blocked CDN); they are pending.
+
+## Results (medians of 3 interleaved rounds)
+
+| target | conn | RPS | P50 | P99 |
+|---|---|---|---|---|
+| direct (1 backend) | 8 | 1210 | 6.0ms | 18.7ms |
+| direct (1 backend) | 50 | 1239 | 29.0ms | 988ms |
+| nginx (4 backends) | 8 | 1549 | 4.7ms | 15.1ms |
+| nginx (4 backends) | 50 | 1616 | 29.1ms | 138.8ms |
+| **epoll-gateway (4 backends)** | 8 | **608** | 12.7ms | 29.0ms |
+| **epoll-gateway (4 backends)** | 50 | **604** | 78.2ms | 227.1ms |
+
+Idle RSS (steady state, after warm traffic):
+
+| process | RSS |
+|---|---|
+| epoll-gateway (1 process, 2 workers) | 26.0 MB |
+| nginx (master 3.8 + 2 workers ≈ 22.6) | 26.4 MB total |
+
+## Findings
+
+1. **Memory parity, not advantage, vs nginx on this workload.** The claim
+   "lighter than nginx" does not hold for a single tiny route: both sit at
+   ~26 MB. The gateway's edge, if any, shows in single-binary deployment and
+   config surface, not RSS.
+2. **Throughput gap is ~2.5-2.7x.** epoll-gateway's numbers were extremely
+   stable across rounds (600-650 at c8) — it is CPU-bound inside its own
+   request path, while nginx/direct numbers bounced with background machine
+   noise. Candidates for the gap (unmeasured): per-request log writes, extra
+   copies in the proxy buffer path, TLS record sizing.
+3. **Measurement traps worth remembering:**
+   - `ps` %CPU is a lifetime average, useless for idle checks; sample
+     `/proc/PID/task/*/stat` over 3s instead.
+   - A stale pre-fix binary was still listening via `SO_REUSEPORT`, silently
+     serving half the requests and polluting every round until killed. Always
+     `ss -tlnp` before trusting a number.
+   - The Python mock needs `disable_nagle_algorithm = True` (see the 43 ms
+     finding above) — a regression here shows up as a mysterious 40 ms p50.
+
+## Bug found by the benchmark: handshake-phase spin on dead connections
+
+Under c50 load, a client that disconnects mid-handshake left the connection
+in the HANDSHAKING state spinning: `SSL_accept` on a dead fd kept returning
+"not finished", the fd was re-armed and retried forever, one error log per
+turn — 225k error lines in a 25s window.
+
+Root cause chain (all three required):
+
+1. `Socket::sslAccept()` returned `bool`, collapsing WANT_READ/WANT_WRITE
+   (retry) and FAILED (tear down) into the same `false`.
+2. The worker's HANDSHAKING branch checked EPOLLHUP/EPOLLERR *after* the
+   handshake attempt, so a dead fd never reached the cleanup path.
+3. No `ERR_clear_error()` before `SSL_accept`, so the error string was
+   `error:00000000` (per-thread error queue pollution).
+
+Fix: `sslAccept()` now returns the four-state `SSLHandshakeStatus`; the
+worker tears the connection down on FAILED/HUP before attempting a
+handshake; error queue is cleared per operation. Post-fix, the same load
+produces 11 log lines instead of 225k.
+
+## Pending
+
+- Traefik / KrakenD comparison (binary download blocked on this network).
+- A config option to disable per-request access/audit logging (fairness gap
+  vs `access_log off`; also a real feature request).
