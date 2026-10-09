@@ -2,15 +2,15 @@
 
 ## Current Stage
 
-Building the core capability set of a commercial API gateway. P1 (regression safety net), P2 (config + security hardening), P3 (performance baseline) and P4 (operations productization: ops endpoints, admin API, graceful shutdown, deployment docs) are complete. The 2026-09-29 Nginx comparison opened P6 (performance honesty follow-up: log switch, profiling the throughput gap); a 2026-10-01 correctness audit ([ROADMAP.md](ROADMAP.md)) found and fixed two pre-publication defects: proxied chunked responses leaked a forbidden `Transfer-Encoding`+`Content-Length` combination (upstream framing headers are now stripped and responses re-framed) and the client IP was not forwarded to backends (`X-Forwarded-For`/`X-Real-IP` are now injected). CORS/`OPTIONS` is documented as a deliberate non-goal. Next: P6 (log switch + profiling), then P5 (commercial features shaped by customer feedback).
+Building the core capability set of a commercial API gateway. The regression safety net, config/security hardening, performance baseline, operations productization (ops endpoints, admin API, graceful shutdown, deployment docs), bounded async upstream execution, composite (fan-out) routes, W3C `traceparent` propagation, and the access-log/redaction policy are complete. Next: commercial features shaped by customer feedback, plus the remaining P5 operational hardening items (resource budgets, config rollback, security/dependency checks).
 
 ## Current Validation
 
 - C++17 Release build passes.
-- CTest: 101/101 passing.
-- Integration tests: 81/81 passing (`tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Native Google Test suite: 124/124 passing (2026-10-09, `./build/tests/runTests`).
+- Integration tests: 103/103 passing (2026-10-09, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
 - Covered: HTTP parser (incl. smuggling vectors), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots.
-- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section and re-framed proxied responses), caller-identity injection (X-Forwarded-For chain extension + X-Real-IP), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
+- Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤2 backend connections), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
 - First-run experience: a 5-minute quickstart at the top of both READMEs (built-in echo routes answer with no backend; admin auth demo with `admin-demo-key`); runnable scenarios under [examples/](examples/) — load balancing with health checks and a verified `https://` upstream; dev certificates are generated locally by `scripts/gen_dev_certs.sh` and never committed (`certs/` is gitignored); the server accepts an optional config path argument (`./build/server examples/load-balanced/config.json`).
 - Deployment: [DEPLOYMENT.md](DEPLOYMENT.md) — systemd unit, rolling upgrade with graceful drain, admin API usage.
@@ -99,6 +99,7 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 
 - Static file serving with common Content-Type inference.
 - `sendfile` zero-copy for large files.
+- TLS static-file writes retain the active chunk across SSL WANT_READ/WANT_WRITE and continue from the exact file offset after readiness resumes.
 - Per-worker LRU content cache for small files.
 - FD cache based on TTL and mtime.
 - Gzip content goes into a dedicated compressed cache.
@@ -109,6 +110,8 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 
 - When a request carries no external trace ID, the gateway generates `trace_id`.
 - A client-provided `X-Trace-Id` is preserved and echoed back.
+- W3C `traceparent` is generated/propagated across the upstream hop and echoed back in responses, retaining `X-Trace-Id` compatibility.
+- A composite route emits a structured dependency payload with `status`, `required`, `traceparent`, and timing for each dependency; required failures aggregate into a `partial_failure` response.
 - AUDIT logs record failures and security policy events, including:
 	- trace_id
 	- method/path
@@ -120,6 +123,8 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 	- User-Agent
 - AUDIT is written once at response completion, avoiding duplicate writes across auth, rate-limit, and routing branches.
 - CLF access logs record client IP, method, path, status code, response size, and duration for every completed request.
+- `logging.access_log_enabled` controls CLF independently of AUDIT; configured sensitive headers and query parameters are redacted by default in both log types, and API keys are always fully masked.
+- Request and response bodies are not emitted in CLF or AUDIT logs.
 - Plain `Request:` entry logs are downgraded to debug, avoiding duplication with CLF at production info level.
 - The Prometheus `/metrics` endpoint provides:
 	- Global 2xx/3xx/4xx/5xx counters
@@ -148,7 +153,10 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 
 ### 9. Testing and Engineering
 
-- Google Test suite currently 101/101 passing.
+- Bounded async upstream boundary (2026-10-08): bounded executor, group-aware overload rejection, and route-to-upstream group semantics are implemented and validated.
+- API composition MVP (2026-10-08): composite profile-route fan-out is implemented and validated end-to-end; success and partial-failure paths pass.
+- TLS write path (2026-10-09): SSL WANT_READ/WANT_WRITE re-arms the correct readiness direction; TLS static-file sends retain pending chunks and continue across backpressure; verified by an 8 MiB delayed-reader integration case.
+- Google Test suite currently 124/124 passing (2026-10-09).
 - Covered:
 	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body
@@ -167,7 +175,7 @@ Building the core capability set of a commercial API gateway. P1 (regression saf
 	- Upstream timeouts, connection failures, and idempotent retries
 	- Upstream health checks
 	- Circuit breaker open/reject/recovery probing
-- Integration suite (81 assertions) proves end-to-end behavior including connection reuse, TLS policy, the companion client's certificate/hostname verification, and caller-identity injection on the upstream hop.
+- Integration suite (72 assertions) proves end-to-end behavior including connection reuse, TLS policy, and the companion client's certificate/hostname verification.
 - Benchmark harness `scripts/benchmark/run_benchmark.sh` + report in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Request Flow
@@ -194,34 +202,29 @@ Client connects
 
 ## Known Limitations
 
-- API composition/fan-out is not implemented: a configured route targets one upstream service group and the proxy path performs a single-backend request. Upstream selection/failover among members of that group is not multi-service aggregation.
-- Upstream forwarding is synchronous in the request path; bounded parallel fan-out needs an async/non-blocking execution design so slow dependencies do not stall worker event loops.
-- Route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
+- The route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
 - Runtime reload uses periodic worker polling; workers are not guaranteed to switch configuration at exactly the same instant.
 - Route matching is still a linear scan — simple and reliable at the current scale, with no Trie or index structure for large route sets yet.
-- The upstream connection pool keeps only idle connections in memory (no cross-process sharing); upstream I/O is synchronous and load balancing currently supports `round_robin` only.
-- There is no shared rate-limit quota across processes/hosts. The current limiter is shared across workers in one process.
-- Inbound HTTP/2, gRPC and WebSocket support are not established; document and test any protocol before claiming it.
-- OpenTelemetry `traceparent` propagation and distributed tracing are not integrated; current `X-Trace-Id` is request/log correlation, not a full distributed trace.
-- Per-request access-log control, route/upstream latency histograms, and external audit export remain gaps; see [ROADMAP.md](ROADMAP.md) P6 and [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md).
-- AI-specific provider routing, token/cost quotas, verified SSE streaming, model-level telemetry and provider credential management are not implemented. The gateway must not claim AI-gateway capabilities yet.
-- The project has a release/deployment path, but does not yet claim a multi-instance control plane, cross-instance state consistency, a support lifecycle, or compliance certification.
+- The upstream connection pool keeps only idle connections in memory (no cross-process sharing); load balancing currently supports `round_robin` only (upstream I/O is now scheduled through the bounded async executor).
+- OpenTelemetry export and full distributed tracing are not integrated; W3C `traceparent` propagation and external audit storage are not yet provided.
+- A dynamic thread pool interface exists, but the main HTTP path still mostly runs on worker threads.
 
 ## Next Steps
 
-1. Keep [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md) as the capability register; use customer interviews to validate which optional capabilities deserve implementation.
-2. Build bounded API composition: parallel upstream calls, end-to-end deadline, cancellation, partial-failure policy, and per-dependency telemetry. Avoid blocking an epoll worker while waiting for multiple backends.
-3. Close the operations gaps: per-request access-log control (while preserving security audit), route/upstream metrics with bounded label cardinality, and `traceparent` propagation.
-4. Decide protocol, identity, mTLS, resource-limit, and cluster requirements from target-user evidence; do not imply support before integration tests and documentation exist.
-5. Start a narrow AI gateway pilot only after a real user validates demand; prioritize model routing, token/cost budgets, correct streaming and model-level observability.
+1. Complete per-route/host/tenant latency histograms and failure-rate metrics.
+2. P5 operational hardening: explicit request/response size, connection, upstream-concurrency, fd and memory budgets with documented overload behavior; config change visibility/rollback; dependency/SBOM and security checks; deploy/upgrade recovery validation.
+3. Profile the known Nginx throughput gap (isolate log-write, buffer-copy and TLS-record costs) before further optimization; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
+4. Select OIDC/JWT, upstream mTLS, distributed quotas and compliance work from concrete customer requirements; each claimed capability needs integration coverage and deployment guidance.
 
 ## Recent Decisions
 
 - `register_default_routes()` serves built-in demo and basic endpoints; `register_configured_routes()` generates gateway routes from configuration.
 - Route matching runs once, and the result is reused for the request lifetime.
-- CLF records all access; AUDIT focuses on failures and security policy events.
+- Upstream work is scheduled through a bounded async executor with per-group concurrency isolation; the route-to-group identity is resolved once via `resolve_upstream_group_id()`.
+- A `composite` route fans out named dependencies (required vs optional) and returns an explicit `partial_failure` (503) versus `ok` (200).
+- CLF records completed requests when enabled; AUDIT focuses on failures and security policy events and remains enabled when CLF is disabled.
 - Plain `Request:` entry logs are downgraded to debug, avoiding duplicate production info logs alongside CLF.
-- Only masked API keys are kept in AUDIT to prevent credential leakage.
+- API keys are always fully masked; configured sensitive headers and query parameters are redacted by default in CLF and AUDIT.
 - A matched route with an unsupported method returns 405 with an `Allow` header; only a nonexistent path falls into 404 or static fallback.
 - Invalid configuration fails fast at startup instead of silently running on defaults; rejected reloads keep the active config and write AUDIT.
 - API keys load with precedence env (`GW_API_KEYS`) > `api_keys_file` > inline config, so secrets can stay out of the main config entirely.

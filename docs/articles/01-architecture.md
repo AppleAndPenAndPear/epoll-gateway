@@ -1,6 +1,6 @@
 # Writing an API gateway from scratch in C++17: the threading model, control-plane separation, and three real bugs
 
-> A architecture retrospective, not a tutorial. Every number, bug and conclusion below comes from one real project ([epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)): a single-binary API gateway in C++17 with no etcd/Postgres/Redis runtime dependency. Code references point at real files, benchmark numbers come from `docs/BENCHMARKS.md`, and test counts are actual CI output (101 unit tests / 81 integration assertions).
+> A architecture retrospective, not a tutorial. Every number, bug and conclusion below comes from one real project ([epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)): a single-binary API gateway in C++17 with no etcd/Postgres/Redis runtime dependency. Code references point at real files, benchmark numbers come from `docs/BENCHMARKS.md`, and test counts are actual CI output (101 unit tests / 77 integration assertions).
 
 ## 1. Why write another gateway
 
@@ -164,7 +164,7 @@ But none of the three bugs above is unit-testable — they are products of real 
 - graceful shutdown is exercised with a connection mid-way through a 1.5 s request, which must still be served inside the drain window;
 - after admin key rotation, the old key gets 401 and the new key 200.
 
-Current state: **101 unit tests (CTest) + 81 integration assertions**, all through one `./ci.sh` that builds, runs unit tests and then integration; an AddressSanitizer build is also supported.
+Current state: **101 unit tests (CTest) + 77 integration assertions**, all through one `./ci.sh` that builds, runs unit tests and then integration; an AddressSanitizer build is also supported.
 
 ## 8. What is intentionally not done yet
 
@@ -172,7 +172,7 @@ Current state: **101 unit tests (CTest) + 81 integration assertions**, all throu
 - No plugin system or Lua — extend by changing code or fronting another upstream.
 - The admin listener's topology (enabled/port/bind) needs a process restart (keys rotate hot).
 - Benchmark numbers come from a 2 vCPU box where client, gateway and Python mock share the same machine: absolute values mean little, **ratios** carry the conclusion.
-- The same-conditions Nginx comparison (Section 1) showed memory parity and a 2.5-2.7x throughput gap. The specific sources of that gap — per-request access/AUDIT log writes, buffer copies in the proxy path, TLS record sizing — are not yet isolated, and per-request logging currently has no config switch to turn it off, which is itself the next config feature to add.
+- The same-conditions Nginx comparison (Section 1) showed memory parity and a 2.5-2.7x throughput gap. The specific sources of that gap — per-request access/AUDIT log writes, buffer copies in the proxy path, TLS record sizing — are not yet isolated. A per-request access-log switch (`logging.access_log_enabled`, independent of AUDIT) now exists, so the log-write share can be measured against `access_log off`; isolating the remaining costs with flame graphs is still open.
 - The connection pool's throughput win on loopback is within noise (a local TCP connect costs tens of microseconds). Its value scales with backend distance — it removes one RTT per request.
 
 ## 9. Reproducing
@@ -180,7 +180,7 @@ Current state: **101 unit tests (CTest) + 81 integration assertions**, all throu
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                              # build + 101 unit tests + 81 integration assertions
+./ci.sh                              # build + 101 unit tests + 77 integration assertions
 scripts/benchmark/run_benchmark.sh   # wrk benchmark (15 s per scenario)
 ```
 

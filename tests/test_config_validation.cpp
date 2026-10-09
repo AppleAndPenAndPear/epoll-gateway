@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include "config.h"
+#include "logging_utils.h"
 
 namespace {
 // Writes a temp JSON file under /tmp and returns its path.
@@ -16,6 +17,58 @@ std::string write_temp_config(const std::string& name, const std::string& conten
 TEST(ConfigValidationTest, AcceptsDefaults) {
     Config config;
     EXPECT_TRUE(Config::validate(config).empty());
+}
+
+TEST(ConfigValidationTest, ParsesAccessLogAndRedactionSettings) {
+    const std::string path = write_temp_config("logging_section", R"({
+        "logging": {
+            "access_log_enabled": false,
+            "redact_sensitive_headers": true,
+            "sensitive_headers": ["authorization", "cookie", "x-api-key"],
+            "redact_sensitive_query_params": true,
+            "sensitive_query_params": ["session", "token"]
+        }
+    })");
+    std::vector<std::string> errors;
+    const Config config = Config::from_file(path, &errors);
+    EXPECT_TRUE(errors.empty()) << (errors.empty() ? "" : errors[0]);
+    EXPECT_FALSE(config.logging.access_log_enabled);
+    EXPECT_TRUE(config.logging.redact_sensitive_headers);
+    EXPECT_EQ(config.logging.sensitive_headers.size(), 3u);
+    EXPECT_TRUE(config.logging.redact_sensitive_query_params);
+    EXPECT_EQ(config.logging.sensitive_query_params.size(), 2u);
+}
+
+TEST(ConfigValidationTest, RedactsConfiguredHeadersAndSensitiveQueryParameters) {
+    LoggingConfig config;
+    EXPECT_EQ(logging_utils::redact_header_value("Authorization", "Bearer secret", config), "[redacted]");
+    EXPECT_EQ(logging_utils::redact_request_target(
+                  "/search?token=secret&sort=recent&%61pi_key=another",
+                  config),
+              "/search?token=[redacted]&sort=recent&%61pi_key=[redacted]");
+
+    config.sensitive_headers = {"x-private"};
+    EXPECT_EQ(logging_utils::redact_header_value("X-Private", "secret", config), "[redacted]");
+    EXPECT_EQ(logging_utils::redact_header_value("Authorization", "Bearer secret", config), "Bearer secret");
+
+    config.redact_sensitive_headers = false;
+    config.redact_sensitive_query_params = false;
+    EXPECT_EQ(logging_utils::redact_header_value("X-Private", "secret", config), "secret");
+    EXPECT_EQ(logging_utils::redact_request_target("/search?token=secret", config), "/search?token=secret");
+}
+
+TEST(ConfigValidationTest, AlwaysFullyRedactsApiKeys) {
+    EXPECT_EQ(logging_utils::redact_api_key("short"), "[redacted]");
+    EXPECT_EQ(logging_utils::redact_api_key("long-api-key-secret"), "[redacted]");
+    EXPECT_EQ(logging_utils::redact_api_key(""), "anonymous");
+}
+
+TEST(FromFileSchemaTest, RejectsNonObjectLoggingSection) {
+    const std::string path = write_temp_config("logging_not_object", R"({"logging": []})");
+    std::vector<std::string> errors;
+    Config::from_file(path, &errors);
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors[0].find("logging: expected an object"), std::string::npos);
 }
 
 TEST(ConfigValidationTest, RejectsAdminEnabledWithoutKeys) {
@@ -193,6 +246,52 @@ TEST(ConfigValidationTest, RejectsStaticRouteWithoutRoot) {
     bool found = false;
     for (const auto& e : errors) {
         if (e.find("static_root") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(ConfigValidationTest, AcceptsCompositeRouteWithDependencies) {
+    Config config;
+    Upstream user_upstream;
+    user_upstream.servers.push_back(UpstreamServer{"127.0.0.1", 8080});
+    Upstream order_upstream;
+    order_upstream.servers.push_back(UpstreamServer{"127.0.0.1", 8081});
+    config.upstream_config.upstreams["user-service"] = user_upstream;
+    config.upstream_config.upstreams["order-service"] = order_upstream;
+
+    GatewayRoute route;
+    route.name = "profile";
+    route.path = "/profile";
+    route.target_type = "composite";
+    route.composite_target.name = "profile";
+    route.composite_target.dependencies.push_back({"user", "user-service", "/me", "GET", true, 1000});
+    route.composite_target.dependencies.push_back({"orders", "order-service", "/orders/42", "GET", false, 1000});
+    config.upstream_config.routes.push_back(route);
+
+    EXPECT_TRUE(Config::validate(config).empty());
+}
+
+TEST(ConfigValidationTest, RejectsBadCompositeRoute) {
+    Config config;
+    Upstream user_upstream;
+    user_upstream.servers.push_back(UpstreamServer{"127.0.0.1", 8080});
+    config.upstream_config.upstreams["user-service"] = user_upstream;
+
+    GatewayRoute route;
+    route.name = "bad-profile";
+    route.path = "/profile";
+    route.target_type = "composite";
+    route.composite_target.name = "profile";
+    route.composite_target.dependencies.push_back({"user", "", "/me", "GET", true, 1000});
+    config.upstream_config.routes.push_back(route);
+
+    std::vector<std::string> errors = Config::validate(config);
+    EXPECT_FALSE(errors.empty());
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("composite") != std::string::npos || e.find("upstream_name") != std::string::npos) {
+            found = true;
+        }
     }
     EXPECT_TRUE(found);
 }

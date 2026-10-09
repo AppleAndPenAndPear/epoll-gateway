@@ -52,6 +52,20 @@ struct UpstreamTarget {
     int circuit_recovery_timeout_ms = 10000;
 };
 
+struct CompositeDependency {
+    std::string name;                 // dependency identifier in the composite result
+    std::string upstream_name;        // upstream group to contact
+    std::string path = "/";          // path to call inside the upstream service
+    std::string method = "GET";     // HTTP method for this dependency
+    bool required = true;             // required for the parent route to succeed
+    int timeout_ms = 5000;            // per-dependency timeout threshold
+};
+
+struct CompositeTarget {
+    std::string name;                       // composite route identifier
+    std::vector<CompositeDependency> dependencies;
+};
+
 // Gateway route rule: matches the path and carries security policy and execution target
 struct GatewayRoute {
     std::string name;
@@ -59,10 +73,21 @@ struct GatewayRoute {
     std::string path = "/";
     std::string host = "*";               // Allowed Host, e.g. "api.example.com"
     std::string tenant = "*";             // Allowed tenant, e.g. "team-a"
-    std::string target_type = "upstream";  // local | upstream | static
+    std::string target_type = "upstream";  // local | upstream | composite | static
     std::string handler_name;
     UpstreamTarget upstream_target;
+    CompositeTarget composite_target;
     std::string static_root;
+
+    // The upstream group identity is the backend pool the route is bound to.
+    // It is not the route display name: route.name is only a fallback when the
+    // route has not been explicitly bound to an upstream group.
+    std::string upstream_group_id() const {
+        if (!upstream_target.name.empty()) {
+            return upstream_target.name;
+        }
+        return name;
+    }
 
     bool enabled = true;        // Whether enabled
     bool auth_required = true;
@@ -80,6 +105,10 @@ struct UpstreamConfig {
     int health_check_timeout_ms = 500;
 };
 
+inline std::string resolve_upstream_group_id(const GatewayRoute& route) {
+    return route.upstream_group_id();
+}
+
 // TLS server material and hardening knobs
 struct TlsConfig {
     std::string cert_path = "certs/server.crt";
@@ -93,6 +122,19 @@ struct AdminConfig {
     unsigned short port = 8105;
     std::string bind = "127.0.0.1";   // Loopback by default; admin traffic stays off the wire
     std::vector<std::string> api_keys; // Required (non-empty) when enabled
+};
+
+struct LoggingConfig {
+    bool access_log_enabled = true;          // Per-request access log switch; audit is kept independent.
+    bool redact_sensitive_headers = true;    // Mask request headers like Authorization / Cookie / X-API-Key in logs.
+    bool redact_sensitive_query_params = true;
+    std::vector<std::string> sensitive_headers = {
+        "authorization", "proxy-authorization", "x-api-key", "cookie",
+        "set-cookie", "x-forwarded-for", "x-real-ip"
+    };
+    std::vector<std::string> sensitive_query_params = {
+        "access_token", "api_key", "apikey", "key", "password", "secret", "token"
+    };
 };
 
 struct Config {
@@ -126,6 +168,8 @@ struct Config {
 
     TlsConfig tls;
 
+    LoggingConfig logging;
+
     AdminConfig admin;
 
     RateLimitConfig rate_limit_config;
@@ -157,6 +201,10 @@ struct Config {
         if (config.backlog <= 0) errors.push_back("backlog: must be > 0");
         if (config.keepalive_timeout <= 0) errors.push_back("keepalive_timeout: must be > 0");
         if (config.shutdown_drain_timeout <= 0) errors.push_back("shutdown_drain_timeout: must be > 0");
+        if (config.logging.sensitive_headers.empty())
+            errors.push_back("logging.sensitive_headers: must not be empty");
+        if (config.logging.sensitive_query_params.empty())
+            errors.push_back("logging.sensitive_query_params: must not be empty");
         if (config.cache_max_entries == 0) errors.push_back("cache_max_entries: must be > 0");
         if (config.cache_max_file_size_mb == 0) errors.push_back("cache_max_file_size_mb: must be > 0");
         if (config.thread_pool.min_threads == 0) errors.push_back("thread_pool.min: must be > 0");
@@ -213,9 +261,29 @@ struct Config {
             if (r.method.empty()) errors.push_back(at + ".method: must not be empty");
             if (r.path.empty() || r.path[0] != '/')
                 errors.push_back(at + ".path: must start with '/'");
-            if (r.target_type != "local" && r.target_type != "upstream" && r.target_type != "static") {
+            if (r.target_type != "local" && r.target_type != "upstream" &&
+                r.target_type != "composite" && r.target_type != "static") {
                 errors.push_back(at + ".target_type: unknown value '" + r.target_type +
-                                 "' (expected local|upstream|static)");
+                                 "' (expected local|upstream|composite|static)");
+            }
+            if (r.target_type == "composite") {
+                if (r.composite_target.name.empty()) {
+                    errors.push_back(at + ".composite_target.name: required for target_type=composite");
+                }
+                if (r.composite_target.dependencies.empty()) {
+                    errors.push_back(at + ".composite_target.dependencies: at least one dependency is required");
+                }
+                for (size_t dep_i = 0; dep_i < r.composite_target.dependencies.size(); ++dep_i) {
+                    const auto& dep = r.composite_target.dependencies[dep_i];
+                    const std::string dep_at = at + ".composite_target.dependencies[" + std::to_string(dep_i) + "]";
+                    if (dep.name.empty()) errors.push_back(dep_at + ".name: must not be empty");
+                    if (dep.upstream_name.empty()) errors.push_back(dep_at + ".upstream_name: must not be empty");
+                    if (dep.path.empty() || dep.path[0] != '/') errors.push_back(dep_at + ".path: must start with '/'");
+                    if (dep.timeout_ms <= 0) errors.push_back(dep_at + ".timeout_ms: must be > 0");
+                    if (config.upstream_config.upstreams.find(dep.upstream_name) == config.upstream_config.upstreams.end()) {
+                        errors.push_back(dep_at + ".upstream_name: references unknown upstream '" + dep.upstream_name + "'");
+                    }
+                }
             }
             if (r.rate_limit_policy != "api_key" && r.rate_limit_policy != "ip" &&
                 r.rate_limit_policy != "route") {
@@ -457,6 +525,42 @@ struct Config {
             if (read_int(j, "shutdown_drain_timeout", 1, 86400, v, ""))
                 config.shutdown_drain_timeout = static_cast<int>(v);
         }
+        if (j.contains("logging") && !j["logging"].is_object()) {
+            errs.push_back("logging: expected an object");
+        } else if (j.contains("logging")) {
+            const auto& log_cfg = j["logging"];
+            read_bool(log_cfg, "access_log_enabled", config.logging.access_log_enabled, "logging.");
+            read_bool(log_cfg, "redact_sensitive_headers", config.logging.redact_sensitive_headers, "logging.");
+            read_bool(log_cfg, "redact_sensitive_query_params", config.logging.redact_sensitive_query_params, "logging.");
+            if (log_cfg.contains("sensitive_headers")) {
+                if (!log_cfg["sensitive_headers"].is_array()) {
+                    errs.push_back("logging.sensitive_headers: expected an array");
+                } else {
+                    config.logging.sensitive_headers.clear();
+                    for (const auto& value : log_cfg["sensitive_headers"]) {
+                        if (!value.is_string()) {
+                            errs.push_back("logging.sensitive_headers: entries must be strings");
+                            continue;
+                        }
+                        config.logging.sensitive_headers.push_back(value.get<std::string>());
+                    }
+                }
+            }
+            if (log_cfg.contains("sensitive_query_params")) {
+                if (!log_cfg["sensitive_query_params"].is_array()) {
+                    errs.push_back("logging.sensitive_query_params: expected an array");
+                } else {
+                    config.logging.sensitive_query_params.clear();
+                    for (const auto& value : log_cfg["sensitive_query_params"]) {
+                        if (!value.is_string()) {
+                            errs.push_back("logging.sensitive_query_params: entries must be strings");
+                            continue;
+                        }
+                        config.logging.sensitive_query_params.push_back(value.get<std::string>());
+                    }
+                }
+            }
+        }
 
         // Parse upstreams
         if (j.contains("upstreams")) {
@@ -520,6 +624,32 @@ struct Config {
                     read_str(item, "target_type", r.target_type, "route.");
                     read_str(item, "handler", r.handler_name, "route.");
                     read_str(item, "static_root", r.static_root, "route.");
+
+                    if (item.contains("composite_target")) {
+                        const auto& ct = item["composite_target"];
+                        read_str(ct, "name", r.composite_target.name, "route.composite_target.");
+                        if (ct.contains("dependencies") && !ct["dependencies"].is_array()) {
+                            errs.push_back("route.composite_target.dependencies: expected an array");
+                        } else if (ct.contains("dependencies") && ct["dependencies"].is_array()) {
+                            for (const auto& dep_json : ct["dependencies"]) {
+                                if (!dep_json.is_object()) {
+                                    errs.push_back("route.composite_target.dependencies: entries must be objects");
+                                    continue;
+                                }
+                                CompositeDependency dep;
+                                read_str(dep_json, "name", dep.name, "route.composite_target.dependencies[].");
+                                read_str(dep_json, "upstream_name", dep.upstream_name, "route.composite_target.dependencies[].");
+                                read_str(dep_json, "path", dep.path, "route.composite_target.dependencies[].");
+                                read_str(dep_json, "method", dep.method, "route.composite_target.dependencies[].");
+                                read_bool(dep_json, "required", dep.required, "route.composite_target.dependencies[].");
+                                long long timeout_ms = dep.timeout_ms;
+                                if (read_int(dep_json, "timeout_ms", 1, 600000, timeout_ms, "route.composite_target.dependencies[].")) {
+                                    dep.timeout_ms = static_cast<int>(timeout_ms);
+                                }
+                                r.composite_target.dependencies.push_back(dep);
+                            }
+                        }
+                    }
 
                     read_bool(item, "enabled", r.enabled, "route.");
                     read_bool(item, "auth_required", r.auth_required, "route.");

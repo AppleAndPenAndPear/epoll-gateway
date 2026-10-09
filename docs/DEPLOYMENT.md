@@ -136,3 +136,19 @@ Both SIGHUP and `POST /admin/reload`:
 - Confirm `/readyz` is what your LB probes — not `/healthz` — so a gateway with all backends down leaves the pool instead of failing client traffic.
 - AUDIT log lines (`AUDIT ...`) carry trace_id, route, status, failure reason, masked keys — wire into your SIEM.
 - Baseline capacity numbers: [BENCHMARKS.md](BENCHMARKS.md).
+
+## 10. Logging Policy
+
+The `logging` section controls data-plane request logs. `access_log_enabled` disables CLF access lines only; security AUDIT events remain enabled. Sensitive request headers and query parameters are redacted by default in both CLF and AUDIT output. API-key values in AUDIT are always fully redacted, regardless of the header-redaction switch.
+
+```json
+"logging": {
+  "access_log_enabled": true,
+  "redact_sensitive_headers": true,
+  "redact_sensitive_query_params": true,
+  "sensitive_headers": ["authorization", "proxy-authorization", "x-api-key", "cookie", "set-cookie"],
+  "sensitive_query_params": ["access_token", "api_key", "apikey", "key", "password", "secret", "token"]
+}
+```
+
+Set either redaction switch to `false` only when logging the corresponding raw values is explicitly acceptable. Request and response bodies are not included in CLF or AUDIT entries.

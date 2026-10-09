@@ -44,6 +44,10 @@ STAGING="${OUT_DIR:?}/${NAME}"
 BINARY="build-release/server"
 
 echo "==> Configuring release build (${VERSION}, ${ARCH})"
+# Start from a clean CMake cache so packaging works both in a fresh checkout
+# and inside a clean verification container where the source tree is mounted at
+# a different path than the build directory used during the host build.
+rm -rf build-release
 # -static-libstdc++ / -static-libgcc go through the linker flags so the
 # C++ runtime is baked into the binary: an Ubuntu 22.04 build otherwise
 # requires GLIBCXX_3.4.30, which 20.04's libstdc++ (3.4.28) does not have.

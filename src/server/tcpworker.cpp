@@ -304,7 +304,11 @@ void TcpWorker::handle_client(int fd, uint32_t events) {
   }
 
   if (events & EPOLLIN) {
-    handler_.handle_read(conn.sock, client_ips_[fd]);  // Pass in the client IP
+    if (handler_.has_pending_ssl_write(conn.sock.get())) {
+      handler_.handle_write(conn.sock);
+    } else {
+      handler_.handle_read(conn.sock, client_ips_[fd]);  // Pass in the client IP
+    }
   } else if (events & EPOLLOUT) {
     handler_.handle_write(conn.sock);
   } else {

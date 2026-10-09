@@ -28,6 +28,24 @@
                 {"host": "127.0.0.1", "port": 8092}
             ],
             "algorithm": "round_robin"
+        },
+        "user-service": {
+            "servers": [
+                {"host": "127.0.0.1", "port": 8093}
+            ],
+            "algorithm": "round_robin"
+        },
+        "orders-service": {
+            "servers": [
+                {"host": "127.0.0.1", "port": 8094}
+            ],
+            "algorithm": "round_robin"
+        },
+        "recommendations-service": {
+            "servers": [
+                {"host": "127.0.0.1", "port": 8095}
+            ],
+            "algorithm": "round_robin"
         }
     },
     "routes": [
@@ -39,6 +57,42 @@
             "upstream_target": {
                 "name": "demo-service",
                 "timeout_ms": 5000
+            }
+        },
+        {
+            "name": "profile-page",
+            "method": "GET",
+            "path": "/profile",
+            "auth_required": false,
+            "target_type": "composite",
+            "composite_target": {
+                "name": "profile-page",
+                "dependencies": [
+                    {
+                        "name": "user",
+                        "upstream_name": "user-service",
+                        "path": "/me",
+                        "method": "GET",
+                        "required": true,
+                        "timeout_ms": 2000
+                    },
+                    {
+                        "name": "orders",
+                        "upstream_name": "orders-service",
+                        "path": "/orders/42",
+                        "method": "GET",
+                        "required": false,
+                        "timeout_ms": 2000
+                    },
+                    {
+                        "name": "recommendations",
+                        "upstream_name": "recommendations-service",
+                        "path": "/recommendations/42",
+                        "method": "GET",
+                        "required": true,
+                        "timeout_ms": 2000
+                    }
+                ]
             }
         }
     ],

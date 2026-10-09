@@ -62,6 +62,7 @@ set(SERVER_SOURCES
     src/server/gzip_utils.cpp
     src/server/metrics.cpp
     src/server/upstream_manager.cpp
+    src/server/upstream_async.cpp
     src/server/rate_limiter.cpp
 )
 # Generate the version header from project(VERSION) — single source of truth

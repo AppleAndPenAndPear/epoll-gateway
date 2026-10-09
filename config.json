@@ -16,6 +16,18 @@
         "cert_path": "certs/server.crt",
         "key_path": "certs/server.key"
     },
+    "logging": {
+        "access_log_enabled": true,
+        "redact_sensitive_headers": true,
+        "redact_sensitive_query_params": true,
+        "sensitive_headers": [
+            "authorization", "proxy-authorization", "x-api-key", "cookie",
+            "set-cookie", "x-forwarded-for", "x-real-ip"
+        ],
+        "sensitive_query_params": [
+            "access_token", "api_key", "apikey", "key", "password", "secret", "token"
+        ]
+    },
     "admin": {
         "enabled": true,
         "port": 8105,

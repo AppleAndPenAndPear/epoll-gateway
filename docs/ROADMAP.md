@@ -4,8 +4,6 @@ The execution plan for taking this project from a personal project to a commerci
 
 > Companion documents: [PROJECT_STATUS.md](PROJECT_STATUS.md) records the current capability snapshot, [../CHANGELOG.md](../CHANGELOG.md) records completed changes, and this file plans what comes next.
 
-> The full Chinese commercial-readiness backlog, including API composition and AI gateway assessment, is tracked in [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md). Keep that capability register and this roadmap aligned as work ships.
-
 ---
 
 ## 1. Positioning and Differentiation
@@ -35,15 +33,8 @@ The execution plan for taking this project from a personal project to a commerci
 ### What We Deliberately Won't Do
 
 - No plugin marketplace, no sprawling dashboard, no all-protocol suite (competing on ecosystem is a losing game)
-- No browser-CORS preflight handling and no `OPTIONS` method support — cross-origin concerns are expected to be terminated at the edge (CDN/nginx) in the target deployment; this is a stated non-goal, not an oversight
 - No show-off features like HTTP/3/QUIC (target customers don't care)
 - No contest over extreme benchmark numbers (we sell "good enough + deployable", not peak performance — the Nginx comparison quantified the gap at 2.5-2.7x and we say so publicly)
-
-### API Gateway and AI Gateway Direction
-
-API gateways remain relevant because AI applications still depend on authenticated, governed APIs to reach models and business services. The product shift is from generic HTTP forwarding toward model-aware routing, token/cost budgets, streaming correctness and model-level observability. This project should keep a reliable, provider-neutral API gateway core and add AI-specific policies as an optional layer; it should not abandon general API, edge or OEM users based on trend alone.
-
-The next technical milestone is bounded API composition (parallel upstream calls, an end-to-end deadline, cancellation, explicit partial-failure behavior and per-dependency telemetry). Do not implement fan-out by synchronously blocking an epoll worker. AI features should follow only after a real user validates demand, with a narrow pilot around model routing, token budgets and streaming/usage telemetry. See [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md) for the status matrix and proposed gates.
 
 ### Licensing Strategy (current decision: stay MIT for now)
 
@@ -103,20 +94,11 @@ The next technical milestone is bounded API composition (parallel upstream calls
 
 The comparison in [BENCHMARKS.md](BENCHMARKS.md) established: memory parity, 2.5-2.7x throughput gap, and the gateway being CPU-bound in its own request path (run-to-run stable at 600-650 RPS while Nginx numbers floated with machine noise). Before any optimization, make the costs visible and controllable:
 
-- **Per-request log switch (do first)**: every request currently writes access (CLF) + AUDIT log lines with no config option to disable — an unfair handicap against `access_log off` in comparisons and a real operational need. Add a config field (e.g. `access_log: enabled|disabled`), keep AUDIT for auth/reload/security events regardless.
-- **Profile before touching the hot path**: isolate the gap's sources — log I/O volume, buffer copies in the proxy path, TLS record sizing, per-request allocations — with flame graphs / syscall counts on the existing bench setup. Optimize only what profiling proves.
+- ~~**Per-request log switch (do first)**~~ ✅ **Done (2026-10-09):** `logging.access_log_enabled` disables CLF access lines independently; AUDIT for auth/reload/security events stays on regardless. Shipped with integration tests (access-log switch + redaction) and documented in [DEPLOYMENT.md](DEPLOYMENT.md).
+- **Profile before touching the hot path**: isolate the gap's sources — log I/O volume (now measurable against `access_log off`), buffer copies in the proxy path, TLS record sizing, per-request allocations — with flame graphs / syscall counts on the existing bench setup. Optimize only what profiling proves.
 - **Re-run the comparison after each change**: same methodology (interleaved rounds, medians, RSS sampling) so regressions and wins are directly comparable to the recorded baseline.
 - **Complete the competitor matrix when the network allows**: Traefik and KrakenD release binaries (download was blocked from this network); they add the "batteries-included gateway" reference points the Nginx comparison lacks.
 - **DoD**: log switch shipped with tests; profiling report appended to BENCHMARKS.md naming the top cost; the gap re-measured after addressing it (or a written justification for why the gap is accepted).
-
-### Correctness Audit (2026-10-01, pre-publication feature review)
-
-Findings from a source-level audit against mainstream-gateway expectations. Both defects were fixed and are covered by integration assertions (81 total, up from 77):
-
-- **Proxied chunked responses carried both `Transfer-Encoding` and `Content-Length` (fixed)**: the proxy path forwarded upstream framing headers verbatim, then re-stamped its own `Content-Length` on top ([http_handler.cpp:573-593](../src/server/http_handler.cpp#L573-L593)), producing the exact response-side smuggling vector the request parser rejects. The upstream chunked body is now de-chunked ([http_client.cpp:98-141](../src/server/http_client.cpp#L98-L141)), framing/hop-by-hop headers are stripped, and the gateway re-frames by `Content-Length`. Integration assertions: a proxied chunked response carries no `Transfer-Encoding` and its `Content-Length` matches the decoded body.
-- **No `X-Forwarded-For` / `X-Real-IP` injection (fixed)**: the client IP is now appended to `X-Forwarded-For` (a client-supplied chain is preserved, our hop last) and pinned in `X-Real-IP` ([http_handler.cpp:540-549](../src/server/http_handler.cpp#L540-L549)). Integration assertions: the backend sees the injected headers, and a client-supplied chain is extended rather than replaced.
-- **No CORS handling and no `OPTIONS` method support** — acceptable for the current positioning (browser-facing CORS is typically terminated at the edge CDN/nginx in the target scenario), but it must be stated as a deliberate non-goal in the README rather than left silent.
-- Not treated as gaps (by positioning): WebSocket/gRPC proxying, dynamic service discovery, plugin system (see "What We Deliberately Won't Do").
 
 ---
 
@@ -150,8 +132,6 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
 ---
 
 ## 4. Current Status and Next Steps
-
-Current completed capabilities and known gaps are summarized in [PROJECT_STATUS.md](PROJECT_STATUS.md). The capability-by-capability commercial backlog and AI gateway decision criteria are in [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md).
 
 - [x] P1: integration test framework (real server + mock upstreams), 32/32 passing (2026-09-12)
   - Along the way, found and fixed a defect where `forward_request` reading the response with a single `recv` returned 200 with an empty body
@@ -197,7 +177,7 @@ Current completed capabilities and known gaps are summarized in [PROJECT_STATUS.
   - Backends declared as `https://host:port` in `servers` get a client-side handshake before proxying (non-blocking, reusing the same hardening policy and `Socket`/`Poller` timeouts); per-upstream `tls_ca_file` (empty = system default trust store), `tls_server_name` (SNI + `SSL_set1_host` hostname binding) and `tls_skip_verify` (explicit escape hatch, off by default); verification defaults to on
   - The connection pool key now embeds the verification policy (`scheme` = `tls/<server_name>`, `tls/insecure` or empty), so a session verified for one hostname can never be handed to a different policy on the same host:port — the hostname check would otherwise only run during the handshake that a reused connection skips
   - Every SSL I/O call now starts with `ERR_clear_error()`: a failed upstream handshake leaves stale errors in OpenSSL's per-thread queue, and the next `SSL_get_error` on an unrelated socket in the same thread misclassified `WANT_READ` as fatal and dropped the client connection
-  - Tests: 101 unit / 81 integration passing, including the 2026-10-01 correctness-audit assertions (proxied chunked responses re-framed without a TE+CL conflict, caller-identity injection), 5 upstream-TLS integration assertions (verified 200, pooled TLS reuse, hostname-mismatch 502, skip-verify escape hatch) and a pool-identity unit test
+  - Tests: 101 unit / 77 integration passing, including 5 new upstream-TLS integration assertions (verified 200, pooled TLS reuse, hostname-mismatch 502, skip-verify escape hatch) and a pool-identity unit test
   - Not yet: mTLS (client certificates to backends), TLS-layer health probes (health checks stay TCP-level)
 - [x] First-run experience productization (2026-09-26)
   - 5-minute quickstart at the top of both READMEs: built-in echo routes answer with no backend, admin auth demo (401 → 200 with key), ops endpoints and /metrics; default `config.json` no longer carries phantom upstreams that made `/readyz` answer 503 out of the box
@@ -226,3 +206,24 @@ Current completed capabilities and known gaps are summarized in [PROJECT_STATUS.
   - Pending: Traefik/KrakenD reference points (release binary downloads blocked from this network)
 - [ ] Outreach: first architecture article — draft lives in [docs/articles/](articles/); publishing to Juejin/Zhihu/V2EX/HN still pending
 - [ ] Signals: interview 5 potential users
+
+## Post-2026-09-29 Engineering Milestones (current work)
+
+These supersede the earlier P1~P6 framing above and are the active sequence; current state is the source of truth in [PROJECT_STATUS.md](PROJECT_STATUS.md).
+
+- [x] Bounded async upstream boundary (2026-10-08)
+  - `BoundedAsyncUpstreamExecutor` (`upstream_async.{h,cpp}`): worker pool + bounded queue + per-upstream-group concurrency isolation; overloaded or shutting-down submissions return a deterministic 503 instead of blocking an epoll worker
+  - Route identity resolved once via `resolve_upstream_group_id()` (route bound to `upstream_target.name`, falling back to the route name) so the executor key always matches the real backend pool, not a display label
+- [x] Composite route MVP (2026-10-08)
+  - `composite` target type with named dependencies (required vs optional) validated at config load; dependencies fan out through the bounded executor and aggregate into an explicit `partial_failure` (503) vs `ok` (200) response
+  - End-to-end profile-page scenario (user + orders + recommendations) passes
+- [x] Composition diagnostics and logging policy (2026-10-09)
+  - W3C `traceparent` generated/propagated across the upstream hop and echoed back, keeping `X-Trace-Id` compatibility; per-dependency `traceparent`, `duration_ms`, and status in the composite payload
+  - `logging` config section: `access_log_enabled` (CLF toggle independent of AUDIT), `redact_sensitive_headers` / `redact_sensitive_query_params` with configurable sensitive-header/query lists; API keys always fully masked; request/response bodies never logged
+- [x] Read/write boundary correctness (2026-10-09)
+  - Half-packet assembly: the parser reports every consumed byte and the caller erases it each pass, so fragmented requests resume correctly instead of re-parsing old bytes
+  - Coalesced requests: `handle_read` parses already-buffered bytes before `recv`, and one TCP write carrying two requests yields two ordered responses (pipelining regression added)
+  - TLS partial writes: `SSL_write` WANT_READ/WANT_WRITE re-arms the correct epoll direction via `last_ssl_want()`; TLS static-file sends retain their pending chunk and continue across backpressure (8 MiB delayed-reader test added)
+- [x] Proxied chunked re-frame (2026-10-09, restored)
+  - Backend chunked responses are de-chunked and re-framed by `Content-Length` so the client never receives a `Transfer-Encoding: chunked` + `Content-Length` conflict; trailer fields are dropped and the pooled connection stays reusable
+- Current verification: 124/124 unit, 103/103 integration (2026-10-09)

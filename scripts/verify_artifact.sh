@@ -120,7 +120,7 @@ fi
 # 2. Actually start it and prove the listener comes up. A raw TCP connect is
 #    enough: it means the binary loaded, the TLS context built and the socket
 #    is accepting.
-./bin/epollthread > /tmp/server.log 2>&1 &
+./start.sh > /tmp/server.log 2>&1 &
 pid=$!
 ok=1
 for _ in $(seq 1 60); do

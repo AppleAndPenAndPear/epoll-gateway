@@ -92,3 +92,37 @@ TEST(UpstreamManagerTest, StatusSnapshotReportsHealthAndCircuitState) {
     status = manager.status_snapshot();
     EXPECT_TRUE(status[0].backends[0].circuit_open);
 }
+
+TEST(UpstreamManagerTest, PicksOnlyHealthyServersWithinUpstreamGroup) {
+    UpstreamConfig config;
+    config.upstreams["multi"] = Upstream{
+        {
+            UpstreamServer{"10.0.0.1", 8080, false, "", "", false, true},
+            UpstreamServer{"10.0.0.2", 8080, false, "", "", false, false},
+            UpstreamServer{"10.0.0.3", 8080, false, "", "", false, true}
+        },
+        "round_robin"
+    };
+
+    UpstreamManager manager(config);
+    EXPECT_EQ(manager.pick_server("multi").host, "10.0.0.1");
+    EXPECT_EQ(manager.pick_server("multi").host, "10.0.0.3");
+}
+
+TEST(UpstreamManagerTest, RotatesAcrossHealthyServersInRoundRobinOrder) {
+    UpstreamConfig config;
+    config.upstreams["multi"] = Upstream{
+        {
+            UpstreamServer{"10.0.0.1", 8080},
+            UpstreamServer{"10.0.0.2", 8080},
+            UpstreamServer{"10.0.0.3", 8080}
+        },
+        "round_robin"
+    };
+
+    UpstreamManager manager(config);
+
+    EXPECT_EQ(manager.pick_server("multi").host, "10.0.0.1");
+    EXPECT_EQ(manager.pick_server("multi").host, "10.0.0.2");
+    EXPECT_EQ(manager.pick_server("multi").host, "10.0.0.3");
+}

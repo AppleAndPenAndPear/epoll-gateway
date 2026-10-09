@@ -20,14 +20,18 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "upstream_manager.h"
+#include "logging_utils.h"
 #include "gateway_version.h"
 #include <atomic>
 #include <cstdint>
+#include <future>
+#include <functional>
 using json = nlohmann::json;
 
 namespace {
 
 std::atomic<uint64_t> g_trace_counter{0};
+std::atomic<uint64_t> g_traceparent_counter{0};
 
 std::string generate_trace_id() {
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -37,6 +41,54 @@ std::string generate_trace_id() {
     oss << std::hex << std::setw(8) << std::setfill('0') << (now_ns & 0xffffffffULL)
         << std::setw(8) << std::setfill('0') << (seq & 0xffffffffULL);
     return oss.str();
+}
+
+std::string normalize_trace_id_for_traceparent(const std::string& trace_id) {
+    std::string normalized = trace_id.empty() ? generate_trace_id() : trace_id;
+    normalized.erase(std::remove_if(normalized.begin(), normalized.end(), [](unsigned char ch) {
+        return !std::isxdigit(ch);
+    }), normalized.end());
+    if (normalized.size() > 32) {
+        normalized = normalized.substr(0, 32);
+    }
+    while (normalized.size() < 32) {
+        normalized = "0" + normalized;
+    }
+    return normalized;
+}
+
+std::string generate_traceparent(const std::string& trace_id = "", const std::string& dep_name = "") {
+    const std::string normalized_trace_id = normalize_trace_id_for_traceparent(trace_id.empty() ? generate_trace_id() : trace_id);
+    const uint64_t parent_id_seed = std::hash<std::string>{}(dep_name.empty() ? std::string("dependency") : dep_name + ":" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const uint64_t parent_id = parent_id_seed & 0xffffffffffffffffULL;
+    std::ostringstream oss;
+    oss << "00-" << normalized_trace_id << "-" << std::hex << std::setw(16) << std::setfill('0') << parent_id << "-01";
+    return oss.str();
+}
+
+bool is_hex_string(const std::string& value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isxdigit(ch) != 0;
+    });
+}
+
+std::string parse_trace_id_from_traceparent(const std::string& traceparent) {
+    if (traceparent.size() < 35) {
+        return {};
+    }
+    const auto first_dash = traceparent.find('-');
+    if (first_dash == std::string::npos) {
+        return {};
+    }
+    const auto second_dash = traceparent.find('-', first_dash + 1);
+    if (second_dash == std::string::npos) {
+        return {};
+    }
+    const std::string trace_id = traceparent.substr(first_dash + 1, second_dash - first_dash - 1);
+    if (trace_id.size() == 32 && is_hex_string(trace_id)) {
+        return trace_id;
+    }
+    return {};
 }
 
 std::string classify_failure_reason(int status_code, const BackendError* error = nullptr) {
@@ -66,32 +118,27 @@ std::string classify_failure_reason(int status_code, const BackendError* error =
     return "unknown_error";
 }
 
-std::string redact_api_key(const std::string& key) {
-    if (key.empty()) {
-        return "anonymous";
-    }
-    if (key.size() <= 8) {
-        return "[redacted]";
-    }
-    return key.substr(0, 4) + "..." + key.substr(key.size() - 4);
-}
-
-void emit_audit_log(const HttpRequest& req, int status_code, const std::string& failure_reason, const std::string& route_name, const std::string& host, const std::string& tenant) {
+void emit_audit_log(const HttpRequest& req, int status_code, const std::string& failure_reason, const std::string& route_name, const std::string& host, const std::string& tenant, const LoggingConfig& logging_config) {
     const std::string trace_id = req.trace_id.empty() ? "unknown" : req.trace_id;
     const std::string key = req.headers.count("x-api-key") ? req.headers.at("x-api-key") : "";
-    const std::string api_key = redact_api_key(key);
+    const std::string api_key = logging_utils::redact_api_key(key);
+    const std::string user_agent = req.headers.count("user-agent") ? req.headers.at("user-agent") : "-";
+    const std::string auth_header = req.headers.count("authorization") ? req.headers.at("authorization") : "";
+    const std::string cookie_header = req.headers.count("cookie") ? req.headers.at("cookie") : "";
     Logger::get()->info(
-        "AUDIT trace_id={} method={} path={} host={} tenant={} route={} status={} failure={} api_key={} user_agent={}",
+        "AUDIT trace_id={} method={} path={} host={} tenant={} route={} status={} failure={} api_key={} user_agent={} authorization={} cookie={}",
         trace_id,
         req.method,
-        req.path,
+        logging_utils::redact_request_target(req.path, req.query, logging_config),
         host,
         tenant,
         route_name,
         status_code,
         failure_reason,
         api_key,
-        req.headers.count("user-agent") ? req.headers.at("user-agent") : "-");
+        logging_utils::redact_header_value("user-agent", user_agent, logging_config),
+        logging_utils::redact_header_value("authorization", auth_header, logging_config),
+        logging_utils::redact_header_value("cookie", cookie_header, logging_config));
 }
 
 } // anonymous namespace
@@ -102,12 +149,197 @@ static std::string to_hex(size_t n) {
     return oss.str();
 }
 
+static HttpResponse run_upstream_task(BoundedAsyncUpstreamExecutor& executor,
+                                      const std::string& upstream_key,
+                                      std::function<HttpResponse()> task) {
+    std::promise<HttpResponse> promise;
+    auto future = promise.get_future();
+
+    const SubmitStatus status = executor.submit(upstream_key, [&promise, task = std::move(task)]() mutable {
+        try {
+            promise.set_value(task());
+        } catch (...) {
+            HttpResponse fallback;
+            fallback.status_code = 502;
+            fallback.status_message = "Bad Gateway";
+            fallback.body = "Bad Gateway";
+            fallback.headers["Content-Type"] = "text/plain";
+            fallback.headers["Content-Length"] = std::to_string(fallback.body.size());
+            promise.set_value(fallback);
+        }
+    });
+
+    if (status != SubmitStatus::Accepted) {
+        HttpResponse fallback;
+        fallback.status_code = 503;
+        fallback.status_message = "Service Unavailable";
+        fallback.body = "Upstream executor is overloaded";
+        fallback.headers["Content-Type"] = "text/plain";
+        fallback.headers["Content-Length"] = std::to_string(fallback.body.size());
+        return fallback;
+    }
+
+    return future.get();
+}
+
+static json run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
+                                    UpstreamManager& manager,
+                                    const UpstreamConfig& upstream_cfg,
+                                    const HttpRequest& req,
+                                    const std::string& client_ip,
+                                    const CompositeDependency& dep) {
+    const auto started = std::chrono::steady_clock::now();
+    json item = json::object();
+    item["required"] = dep.required;
+    item["upstream"] = dep.upstream_name;
+    item["method"] = dep.method;
+    item["path"] = dep.path;
+    item["trace_id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
+    item["traceparent"] = generate_traceparent(item["trace_id"].get<std::string>(), dep.name.empty() ? dep.upstream_name : dep.name);
+    item["attempts"] = 1;
+    item["timed_out"] = false;
+
+    if (dep.upstream_name.empty()) {
+        item["status"] = "unavailable";
+        item["error"] = dep.required ? "missing_upstream" : "optional_dependency_missing";
+        item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={}",
+                            dep.name.empty() ? "<unnamed>" : dep.name,
+                            "unavailable",
+                            dep.required,
+                            item["traceparent"].get<std::string>(),
+                            item["duration_ms"].get<int64_t>());
+        return item;
+    }
+
+    const auto config_it = upstream_cfg.upstreams.find(dep.upstream_name);
+    if (config_it == upstream_cfg.upstreams.end() || config_it->second.servers.empty()) {
+        item["status"] = "unavailable";
+        item["error"] = dep.required ? "missing_upstream" : "optional_dependency_missing";
+        item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={}",
+                            dep.name.empty() ? "<unnamed>" : dep.name,
+                            "unavailable",
+                            dep.required,
+                            item["traceparent"].get<std::string>(),
+                            item["duration_ms"].get<int64_t>());
+        return item;
+    }
+
+    auto task = [&manager, &req, &client_ip, dep]() -> HttpResponse {
+        HttpResponse local_resp;
+        const auto& server = manager.pick_server(dep.upstream_name);
+        if (!manager.allow_request(dep.upstream_name, server, dep.timeout_ms)) {
+            local_resp.status_code = 503;
+            local_resp.status_message = "Service Unavailable";
+            local_resp.body = "circuit_open";
+            local_resp.headers["Content-Type"] = "text/plain";
+            local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
+            return local_resp;
+        }
+
+        UpstreamTlsOptions tls;
+        tls.enable = server.tls;
+        tls.ca_file = server.tls_ca_file;
+        tls.server_name = server.tls_server_name;
+        tls.skip_verify = server.tls_skip_verify;
+
+        std::unordered_map<std::string, std::string> upstream_headers = req.headers;
+        if (!client_ip.empty()) {
+            auto xff = upstream_headers.find("x-forwarded-for");
+            if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
+            else upstream_headers["X-Forwarded-For"] = client_ip;
+            upstream_headers["X-Real-IP"] = client_ip;
+        }
+
+        BackendResponse be = forward_request(server.host, server.port, dep.method, dep.path,
+                                            upstream_headers, req.body, dep.timeout_ms, tls);
+
+        if (be.error != BackendError::None) {
+            const bool timed_out = be.error == BackendError::ConnectTimeout ||
+                                   be.error == BackendError::WriteTimeout ||
+                                   be.error == BackendError::ReadTimeout;
+            local_resp.status_code = timed_out ? 504 : 502;
+            local_resp.status_message = timed_out ? "Gateway Timeout" : "Bad Gateway";
+            local_resp.body = timed_out ? "upstream_timeout" : "upstream_unavailable";
+            local_resp.headers["Content-Type"] = "text/plain";
+            local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
+            return local_resp;
+        }
+
+        local_resp.status_code = be.status_code;
+        local_resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
+        local_resp.body = be.body;
+        local_resp.headers["Content-Type"] = "application/json";
+        local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
+        return local_resp;
+    };
+
+    std::promise<HttpResponse> promise;
+    auto future = promise.get_future();
+    const SubmitStatus status = executor.submit(dep.upstream_name, [&promise, task = std::move(task)]() mutable {
+        try {
+            promise.set_value(task());
+        } catch (...) {
+            HttpResponse fallback;
+            fallback.status_code = 502;
+            fallback.status_message = "Bad Gateway";
+            fallback.body = "Bad Gateway";
+            fallback.headers["Content-Type"] = "text/plain";
+            fallback.headers["Content-Length"] = std::to_string(fallback.body.size());
+            promise.set_value(fallback);
+        }
+    });
+
+    if (status != SubmitStatus::Accepted) {
+        item["status"] = "rejected";
+        item["error"] = dep.required ? "executor_overloaded" : "optional_dependency_rejected";
+        item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        Logger::get()->warn("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} reason={}",
+                            dep.name.empty() ? "<unnamed>" : dep.name,
+                            "rejected",
+                            dep.required,
+                            item["traceparent"].get<std::string>(),
+                            item["duration_ms"].get<int64_t>(),
+                            item["error"].get<std::string>());
+        return item;
+    }
+
+    HttpResponse response = future.get();
+    item["status"] = response.status_code >= 200 && response.status_code < 300 ? "ok" : "failed";
+    item["http_status"] = response.status_code;
+    item["backend"] = dep.upstream_name;
+    item["error"] = response.status_code >= 200 && response.status_code < 300 ? "" : response.body;
+    item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    item["timed_out"] = response.status_code == 504;
+    if (response.status_code >= 200 && response.status_code < 300) {
+        item["body"] = response.body;
+    }
+
+    Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} http_status={}",
+                        dep.name.empty() ? "<unnamed>" : dep.name,
+                        item["status"].get<std::string>(),
+                        dep.required,
+                        item["traceparent"].get<std::string>(),
+                        item["duration_ms"].get<int64_t>(),
+                        response.status_code);
+    return item;
+}
+
 
 HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager, ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
 cache_(config.cache_max_entries, config.cache_max_file_size_mb), 
-upstream_manager_(upstream_manager), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
+upstream_manager_(upstream_manager), upstream_executor_(4, 64), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
     register_default_routes();
     register_configured_routes();
+}
+
+HttpHandler::~HttpHandler() {
+    upstream_executor_.shutdown();
 }
 
 void HttpHandler::reload_config(const Config& config) {
@@ -275,23 +507,27 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
     try {
         char buf[4096];
         while (true) {
-            bool is_ssl = sock_ptr->get_is_ssl_();
-            // sslRead counts a bare FIN (no close_notify) as a clean end of stream,
-            // which is what most HTTP clients do: request completeness comes from
-            // HTTP framing, so the close style must not be reported as a read error.
-            int n = is_ssl ? sock_ptr->sslRead(buf, sizeof(buf)) : sock_ptr->recv(buf, sizeof(buf), 0);
-            if (n > 0) {
-                auto& read_buf = read_bufs_[sock_ptr];
-                read_buf.append(buf, n);
-
+            auto& read_buf = read_bufs_[sock_ptr];
+            const bool has_buffered_data = !read_buf.empty();
+            int n = 0;
+            if (!has_buffered_data) {
+                bool is_ssl = sock_ptr->get_is_ssl_();
+                // sslRead counts a bare FIN (no close_notify) as a clean end of stream,
+                // which is what most HTTP clients do: request completeness comes from
+                // HTTP framing, so the close style must not be reported as a read error.
+                n = is_ssl ? sock_ptr->sslRead(buf, sizeof(buf)) : sock_ptr->recv(buf, sizeof(buf), 0);
+                if (n > 0) read_buf.append(buf, n);
+            }
+            if (has_buffered_data || n > 0) {
                 // Keep parsing the buffer until no complete request remains
                 while (true) {
                     size_t consumed = 0;
-                    if (parsers_[sock_ptr].parse(read_buf.data(), read_buf.size(),requests_[sock_ptr], consumed)) {
+                    const bool parsed = parsers_[sock_ptr].parse(
+                        read_buf.data(), read_buf.size(), requests_[sock_ptr], consumed);
+                    if (consumed > 0) read_buf.erase(0, consumed);
+                    if (parsed) {
                         // Parsed a complete request; record the total request count
                         Metrics::instance().record_total_request();
-                        // Remove the consumed data from the buffer
-                        read_buf.erase(0, consumed);
 
                         // Get a reference to the parsed request
                         auto& req = requests_[sock_ptr];
@@ -301,7 +537,19 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         if (host_it != req.headers.end()) req.host = host_it->second;
                         if (tenant_it != req.headers.end()) req.tenant = tenant_it->second;
                         if (req.trace_id.empty()) {
-                            req.trace_id = req.headers.count("x-trace-id") ? req.headers["x-trace-id"] : generate_trace_id();
+                            if (req.headers.count("x-trace-id")) {
+                                req.trace_id = req.headers["x-trace-id"];
+                            } else if (req.headers.count("traceparent")) {
+                                req.trace_id = parse_trace_id_from_traceparent(req.headers["traceparent"]);
+                                if (req.trace_id.empty()) {
+                                    req.trace_id = generate_trace_id();
+                                }
+                            } else {
+                                req.trace_id = generate_trace_id();
+                            }
+                        }
+                        if (req.headers.count("traceparent") == 0) {
+                            req.headers["traceparent"] = generate_traceparent();
                         }
                         req.headers["x-trace-id"] = req.trace_id;
 
@@ -401,14 +649,12 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             last_requests_[sock_ptr] = requests_[sock_ptr];
                             send_error_response(sock_ptr, 400, "Bad Request");
                         }
-                        // Remove partially consumed data
-                        if (consumed > 0) read_buf.erase(0, consumed);
-                        parsers_[sock_ptr].reset();
-                        requests_[sock_ptr].clear();
                         // Stop parsing: after a smuggling-class rejection the
                         // rest of the buffer is untrusted, and send_error_response
                         // already queued "Connection: close", so nothing further
                         // on this connection should be handled.
+                        parsers_[sock_ptr].reset();
+                        requests_[sock_ptr].clear();
                         break;
                     }
                     else {
@@ -492,7 +738,7 @@ HttpHandler::ResolvedRoute HttpHandler::resolve_route(const HttpRequest& req) co
     return matched;
 }
 
-void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp) const {
+void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp) {
     if (!matched.route) {
         resp.status_code = 404;
         resp.status_message = "Not Found";
@@ -507,89 +753,137 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         return;
     }
 
-    if (matched.route->route.target_type == "upstream") {
+    if (matched.route->route.target_type == "composite") {
         const auto& route = matched.route->route;
-        const std::string& upstream_name = route.upstream_target.name;
-        auto it = config_.upstream_config.upstreams.find(upstream_name);
-        if (it == config_.upstream_config.upstreams.end() || it->second.servers.empty()) {
-            resp.status_code = 502;
-            resp.status_message = "Bad Gateway";
-            resp.body = "Bad Gateway: no upstream server";
-            resp.headers["Content-Type"] = "text/plain";
+        json composite = json::object();
+        bool required_failed = false;
+        std::vector<std::future<json>> futures;
+        futures.reserve(route.composite_target.dependencies.size());
+
+        for (const auto& dep : route.composite_target.dependencies) {
+            futures.push_back(std::async(std::launch::async, [this, &req, &client_ip, &dep]() -> json {
+                return run_composite_dependency(upstream_executor_, upstream_manager_, config_.upstream_config, req, client_ip, dep);
+            }));
+        }
+
+        for (size_t i = 0; i < route.composite_target.dependencies.size(); ++i) {
+            json item = futures[i].get();
+            const std::string dep_name = route.composite_target.dependencies[i].name;
+            composite[dep_name] = item;
+            if (route.composite_target.dependencies[i].required &&
+                (item["status"] == "failed" || item["status"] == "rejected" || item["status"] == "unavailable")) {
+                required_failed = true;
+            }
+        }
+
+        if (required_failed) {
+            resp.status_code = 503;
+            resp.status_message = "Service Unavailable";
+            resp.headers["Content-Type"] = "application/json";
+            json payload = json::object();
+            payload["route"] = route.name;
+            payload["status"] = "partial_failure";
+            payload["dependencies"] = composite;
+            resp.body = payload.dump();
             resp.headers["Content-Length"] = std::to_string(resp.body.size());
             return;
         }
 
-        const auto& server = upstream_manager_.pick_server(upstream_name);
-        // The circuit-breaker check happens before connecting to the backend; no new backend connection is made while the circuit is open.
-        if (!upstream_manager_.allow_request(upstream_name, server,route.upstream_target.circuit_recovery_timeout_ms)) {
-            resp = make_error_response(503, "Service Unavailable", "Upstream circuit is open");
-            return;
-        }
-
-        BackendResponse be;
-        be.status_code = 502;
-        be.body = "Bad Gateway";
-        be.error = BackendError::ConnectFailed;
-        int attempt_count = 0;
-        UpstreamTlsOptions tls;
-        tls.enable = server.tls;
-        tls.ca_file = server.tls_ca_file;
-        tls.server_name = server.tls_server_name;
-        tls.skip_verify = server.tls_skip_verify;
-        // The backend must be able to see the real caller: append this hop to
-        // X-Forwarded-For (a client-supplied chain is preserved but our IP is
-        // always appended last) and pin X-Real-IP to the connection peer.
-        std::unordered_map<std::string, std::string> upstream_headers = req.headers;
-        if (!client_ip.empty()) {
-            auto xff = upstream_headers.find("x-forwarded-for");
-            if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
-            else upstream_headers["X-Forwarded-For"] = client_ip;
-            upstream_headers["X-Real-IP"] = client_ip;
-        }
-        while (true) {
-            be = forward_request(server.host, server.port, req.method, req.path,
-                                 upstream_headers, req.body,
-                                 route.upstream_target.timeout_ms, tls);
-            if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
-                !should_retry_backend_request(req.method, be.error, attempt_count)) {
-                break;
-            }
-            ++attempt_count;
-        }
-        if (be.error != BackendError::None) {
-            upstream_manager_.record_failure(upstream_name, server,route.upstream_target.circuit_failure_threshold,route.upstream_target.circuit_recovery_timeout_ms);
-            Metrics::instance().record_upstream_error(be.error);
-            const bool timed_out = be.error == BackendError::ConnectTimeout ||
-                                   be.error == BackendError::WriteTimeout ||
-                                   be.error == BackendError::ReadTimeout;
-            resp = make_error_response(
-                timed_out ? 504 : 502,
-                timed_out ? "Gateway Timeout" : "Bad Gateway",
-                timed_out ? "The upstream service timed out"
-                          : "The upstream service returned an invalid response or could not be reached");
-            return;
-        }
-        upstream_manager_.record_success(upstream_name, server);
-        resp.status_code = be.status_code;
-        resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
-        resp.body = be.body;
-        // Framing is re-computed here, never forwarded: copying the upstream's
-        // Content-Length/Transfer-Encoding verbatim produced CL+TE conflicts on
-        // chunked backends (the response-side smuggling vector the request
-        // parser rejects). Connection/Keep-Alive are hop-by-hop and our own
-        // keep-alive decision governs the client hop.
-        auto header_key_lower = [](std::string k) {
-            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
-            return k;
-        };
-        for (const auto& [k, v] : be.headers) {
-            const std::string lk = header_key_lower(k);
-            if (lk == "content-length" || lk == "transfer-encoding" ||
-                lk == "connection" || lk == "keep-alive") continue;
-            resp.headers[k] = v;
-        }
+        resp.status_code = 200;
+        resp.status_message = "OK";
+        resp.headers["Content-Type"] = "application/json";
+        json payload = json::object();
+        payload["route"] = route.name;
+        payload["status"] = "ok";
+        payload["dependencies"] = composite;
+        resp.body = payload.dump();
         resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        return;
+    }
+
+    if (matched.route->route.target_type == "upstream") {
+        const auto& route = matched.route->route;
+        const std::string upstream_key = resolve_upstream_group_id(route);
+        const auto task = [this, &req, &matched, &client_ip, upstream_key]() -> HttpResponse {
+            HttpResponse local_resp;
+            const auto& route = matched.route->route;
+            const std::string& upstream_name = upstream_key;
+            auto it = config_.upstream_config.upstreams.find(upstream_name);
+            if (it == config_.upstream_config.upstreams.end() || it->second.servers.empty()) {
+                local_resp.status_code = 502;
+                local_resp.status_message = "Bad Gateway";
+                local_resp.body = "Bad Gateway: no upstream server";
+                local_resp.headers["Content-Type"] = "text/plain";
+                local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
+                return local_resp;
+            }
+
+            const auto& server = upstream_manager_.pick_server(upstream_name);
+            if (!upstream_manager_.allow_request(upstream_name, server, route.upstream_target.circuit_recovery_timeout_ms)) {
+                return make_error_response(503, "Service Unavailable", "Upstream circuit is open");
+            }
+
+            BackendResponse be;
+            be.status_code = 502;
+            be.body = "Bad Gateway";
+            be.error = BackendError::ConnectFailed;
+            int attempt_count = 0;
+            UpstreamTlsOptions tls;
+            tls.enable = server.tls;
+            tls.ca_file = server.tls_ca_file;
+            tls.server_name = server.tls_server_name;
+            tls.skip_verify = server.tls_skip_verify;
+            std::unordered_map<std::string, std::string> upstream_headers = req.headers;
+            if (upstream_headers.count("traceparent") == 0) {
+                upstream_headers["traceparent"] = generate_traceparent();
+            }
+            if (!client_ip.empty()) {
+                auto xff = upstream_headers.find("x-forwarded-for");
+                if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
+                else upstream_headers["X-Forwarded-For"] = client_ip;
+                upstream_headers["X-Real-IP"] = client_ip;
+            }
+            while (true) {
+                be = forward_request(server.host, server.port, req.method, req.path,
+                                     upstream_headers, req.body,
+                                     route.upstream_target.timeout_ms, tls);
+                if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
+                    !should_retry_backend_request(req.method, be.error, attempt_count)) {
+                    break;
+                }
+                ++attempt_count;
+            }
+            if (be.error != BackendError::None) {
+                upstream_manager_.record_failure(upstream_name, server, route.upstream_target.circuit_failure_threshold, route.upstream_target.circuit_recovery_timeout_ms);
+                Metrics::instance().record_upstream_error(be.error);
+                const bool timed_out = be.error == BackendError::ConnectTimeout ||
+                                       be.error == BackendError::WriteTimeout ||
+                                       be.error == BackendError::ReadTimeout;
+                return make_error_response(
+                    timed_out ? 504 : 502,
+                    timed_out ? "Gateway Timeout" : "Bad Gateway",
+                    timed_out ? "The upstream service timed out"
+                              : "The upstream service returned an invalid response or could not be reached");
+            }
+            upstream_manager_.record_success(upstream_name, server);
+            local_resp.status_code = be.status_code;
+            local_resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
+            local_resp.body = be.body;
+            auto header_key_lower = [](std::string k) {
+                std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+                return k;
+            };
+            for (const auto& [k, v] : be.headers) {
+                const std::string lk = header_key_lower(k);
+                if (lk == "content-length" || lk == "transfer-encoding" ||
+                    lk == "connection" || lk == "keep-alive") continue;
+                local_resp.headers[k] = v;
+            }
+            local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
+            return local_resp;
+        };
+
+        resp = run_upstream_task(upstream_executor_, upstream_key, std::move(task));
         return;
     }
 
@@ -637,6 +931,7 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
     last_requests_[sock] = req;
     HttpResponse resp;
     resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
+    resp.headers["Traceparent"] = req.headers.count("traceparent") ? req.headers.at("traceparent") : generate_traceparent();
     std::string path = req.path;
 
     // Default index page
@@ -649,6 +944,9 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
         const std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "";
         dispatch_route(req, matched, client_ip, resp);
         resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
+        if (resp.headers.count("Traceparent") == 0) {
+            resp.headers["Traceparent"] = req.headers.count("traceparent") ? req.headers.at("traceparent") : generate_traceparent();
+        }
         path_handled = true;
     }
 
@@ -937,6 +1235,9 @@ void HttpHandler::send_error_response(Socket* sock, int code, const std::string&
     if (req_it != last_requests_.end() && !req_it->second.trace_id.empty()) {
         resp.headers["X-Trace-Id"] = req_it->second.trace_id;
     }
+    if (req_it != last_requests_.end() && req_it->second.headers.count("traceparent")) {
+        resp.headers["Traceparent"] = req_it->second.headers.at("traceparent");
+    }
     keep_alive_[sock] = false;
     resp.headers["Connection"] = "close";
     if (!allow_methods.empty()) {
@@ -987,10 +1288,22 @@ void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
     }
     file_offsets_.erase(sock_ptr);
     file_sizes_.erase(sock_ptr);
+    ssl_file_buffers_.erase(sock_ptr);
+    pending_ssl_writes_.erase(sock_ptr);
     client_ip_map_.erase(sock_ptr);
     request_start_time_.erase(sock_ptr);
     last_requests_.erase(sock_ptr);
     Logger::get()->info("HttpHandler: connection closed on fd {}", fd);
+}
+
+void HttpHandler::wait_for_ssl_write(Socket* sock, SSLWant want) {
+    pending_ssl_writes_[sock] = want;
+    const uint32_t event = want == SSLWant::READ ? EPOLLIN : EPOLLOUT;
+    epoll_.mod(sock->getFd(), event | EPOLLET | EPOLLONESHOT);
+}
+
+bool HttpHandler::has_pending_ssl_write(Socket* sock) const {
+    return pending_ssl_writes_.find(sock) != pending_ssl_writes_.end();
 }
 
 void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
@@ -1008,6 +1321,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                 int n = is_ssl ? sock->sslWrite(front.data(), front.size())
                                : sock->send(front.data(), front.size(), 0);
                 if (n > 0) {
+                    if (is_ssl) pending_ssl_writes_.erase(sock_ptr);
                     if (n == front.size()) {
                         queue.pop_front();
                     } else {
@@ -1017,7 +1331,12 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         break;  // Kernel buffer full
                     }
                 } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                    if (is_ssl) {
+                        wait_for_ssl_write(sock_ptr, sock->last_ssl_want());
+                        return;
+                    } else {
+                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                    }
                     break;
                 } else if(n == -1 && errno == EPIPE){
                     // The client has disconnected; this is normal, just clean up the connection
@@ -1042,42 +1361,52 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
 
                     if (is_ssl) {
                         // SSL connections cannot use sendfile (sendfile bypasses the OpenSSL encryption layer)
-                        // The file content must be read into a user-space buffer and sent via SSL_write
+                        // Keep each user-space chunk alive across WANT_READ/WANT_WRITE retries.
                         constexpr size_t SSL_SENDFILE_BUF = 65536;  // 64KB buffer
-                        std::vector<char> filebuf(std::min(static_cast<off_t>(SSL_SENDFILE_BUF), remaining));
-                        ssize_t read_n = ::pread(file_fd, filebuf.data(), filebuf.size(), offset);
-                        if (read_n > 0) {
-                            int write_n = sock->sslWrite(filebuf.data(), read_n);
+                        auto& filebuf = ssl_file_buffers_[sock_ptr];
+                        while (remaining > 0) {
+                            if (filebuf.empty()) {
+                                filebuf.resize(std::min(static_cast<off_t>(SSL_SENDFILE_BUF), remaining));
+                                const ssize_t read_n = ::pread(file_fd, filebuf.data(), filebuf.size(), offset);
+                                if (read_n <= 0) {
+                                    Logger::get()->error("pread for SSL file failed or file was truncated: {}",
+                                                         read_n == -1 ? strerror(errno) : "unexpected EOF");
+                                    file_fds_.erase(sock_ptr);
+                                    file_offsets_.erase(sock_ptr);
+                                    file_sizes_.erase(sock_ptr);
+                                    ssl_file_buffers_.erase(sock_ptr);
+                                    cleanup(sock);
+                                    return;
+                                }
+                                filebuf.resize(static_cast<size_t>(read_n));
+                            }
+
+                            const int write_n = sock->sslWrite(filebuf.data(), filebuf.size());
                             if (write_n > 0) {
+                                pending_ssl_writes_.erase(sock_ptr);
                                 offset += write_n;
                                 remaining -= write_n;
-                                // Partial write, wait for the next EPOLLOUT
-                                if (write_n < read_n) {
-                                    file_offsets_[sock_ptr] = offset;
+                                filebuf.erase(filebuf.begin(), filebuf.begin() + write_n);
+                                file_offsets_[sock_ptr] = offset;
+                                if (!filebuf.empty()) {
                                     epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                                     return;
                                 }
                             } else if (write_n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                                 file_offsets_[sock_ptr] = offset;
-                                epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                                wait_for_ssl_write(sock_ptr, sock->last_ssl_want());
                                 return;
                             } else {
                                 Logger::get()->error("SSL_write for file failed on fd {}", fd);
                                 file_fds_.erase(sock_ptr);
                                 file_offsets_.erase(sock_ptr);
                                 file_sizes_.erase(sock_ptr);
+                                ssl_file_buffers_.erase(sock_ptr);
                                 cleanup(sock);
                                 return;
                             }
-                        } else if (read_n == -1) {
-                            Logger::get()->error("pread for SSL file failed: {}", strerror(errno));
-                            file_fds_.erase(sock_ptr);
-                            file_offsets_.erase(sock_ptr);
-                            file_sizes_.erase(sock_ptr);
-                            cleanup(sock);
-                            return;
                         }
-                        // read_n == 0 means EOF, treat as done
+                        ssl_file_buffers_.erase(sock_ptr);
                     } else {
                         // Non-SSL: use sendfile zero-copy
                         while (remaining > 0) {
@@ -1140,11 +1469,12 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                                    classify_failure_reason(status_it->second),
                                    route_name,
                                    audit_request.host.empty() ? "-" : audit_request.host,
-                                   audit_request.tenant.empty() ? "-" : audit_request.tenant);
+                                   audit_request.tenant.empty() ? "-" : audit_request.tenant,
+                                   config_.logging);
                 }
 
-                // ★ New: record the access log in CLF format
-                {
+                // Access log is independently configurable; audit remains on.
+                if (config_.logging.access_log_enabled) {
                     auto ip_it = client_ip_map_.find(sock_ptr);
                     std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "-";
 
@@ -1160,10 +1490,13 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     auto req_it = last_requests_.find(sock_ptr);
                     if (req_it != last_requests_.end()) {
                         method = req_it->second.method;
-                        path = req_it->second.path;
+                        path = logging_utils::redact_request_target(
+                            req_it->second.path, req_it->second.query, config_.logging);
                         version = req_it->second.version;
                         auto ua = req_it->second.headers.find("user-agent");
-                        user_agent = (ua != req_it->second.headers.end()) ? ua->second : "-";
+                        user_agent = (ua != req_it->second.headers.end())
+                            ? logging_utils::redact_header_value("user-agent", ua->second, config_.logging)
+                            : "-";
                         last_requests_.erase(sock_ptr);
                     }
 
@@ -1183,6 +1516,11 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                         client_ip, time_buf, method, path, version,
                         status_code, response_size,
                         user_agent, duration_us);
+                } else {
+                    auto req_it = last_requests_.find(sock_ptr);
+                    if (req_it != last_requests_.end()) {
+                        last_requests_.erase(sock_ptr);
+                    }
                 }
 
                 // Clean up the temporary records for this response

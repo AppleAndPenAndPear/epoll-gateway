@@ -4,16 +4,26 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
-## 2026-10-01
+## 2026-10-09
+
+### Added
+
+- **Composition diagnostics and logging policy.** W3C `traceparent` is generated at the request boundary, propagated on the upstream hop, and echoed back, while `X-Trace-Id` stays compatible (a `traceparent` from the caller supplies the trace id). Composite routes now return per-dependency `traceparent`, `duration_ms`, and status, and a `COMPOSITE` structured log line per dependency. A `logging` config section was added: `access_log_enabled` toggles CLF access lines independently of security AUDIT logging, and `redact_sensitive_headers` / `redact_sensitive_query_params` (with configurable `sensitive_headers` / `sensitive_query_params`) redact credential-bearing headers and query parameters in both CLF and AUDIT output. API keys are always fully masked; request/response bodies are never logged.
+- Pipelined-request integration coverage: one TCP write carrying two requests must yield two ordered responses, plus a case that sends the first request in two fragmented writes.
 
 ### Fixed
 
-- **Proxied chunked responses leaked a forbidden `Transfer-Encoding` + `Content-Length` combination.** The proxy path forwarded the upstream's framing headers verbatim and then stamped its own `Content-Length` on top, so any chunked backend produced a client response carrying both — exactly the response-side form of the request-smuggling vector the parser rejects. It stayed green because the raw chunked stream was passed through wholesale, making the stamped `Content-Length` coincidentally equal the raw stream length. The upstream body is now de-chunked, framing/hop-by-hop headers are stripped, and the gateway re-frames by `Content-Length` (`http_client.cpp`, `http_handler.cpp`).
-- **The client IP was never forwarded to backends.** The proxy now appends the peer address to `X-Forwarded-For` (a client-supplied chain is preserved, our hop last) and pins `X-Real-IP`, so backends can identify the real caller (`http_handler.cpp`).
+- **Half-packet request assembly could re-parse already-consumed bytes.** `HttpParser::parse` now reports the number of bytes consumed on every call (including inside the request line, headers, and body), and the read loop erases that prefix after each pass. Previously an incomplete request that had advanced the parser state left the original bytes in the buffer, so the next read re-parsed stale data.
+- **Coalesced requests already in the buffer were not drained before reading the socket.** `handle_read` now parses buffered bytes first and only calls `recv` when the buffer is empty, so a second request that arrived in the same TCP segment (pipelining) is handled instead of waiting for a new socket event that may never come.
+- **TLS partial writes did not resume in the correct direction.** A pending `SSL_write` returning `SSL_ERROR_WANT_READ` re-arms `EPOLLIN` (not just `EPOLLOUT`) via `Socket::last_ssl_want()`, and the worker routes that readiness to `handle_write` rather than treating it as new request data.
+- **TLS static-file responses stopped after the first chunk.** The active user-space chunk is now retained across `WANT_READ`/`WANT_WRITE` retries and the send continues from the exact file offset until the whole file is written; previously a single partial write could be mistaken for completion (an 8 MiB delayed-reader integration case reproduces and now guards this).
 
-### Changed
+## 2026-10-08
 
-- Integration suite grew from 77 to 81 assertions: a proxied chunked response must carry no `Transfer-Encoding` with a `Content-Length` matching the decoded body, and the backend must observe the injected `X-Forwarded-For`/`X-Real-IP` (with an existing chain extended rather than replaced).
+### Added
+
+- **Bounded asynchronous upstream foundation.** `BoundedAsyncUpstreamExecutor` (`upstream_async.{h,cpp}`) schedules upstream work off the epoll worker with a bounded worker pool, a bounded queue, and per-upstream-group concurrency isolation; overload or shutdown returns a deterministic 503 instead of blocking. Routes resolve their backend identity once through `resolve_upstream_group_id()` (`upstream_target.name`, falling back to the route name) so the executor key always matches the real backend pool.
+- **Composite route MVP.** A `composite` target type with named dependencies (required vs optional) is validated at config load, fans out through the bounded executor, and aggregates into an explicit `ok` (200) or `partial_failure` (503) response. A runnable profile-page example and an end-to-end integration scenario (user + orders + recommendations) validate both paths.
 
 ## 2026-09-29
 

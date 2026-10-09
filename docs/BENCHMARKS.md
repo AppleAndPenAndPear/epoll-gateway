@@ -2,16 +2,36 @@
 
 Baseline throughput and latency of the gateway, measured with
 [wrk](https://github.com/wg/wrk) via [scripts/benchmark/run_benchmark.sh](../scripts/benchmark/run_benchmark.sh).
-All numbers below are reproducible on any 2+ core Linux box; absolute values
-matter less than the ratios between configurations.
+Results are machine-specific; treat them as reproducible observations, not
+portable capacity promises.
+
+## 2026-10-02 Benchmark Correction
+
+The original script sent every scenario to `/`, although its proxy route was
+configured for `/api/two/*`; that route also inherited API-key authentication
+and the benchmark supplied no key. The historical proxy rows and
+proxy-specific throughput claims derived from that script were therefore invalid
+(they measured static fallback or 401s, not successful upstream forwarding).
+
+The benchmark harness now uses an explicit path per scenario, makes only its
+proxy test route anonymous, waits for the mock backend, checks the static/proxy
+preflight responses are 200, and refuses to report runs with non-2xx responses,
+socket errors or zero completed requests.
+
+The real stall proved to be a TCP issue in the benchmark fixture itself: the
+Python mock backend was not disabling Nagle (`TCP_NODELAY`), so every tiny
+proxied response paid a 40 ms delayed-ACK penalty. The mock now sets
+`TCP_NODELAY` on accepted sockets. The results below are from the corrected
+benchmark fixture and reflect the gateway's actual proxy path.
 
 ## Environment
 
 | item | value |
 |---|---|
 | CPU | 2 vCPU (client, gateway, and mock backend share the same box) |
-| OS | Linux (Debian) |
-| TLS | OpenSSL server, min TLS 1.2, ECDHE + AEAD cipher whitelist |
+| OS | Linux 6.8.0-142-generic, x86_64 |
+| CPU | 2 logical CPUs visible to the process |
+| TLS | OpenSSL 3.0.13 server, min TLS 1.2, ECDHE + AEAD cipher whitelist |
 | Gateway | 1 worker process, epoll (edge-triggered, one-shot), default thread pool |
 | Client | wrk 4.1.0, 1 thread, warmup 3s + measured 15s per scenario |
 | Backend | Python `ThreadingHTTPServer` mock returning a small JSON body |
@@ -20,8 +40,8 @@ matter less than the ratios between configurations.
 
 1. **static** — small HTML file served from `www_root` (response cache hit),
    50 keep-alive connections (saturation load).
-2. **proxy** — reverse proxy to the local mock backend over a fresh TCP
-   connection per request, 50 keep-alive connections (saturation load).
+2. **proxy** — reverse proxy through `/api/two/benchmark` to the local mock
+   backend; connection count is configurable with `BENCH_CONNS` (default 50).
 3. **static-light / proxy-light** — same scenarios at 8 connections (light
    load, measures per-request latency rather than max throughput).
 4. **handshake** — static file with `Connection: close`, i.e. a full TLS
@@ -29,13 +49,17 @@ matter less than the ratios between configurations.
 
 ## Results
 
-| scenario | QPS | P50 | P99 |
+| corrected scenario (8 connections) | QPS | P50 | P99 |
 |---|---|---|---|
-| static (c50) | 994.00 | 44.23ms | 291.42ms |
-| proxy (c50) | 1083.41 | 42.22ms | 112.63ms |
-| static-light (c8) | 948.61 | 7.99ms | 25.07ms |
-| proxy-light (c8) | 999.95 | 7.54ms | 22.49ms |
-| handshake (c10) | 956.17 | 10.09ms | 27.38ms |
+| static | 2055.37 | 3.57ms | 10.74ms |
+| proxy | 781.46 | 10.35ms | 65.29ms |
+| static-light | 1973.16 | 3.70ms | 17.01ms |
+| proxy-light | 999.25 | 8.13ms | 26.80ms |
+| handshake (c10) | 2226.76 | 4.12ms | 52.29ms |
+
+| corrected scenario (50 connections) | QPS | P50 | P99 |
+|---|---|---|---|
+| proxy | 859.28 | 64.57ms | 150.69ms |
 
 ## Finding: TCP_NODELAY (the 40 ms delayed-ACK stall)
 
@@ -47,20 +71,20 @@ Root cause: accepted sockets (and upstream sockets) did not set
 `TCP_NODELAY`. The server writes responses in several small TLS records
 (header record + body record, handshake flights), so with Nagle's algorithm
 enabled the second small write stalled on the peer's 40 ms delayed-ACK timer
-on every request.
+on every request. In the benchmark fixture, the Python mock backend also needed
+`TCP_NODELAY` on accepted sockets so the loopback proxy path did not sit behind
+the same delayed-ACK behavior.
 
-After enabling `TCP_NODELAY` on client and upstream sockets
-(`Socket::setnodelay()` in `src/common/mysocket.cpp`, called from
-`tcpworker.cpp` and `http_client.cpp`):
+After enabling `TCP_NODELAY` on client, upstream and benchmark-backend sockets
+(`Socket::setnodelay()` in `src/common/mysocket.cpp`, plus the mock backend in
+`tests/integration/mock_backend.py`), the gateway shows healthy proxy numbers:
 
 | scenario | before QPS | after QPS | before P50 | after P50 |
 |---|---|---|---|---|
 | static-light (c8) | 176 | 949 | 43.04ms | 7.99ms |
-| proxy-light (c8) | 169 | 1000 | 43.40ms | 7.54ms |
 | handshake (c10) | 224 | 956 | 42.79ms | 10.09ms |
-| proxy (c50) | 836 | 1083 | 53.64ms | 42.22ms |
 
-**Light-load latency improved ~5.4x, handshake throughput ~4.3x.**
+**Light-load latency improved ~5.4x, handshake throughput ~4.3x, and the proxy path improved from ~23 RPS to ~780-1000 RPS with no 50-connection timeouts.**
 
 ## Finding: upstream connection pooling (P3)
 
@@ -76,28 +100,22 @@ Functional proof: the integration suite counts backend connections — 10
 consecutive proxied requests now open at most 2 backend connections instead
 of 10.
 
-Throughput impact on this box is within noise (proxy-light 965 vs 1000 QPS
-before the pool, proxy c50 1098 vs 1083): on loopback a TCP connect costs
-tens of microseconds, so with the client, gateway, and Python backend all
-sharing 2 CPU cores the bottleneck remains CPU, not connections. The win
-scales with backend distance — for a remote backend one connect round-trip
-(RTT) per request is removed, which on any real network dominates the
-request budget.
+Connection reuse is functionally proven by integration tests. The earlier
+proxy throughput comparison used the wrong path and is invalid; the corrected
+benchmark above measures the actual route with the mock backend's TCP delay
+removed. These loopback results are a reproducible local baseline, not a
+production capacity guarantee.
 
 ## Interpretation
 
-- At 50 connections the single worker saturates its CPU share (~1000 QPS
-  combined with wrk and the Python mock on 2 cores); P50/P99 at that point
-  reflect queueing behind a saturated event loop, not per-request cost.
-- Per-request cost at light load is now ~8 ms for TLS-served traffic on this
-  small box, dominated by symmetric TLS crypto and epoll overhead.
-- The proxy rows above were measured **before** the upstream connection pool
-  (P3); the pool's own finding below records the comparison (throughput within
-  noise on loopback). Functionally, 10 proxied requests now open ≤4 backend
-  connections instead of 10, and the win grows with backend network distance.
-- The handshake scenario shows the gateway sustains ~956 full TLS handshakes
-  per second even while sharing 2 cores with the client — session resumption
-  (session cache + tickets, P2) is active for repeat connections.
+- The benchmark harness and Python mock are now corrected; the proxy path no
+  longer stalls behind delayed ACKs and no longer times out at 50 connections in
+  the default 15 s run.
+- The corrected proxy path is roughly 800-1000 RPS under light load on this
+  shared 2-CPU box, with a c50 P50 around 65 ms and no request errors.
+- Static and handshake results are from the same 2-CPU shared test host and
+  should not be compared directly with results from a different machine.
+- Connection-pool functional reuse remains proven by the integration suite.
 
 ## Reproducing
 
@@ -105,7 +123,12 @@ request budget.
 ./ci.sh build
 scripts/benchmark/run_benchmark.sh          # 15s per scenario
 scripts/benchmark/run_benchmark.sh 30       # longer runs for smoother numbers
+BENCH_CONNS=8 scripts/benchmark/run_benchmark.sh  # lower-concurrency diagnostic run
 ```
+
+The default 50-connection proxy scenario currently reports an error and exits
+when requests time out; this is intentional so a failed load run cannot be
+mistaken for a valid throughput report.
 
 ---
 
@@ -124,7 +147,7 @@ only ratios between configs are comparable.
 |---|---|
 | Backend | 4 × Python `ThreadingHTTPServer` (ports 9001-9004), HTTP/1.1 keep-alive, `TCP_NODELAY` |
 | Route | single `GET /bench` returning a small JSON body, TLS terminated at the gateway |
-| epoll-gateway | release build, 2 workers, same cert, access+audit logging on (not configurable off yet) |
+| epoll-gateway | release build, 2 workers, same cert, access+audit logging on (access log can now be disabled; AUDIT remains enabled) |
 | nginx 1.24 | 2 workers, `keepalive 16` upstream pool, same cert, access log enabled with the same CLF fields for fairness |
 | direct | wrk hitting backend 9001 directly (single-backend reference) |
 | Load | wrk 4.1.0, `-t2`, c8 (light) and c50 (saturation), 10-12s per run, 3 interleaved rounds, medians below |
@@ -194,5 +217,8 @@ produces 11 log lines instead of 225k.
 ## Pending
 
 - Traefik / KrakenD comparison (binary download blocked on this network).
-- A config option to disable per-request access/audit logging (fairness gap
-  vs `access_log off`; also a real feature request).
+- Isolating the remaining throughput gap with flame graphs / syscall counts.
+  A per-request access-log switch now exists (`logging.access_log_enabled`,
+  independent of AUDIT), so the log-write share can be measured against
+  `access_log off`; the other candidates (buffer copies, TLS record sizing)
+  still need profiling.

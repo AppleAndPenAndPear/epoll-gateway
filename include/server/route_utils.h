@@ -61,7 +61,7 @@ inline bool routeMatchesPath(const GatewayRoute& route,
                              const std::string& host,
                              const std::string& tenant,
                              const std::string& path,
-                             std::map<std::string, std::string>& params) {
+                             std::map<std::string, std::string>& params) {      //404
     if (!route.enabled) {
         return false;
     }
@@ -86,7 +86,7 @@ inline bool routeMatchesRequest(const GatewayRoute& route,
                                const std::string& host,
                                const std::string& tenant,
                                const std::string& path,
-                               std::map<std::string, std::string>& params) {
+                               std::map<std::string, std::string>& params) {        //405
     if (!routeMatchesPath(route, host, tenant, path, params)) {
         return false;
     }

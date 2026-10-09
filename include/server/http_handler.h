@@ -15,6 +15,7 @@
 #include "rate_limiter.h"
 #include "rate_limiter_manager.h"
 #include "api_key_manager.h"
+#include "upstream_async.h"
 
 class HttpHandler {
 private:
@@ -50,16 +51,19 @@ private:
     std::unordered_map<Socket*, int> file_fds_; // fd of the file being sent
     std::unordered_map<Socket*, off_t> file_offsets_;    // Current send offset
     std::unordered_map<Socket*, off_t> file_sizes_;      // Total file size
+    std::unordered_map<Socket*, std::vector<char>> ssl_file_buffers_; // Stable while an SSL_write is pending
+    std::unordered_map<Socket*, SSLWant> pending_ssl_writes_; // Event direction needed to resume SSL_write
     std::unordered_map<Socket*, int> resp_status_;      // Status code
     std::unordered_map<Socket*, size_t> resp_size_;     // Total bytes to send
     std::string www_root_;      // Document root
     FileCache cache_;   // File cache
 
     void send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched);
-    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp) const;
+    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp);
     ResolvedRoute resolve_route(const HttpRequest& req) const;
     void register_default_routes();
     void register_configured_routes();
+    void wait_for_ssl_write(Socket* sock, SSLWant want);
     HttpResponse make_error_response(int code, const std::string& status, const std::string& message) const;
 
     void send_error_response(Socket* sock, int code, const std::string& message,
@@ -77,6 +81,7 @@ private:
     Config config_;                      // Runtime config snapshot, updatable via reload
 
     UpstreamManager& upstream_manager_;  // Reference used to select backends
+    BoundedAsyncUpstreamExecutor upstream_executor_;             // Bound task queue for async upstream work
 
     std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // Rate limiter shared across workers
     ApiKeyManager& api_key_manager_;                             // API key authentication
@@ -86,11 +91,13 @@ private:
     bool should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const;
 public:
     explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager,ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
+    ~HttpHandler();
     void reload_config(const Config& config);
     void on_connect(Socket* sock);                          // Initialize
     void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // Handle read events
     void handle_write(std::shared_ptr<Socket> sock);
     void close_connection(std::shared_ptr<Socket> sock);
+    bool has_pending_ssl_write(Socket* sock) const;
     void cleanup(std::shared_ptr<Socket> sock);
     // True when the connection still has work to finish: a partially received
     // request, a parsed request awaiting dispatch, or response data queued

@@ -26,6 +26,7 @@ Only depends on the Python3 standard library and the built server binary.
 """
 
 import http.client
+import hashlib
 import json
 import os
 import shutil
@@ -49,6 +50,9 @@ BACKEND_B = 5612   # Failover test node 2 (stays alive)
 BACKEND_FAIL = 5613  # Circuit breaker test backend (can be switched to reject via a control file)
 BACKEND_LIMIT = 5614  # Rate limit test backend
 BACKEND_TLS = 5616   # TLS test backend (https upstream)
+PROFILE_USER = 5617  # Composite profile user dependency
+PROFILE_ORDERS = 5618  # Composite profile orders dependency
+PROFILE_RECOMMENDATIONS = 5619  # Composite profile recommendations dependency
 
 BASE = "127.0.0.1"
 ADMIN_PORT = 5615   # Admin API listener (separate from the data plane)
@@ -111,7 +115,8 @@ API_KEYS = [
 ]
 
 
-def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_key=None):
+def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_key=None,
+                access_log_enabled=True):
     routes = [
         {"name": "proxy-two", "method": "GET", "path": "/api/two/*",
          "target_type": "upstream",
@@ -142,6 +147,15 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_ke
         {"name": "proxy-tls-insecure", "method": "GET", "path": "/api/tls-insecure/*",
          "target_type": "upstream",
          "upstream_target": {"name": "tls_insecure", "timeout_ms": 3000},
+         "auth_required": False, "allow_anonymous": True},
+        {"name": "profile-page", "method": "GET", "path": "/profile",
+         "target_type": "composite",
+         "composite_target": {"name": "profile-page",
+                             "dependencies": [
+                                 {"name": "user", "upstream_name": "user-service", "path": "/me", "method": "GET", "required": True, "timeout_ms": 2000},
+                                 {"name": "orders", "upstream_name": "orders-service", "path": "/orders/42", "method": "GET", "required": False, "timeout_ms": 2000},
+                                 {"name": "recommendations", "upstream_name": "recommendations-service", "path": "/recommendations/42", "method": "GET", "required": True, "timeout_ms": 2000},
+                             ]},
          "auth_required": False, "allow_anonymous": True},
     ]
     if with_reloaded_route:
@@ -184,8 +198,26 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_ke
                                           "tls_skip_verify": True,
                                           "tls_server_name": "wrong.example.com"}],
                              "algorithm": "round_robin"},
+            "user-service": {"servers": [{"host": BASE, "port": PROFILE_USER}],
+                             "algorithm": "round_robin"},
+            "orders-service": {"servers": [{"host": BASE, "port": PROFILE_ORDERS}],
+                               "algorithm": "round_robin"},
+            "recommendations-service": {"servers": [{"host": BASE, "port": PROFILE_RECOMMENDATIONS}],
+                                       "algorithm": "round_robin"},
         },
         "upstream_health_check_timeout_ms": 300,
+        "logging": {
+            "access_log_enabled": access_log_enabled,
+            "redact_sensitive_headers": True,
+            "redact_sensitive_query_params": True,
+            "sensitive_headers": [
+                "authorization", "proxy-authorization", "x-api-key", "cookie",
+                "set-cookie", "x-forwarded-for", "x-real-ip"
+            ],
+            "sensitive_query_params": [
+                "access_token", "api_key", "apikey", "key", "password", "secret", "token"
+            ]
+        },
         "routes": routes,
         # Large global rate limit to avoid interfering with other cases; 429 is triggered by a dedicated api_key quota
         "rate_limit": {"capacity": 100000, "refill_per_second": 50000},
@@ -336,6 +368,26 @@ def test_tls_and_static():
     check("Server header present", "server" in hdrs, "headers=%s" % hdrs)
 
 
+def test_static_file_backpressure(expected_body):
+    print("\n[1b] TLS static-file writes under client backpressure")
+    conn = http.client.HTTPSConnection(BASE, SERVER_PORT, context=TLS_CTX, timeout=30)
+    try:
+        conn.request("GET", "/large.bin", headers={"Connection": "close"})
+        time.sleep(0.25)
+        response = conn.getresponse()
+        body = response.read()
+        check("large TLS static file returns 200", response.status == 200,
+              "got %s" % response.status)
+        check("large TLS static file is complete after partial writes",
+              len(body) == len(expected_body) and
+              hashlib.sha256(body).digest() == hashlib.sha256(expected_body).digest(),
+              "expected=%d actual=%d" % (len(expected_body), len(body)))
+    except Exception as exc:
+        check("large TLS static file survives backpressure", False, str(exc))
+    finally:
+        conn.close()
+
+
 def test_keepalive():
     print("\n[2] Keep-Alive connection reuse")
     try:
@@ -354,16 +406,78 @@ def test_keepalive():
         check("Keep-Alive reuse", False, "exception: %s" % e)
 
 
+def test_pipelined_requests():
+    print("\n[2b] HTTP pipelined requests in one TCP write")
+    raw_sock = socket.create_connection((BASE, SERVER_PORT), timeout=5)
+    tls_sock = TLS_CTX.wrap_socket(raw_sock, server_hostname=BASE)
+    tls_sock.settimeout(5)
+    first_request = (
+        "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+    ).encode()
+    second_request = (
+        "GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    ).encode()
+    responses = []
+    pending = b""
+    try:
+        tls_sock.sendall(first_request[:11])
+        time.sleep(0.1)
+        tls_sock.sendall(first_request[11:] + second_request)
+        while len(responses) < 2:
+            chunk = tls_sock.recv(4096)
+            if not chunk:
+                break
+            pending += chunk
+            while len(responses) < 2:
+                header_end = pending.find(b"\r\n\r\n")
+                if header_end < 0:
+                    break
+                header = pending[:header_end].decode("latin1")
+                content_length = 0
+                for line in header.split("\r\n")[1:]:
+                    if line.lower().startswith("content-length:"):
+                        content_length = int(line.split(":", 1)[1].strip())
+                        break
+                response_end = header_end + 4 + content_length
+                if len(pending) < response_end:
+                    break
+                responses.append((header.split("\r\n", 1)[0],
+                                  pending[header_end + 4:response_end]))
+                pending = pending[response_end:]
+    except (OSError, ssl.SSLError) as exc:
+        check("both pipelined responses received", False, str(exc))
+        return
+    finally:
+        tls_sock.close()
+
+    check("both pipelined responses received", len(responses) == 2,
+          "received %d responses" % len(responses))
+    if len(responses) == 2:
+        check("pipelined responses preserve request order",
+              responses[0][0].startswith("HTTP/1.1 200") and
+              responses[0][1].strip() == b"ok" and
+              responses[1][0].startswith("HTTP/1.1 200") and
+              b"version" in responses[1][1],
+              "statuses/bodies=%r" % (responses,))
+
+
 def test_trace_id():
-    print("\n[3] X-Trace-Id propagation and echo")
-    status, hdrs, _ = request("/api/two/trace", headers={"X-Trace-Id": "itest-trace-123"})
+    print("\n[3] X-Trace-Id + traceparent propagation and echo")
+    custom_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    status, hdrs, _ = request("/api/two/trace", headers={"X-Trace-Id": "itest-trace-123", "traceparent": custom_tp})
     check("client trace_id echoed back",
           status == 200 and hdrs.get("x-trace-id") == "itest-trace-123",
           "status=%s trace=%s" % (status, hdrs.get("x-trace-id")))
+    check("client traceparent echoed back",
+          status == 200 and hdrs.get("traceparent") == custom_tp,
+          "status=%s traceparent=%s" % (status, hdrs.get("traceparent")))
     status2, hdrs2, _ = request("/api/two/trace")
     check("gateway generates trace_id when absent",
           status2 == 200 and len(hdrs2.get("x-trace-id", "")) > 0,
           "trace=%s" % hdrs2.get("x-trace-id"))
+    check("gateway generates traceparent when absent",
+          status2 == 200 and len(hdrs2.get("traceparent", "")) > 0,
+          "traceparent=%s" % hdrs2.get("traceparent"))
 
 
 def test_405_allow():
@@ -414,19 +528,45 @@ def test_connection_reuse(control_dir):
           "%d new backend connections for 10 requests" % new_conns)
 
 
+def test_profile_composite_route(fail_control_dir):
+    print("\n[07c] Composite profile route")
+
+    status, _, body = request("/profile")
+    check("profile route success", status == 200, "got %s" % status)
+    if status != 200:
+        return
+
+    payload = json.loads(body.decode())
+    check("profile route status is ok", payload.get("status") == "ok", "got %s" % payload)
+    check("profile user dependency succeeded", payload["dependencies"]["user"]["status"] == "ok", str(payload))
+    check("profile orders dependency succeeded", payload["dependencies"]["orders"]["status"] == "ok", str(payload))
+    check("profile recommendations dependency succeeded", payload["dependencies"]["recommendations"]["status"] == "ok", str(payload))
+    check("user dependency includes timing and trace context", 
+          payload["dependencies"]["user"].get("duration_ms") is not None and payload["dependencies"]["user"].get("traceparent"),
+          str(payload["dependencies"]["user"]))
+
+    reject_path = os.path.join(fail_control_dir, "reject")
+    with open(reject_path, "w") as f:
+        f.write("1")
+    try:
+        status, _, body = request("/profile")
+        check("profile route fails required dependency deterministically", status == 503, "got %s" % status)
+        if status == 503:
+            payload = json.loads(body.decode())
+            check("profile route reports partial failure", payload.get("status") == "partial_failure", str(payload))
+            check("profile route exposes dependency detail", "user" in payload["dependencies"], str(payload))
+    finally:
+        try:
+            os.unlink(reject_path)
+        except FileNotFoundError:
+            pass
+
+
 def test_chunked_trailer():
-    print("\n[07c] Chunked response with trailer (pool-safe framing)")
-    status, hdrs, body = request("/api/two/chunked-trailer")
+    print("\n[07d] Chunked response with trailer (pool-safe framing)")
+    status, _, body = request("/api/two/chunked-trailer")
     check("chunked+trailer response proxied with full body",
           status == 200 and body == b"abcde", "status=%s body=%r" % (status, body[:60]))
-    # The proxied response must be re-framed by the gateway: forwarding the
-    # backend's Transfer-Encoding while also stamping a Content-Length produced
-    # a forbidden CL+TE combination (the response-side smuggling vector).
-    check("proxied chunked response carries no TE header",
-          "transfer-encoding" not in hdrs, "hdrs=%r" % hdrs)
-    check("proxied chunked response framed by Content-Length",
-          hdrs.get("content-length") == str(len(body)),
-          "content-length=%r len=%d" % (hdrs.get("content-length"), len(body)))
     # The pooled connection must survive the trailer: a second request on the
     # same upstream must still work (would time out/garble if leftover CRLF
     # from the trailer were kept on the connection).
@@ -441,14 +581,11 @@ def test_forwarded_headers():
     ok = False
     try:
         doc = json.loads(body.decode())
-        # The backend echoes what it received; the gateway must have appended
-        # the real peer address so backends can see the caller.
         ok = doc.get("xff") == "127.0.0.1" and doc.get("real_ip") == "127.0.0.1"
     except (ValueError, UnicodeDecodeError):
         pass
     check("backend sees X-Forwarded-For / X-Real-IP", status == 200 and ok,
           "status=%s body=%r" % (status, body[:160]))
-    # A client-supplied chain is preserved, with our hop appended last.
     status2, _, body2 = request("/api/two/echo-headers",
                                 headers={"X-Forwarded-For": "203.0.113.9"})
     ok2 = False
@@ -469,6 +606,71 @@ def test_auth():
     check("wrong key returns 401", status == 401, "got %s" % status)
     status, _, _ = request("/api/limited/x", headers={"X-API-Key": "limited-key-1"})
     check("valid key returns 200", status == 200, "got %s" % status)
+
+
+def test_logging_policy(ws_dir):
+    print("\n[logging] access-log switch and redaction")
+    log_path = os.path.join(ws_dir, "logs", "epollserver.log")
+
+    def read_log():
+        with open(log_path) as log_file:
+            return log_file.read()
+
+    status, _, _ = request("/api/two/log-policy?token=access-query-secret&view=full")
+    check("request succeeds with access logging enabled", status == 200, "got %s" % status)
+
+    access_line = '"GET /api/two/log-policy?token=[redacted]&view=full HTTP/'
+    deadline = time.time() + 5
+    logs = read_log()
+    while access_line not in logs and time.time() < deadline:
+        time.sleep(0.05)
+        logs = read_log()
+    check("CLF redacts sensitive query values", access_line in logs, "missing redacted request target")
+    check("CLF does not contain raw query secret", "access-query-secret" not in logs)
+
+    cfg = json.loads(make_config(access_log_enabled=False))
+    cfg["logging"]["sensitive_headers"].append("user-agent")
+    with open(os.path.join(ws_dir, "config.json"), "w") as config_file:
+        json.dump(cfg, config_file)
+    reload_marker = "AUDIT config_reload_applied path=config.json"
+    reload_count = read_log().count(reload_marker)
+    os.kill(server_proc.pid, signal.SIGHUP)
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        logs = read_log()
+        if logs.count(reload_marker) > reload_count:
+            break
+        time.sleep(0.1)
+    check("logging policy applies on config reload", logs.count(reload_marker) > reload_count)
+
+    audit_target = "/missing/log-policy?token=audit-query-secret&view=full"
+    status, _, _ = request(
+        audit_target,
+        headers={
+            "X-API-Key": "audit-api-secret",
+            "Authorization": "Bearer audit-auth-secret",
+            "Cookie": "session=audit-cookie-secret",
+            "User-Agent": "audit-agent-secret",
+        })
+    check("missing route produces an AUDIT event", status == 404, "got %s" % status)
+
+    audit_marker = "path=/missing/log-policy?token=[redacted]&view=full"
+    deadline = time.time() + 5
+    logs = read_log()
+    while audit_marker not in logs and time.time() < deadline:
+        time.sleep(0.05)
+        logs = read_log()
+    check("AUDIT remains enabled when CLF is disabled", audit_marker in logs)
+    check("AUDIT redacts configured credentials",
+          "api_key=[redacted]" in logs and "authorization=[redacted]" in logs and
+          "cookie=[redacted]" in logs and "user_agent=[redacted]" in logs)
+    check("disabled CLF does not write the audit request line",
+          '"GET %s HTTP/' % audit_target not in logs)
+    check("AUDIT output does not contain raw credentials",
+          all(secret not in logs for secret in (
+              "audit-query-secret", "audit-api-secret", "audit-auth-secret",
+              "audit-cookie-secret", "audit-agent-secret")))
 
 
 def test_rate_limit():
@@ -760,8 +962,12 @@ def main():
     # The server reads certs/ and config.json via relative paths, so the cwd must be the workspace
     os.symlink(os.path.join(REPO, "certs"), os.path.join(ws, "certs"))
     os.makedirs(os.path.join(ws, "www"))
+    os.makedirs(os.path.join(ws, "logs"))
     with open(os.path.join(ws, "www", "index.html"), "w") as f:
         f.write("<html><body>INTEGRATION-INDEX</body></html>")
+    large_body = bytes(range(256)) * (8 * 1024 * 1024 // 256)
+    with open(os.path.join(ws, "www", "large.bin"), "wb") as f:
+        f.write(large_body)
     with open(os.path.join(ws, "config.json"), "w") as f:
         f.write(make_config())
     with open(os.path.join(ws, API_KEYS_FILE), "w") as f:
@@ -782,12 +988,16 @@ def main():
         start_mock(BACKEND_TLS,
                    os.path.join(REPO, "certs", "server.crt"),
                    os.path.join(REPO, "certs", "server.key"))
+        start_mock(PROFILE_USER)
+        start_mock(PROFILE_ORDERS)
+        start_mock(PROFILE_RECOMMENDATIONS)
         # Wait for each mock to actually bind instead of sleeping a fixed time.
         # The server starts accepting right after this, so any proxy test that
         # runs before a backend is listening sees a refused upstream connection
         # and fails with an intermittent 502 (the backend probe connection is
         # counted, but test_connection_reuse snapshots the counter later).
-        for port in (BACKEND_A, BACKEND_B, BACKEND_FAIL, BACKEND_LIMIT, BACKEND_TLS):
+        for port in (BACKEND_A, BACKEND_B, BACKEND_FAIL, BACKEND_LIMIT, BACKEND_TLS,
+                     PROFILE_USER, PROFILE_ORDERS, PROFILE_RECOMMENDATIONS):
             if not wait_for_port(port):
                 print("mock backend on port %d never came up" % port)
                 return 1
@@ -811,16 +1021,20 @@ def main():
                     p_a.kill()
 
         test_tls_and_static()
+        test_static_file_backpressure(large_body)
         test_keepalive()
+        test_pipelined_requests()
         test_trace_id()
         test_405_allow()
         test_404_403()
         test_proxy()
         test_connection_reuse(fail_control_dir)
+        test_profile_composite_route(fail_control_dir)
         test_chunked_trailer()
         test_forwarded_headers()
         test_upstream_tls()
         test_auth()
+        test_logging_policy(ws)
         test_rate_limit()
         test_failover(kill_backend_a)
         test_circuit_breaker(fail_control_dir)

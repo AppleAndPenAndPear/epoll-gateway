@@ -1,6 +1,6 @@
 # 从零用 C++17 写一个 API 网关：线程模型、控制面分离，以及三个真实 Bug
 
-> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 `docs/BENCHMARKS.md`，测试计数来自 CI 的实际输出（101 个单测 / 81 条集成断言）。
+> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 `docs/BENCHMARKS.md`，测试计数来自 CI 的实际输出（101 个单测 / 77 条集成断言）。
 
 ## 1. 为什么要再写一个网关
 
@@ -164,7 +164,7 @@ proxy        (c50)    836 QPS / 53.64ms → 1083 QPS / 42.22ms
 - 优雅停机时用一条正在处理 1.5 秒慢请求的连接，验证它在 drain 窗口内被完整服务；
 - 管理口密钥轮换后旧 key 401 / 新 key 200。
 
-当前状态：**101 个单测（CTest）+ 81 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
+当前状态：**101 个单测（CTest）+ 77 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
 
 ## 8. 现在还没做的（诚实清单）
 
@@ -172,7 +172,7 @@ proxy        (c50)    836 QPS / 53.64ms → 1083 QPS / 42.22ms
 - 没有插件系统/Lua，扩展方式是改代码或走 upstream 代理；
 - 管理口的监听拓扑（enabled/port/bind）需要重启进程才能改（密钥可热轮换）；
 - 压测数据来自一台 2 vCPU 的机器（客户端、网关、Python mock 挤在同一台机器上），绝对数字意义有限，**比值**才是结论；
-- 与 Nginx 同条件对比的结果如第 1 节所说：内存持平、吞吐低 2.5~2.7 倍。差距的具体来源（每请求的访问/AUDIT 日志写入、代理路径的缓冲拷贝、TLS record 尺寸）还没逐项定位——目前网关的每请求日志也没有开关可关，这本身就是下一个要做的配置项；
+- 与 Nginx 同条件对比的结果如第 1 节所说：内存持平、吞吐低 2.5~2.7 倍。差距的具体来源（每请求的访问/AUDIT 日志写入、代理路径的缓冲拷贝、TLS record 尺寸）还没逐项定位——目前网关已支持每请求访问日志开关（`logging.access_log_enabled`，与 AUDIT 相互独立），因此可以对照 `access_log off` 量化日志写入的占比；其余开销仍需用火焰图逐项定位；
 - 连接池在 loopback 上的吞吐收益在噪声范围内（本地 TCP 建连只有几十微秒），它的价值随后端网络距离放大——每个请求省掉一次 RTT。
 
 ## 9. 复现
@@ -180,7 +180,7 @@ proxy        (c50)    836 QPS / 53.64ms → 1083 QPS / 42.22ms
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                       # 构建 + 101 单测 + 81 条集成断言
+./ci.sh                       # 构建 + 101 单测 + 77 条集成断言
 scripts/benchmark/run_benchmark.sh   # wrk 压测（15s/场景）
 ```
 

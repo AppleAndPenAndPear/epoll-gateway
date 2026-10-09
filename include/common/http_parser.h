@@ -64,12 +64,14 @@ public:
         INVALID_HEADER,             // illegal characters in header name or value
         INVALID_CHUNK_SIZE,         // non-hex chunk size
         REQUEST_LINE_TOO_LONG,      // method+path+version exceeds the cap
-        HEADER_TOO_LONG             // a single header line exceeds the cap
+        HEADER_TOO_LONG,            // a single header line exceeds the cap
+        HEADERS_TOO_LARGE           // the complete header block exceeds the cap
     };
 
     static constexpr size_t MAX_BODY_SIZE = 1024 * 1024; // 1MB cap
     static constexpr size_t MAX_REQUEST_LINE_SIZE = 8 * 1024;    // request line cap
     static constexpr size_t MAX_HEADER_LINE_SIZE = 8 * 1024;     // single header line cap
+    static constexpr size_t MAX_HEADERS_SIZE = 64 * 1024;        // complete header block cap
 
     HttpParser();
 
@@ -90,6 +92,7 @@ private:
     std::string buffer_;
     size_t content_length_;     // body length
     size_t body_read_;          // bytes read so far
+    size_t headers_read_ = 0;   // bytes in the current header block
     ParseError parse_error_ = ParseError::NONE;  // set when the request is rejected
     std::string chunk_size_hex_buffer_;
     size_t chunk_data_remaining_ = 0;

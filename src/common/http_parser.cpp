@@ -1,5 +1,6 @@
 #include "http_parser.h"
 #include <algorithm>
+#include <cctype>
 
 HttpParser::HttpParser(): state_(State::METHOD), content_length_(0), body_read_(0) {}
 
@@ -34,6 +35,7 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
     consumed = 0;
     for (size_t i = 0; i < len; ++i) {
         char c = data[i];
+        consumed = i + 1;
         switch (state_) {
             case State::METHOD:
                 if (c == ' ') {
@@ -108,6 +110,10 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                 }
             break;
             case State::HEADER:
+                if (++headers_read_ > MAX_HEADERS_SIZE) {
+                    fail(ParseError::HEADERS_TOO_LARGE);
+                    return false;
+                }
                 if (c == '\r') {
                     // skip
                 } else if (c == '\n') {
@@ -119,7 +125,12 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                         // chunked is supported; anything else is refused (smuggling vector).
                         auto it_te = request.headers.find("transfer-encoding");
                         if (it_te != request.headers.end()) {
-                            if (it_te->second.find("chunked") == std::string::npos) {
+                            std::string transfer_encoding = it_te->second;
+                            std::transform(transfer_encoding.begin(), transfer_encoding.end(),
+                                           transfer_encoding.begin(), [](unsigned char ch) {
+                                               return static_cast<char>(std::tolower(ch));
+                                           });
+                            if (transfer_encoding != "chunked") {
                                 fail(ParseError::INVALID_TRANSFER_ENCODING);
                                 return false;
                             }
@@ -211,6 +222,10 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                                 fail(ParseError::CL_TE_CONFLICT);
                                 return false;
                             }
+                            if (request.headers.count("transfer-encoding")) {
+                                fail(ParseError::INVALID_TRANSFER_ENCODING);
+                                return false;
+                            }
                         }
 
                         request.headers[key] = value;
@@ -278,7 +293,7 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                         // consume a chunk data byte
                         request.body += c;
                         chunk_data_remaining_--;
-                        if (request.body.size() >= MAX_BODY_SIZE) {
+                        if (request.body.size() > MAX_BODY_SIZE) {
                             fail(ParseError::BODY_TOO_LARGE);
                             return false;
                         }
@@ -315,7 +330,6 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                 // append the byte to request.body
                 request.body += c;
                 body_read_++;
-                consumed++;
                 if (body_read_ >= content_length_) {
                     state_ = State::DONE;
                     return true; // request fully parsed
@@ -335,6 +349,7 @@ void HttpParser::reset(){
     parse_error_ = ParseError::NONE;
     content_length_ = 0;
     body_read_ = 0;
+    headers_read_ = 0;
     chunk_size_hex_buffer_.clear();
     chunk_data_remaining_ = 0;
     chunk_state_ = ChunkState::SIZE;
