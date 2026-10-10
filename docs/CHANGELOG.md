@@ -34,7 +34,9 @@ Commercial-readiness hardening pass: a correctness/security audit produced four 
 
 ### Resource budgets and overload behaviour
 
-The remaining commercial-readiness gap was that capacity was unbounded and its overload behaviour undefined. Each resource now has an explicit limit with a defined response, and the whole set is tabulated in [DEPLOYMENT.md](DEPLOYMENT.md) §11.
+The remaining commercial-readiness gap was that capacity was unbounded and its overload behaviour undefined. Each resource now has an explicit limit with a defined response, tabulated in [DEPLOYMENT.md](DEPLOYMENT.md) §11.
+
+- **`max_response_bytes` (default 64 MB) makes the dominant memory term explicit.** The cap on a single buffered upstream response was a hard-coded `constexpr` in the proxy path, invisible to operators — yet multiplied by concurrent proxied requests it dominates memory use. It is now a validated config key (1 byte .. 4 GiB), threaded through `forward_request`; a response above it is rejected as a framing error (502) instead of buffered unbounded. DEPLOYMENT.md §11 gains a **memory model** with the worst-case formula and sizing guidance.
 
 - **`max_connections` (default 10000) caps concurrent client connections process-wide.** It is enforced through a new `ConnectionBudget` shared by all workers (a per-worker counter would let the process hold `num_workers × limit`). A slot is reserved at accept and held by an RAII `Ticket` stored in the connection-table entry, so it is released exactly once on any teardown path (idle timeout, peer close, handshake failure, forced drain) — the accounting cannot drift from the real connection set.
 - **Overload sheds, it does not queue.** When the ceiling is reached, the connection is accepted and closed immediately (no TLS handshake, no epoll registration). This deliberately drains the kernel backlog — the listen fd is level-triggered, so leaving connections unaccepted would spin the worker — and keeps the fd/memory cost of a flood bounded.
