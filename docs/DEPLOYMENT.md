@@ -35,6 +35,7 @@ Secrets precedence: `GW_API_KEYS` env > `api_keys_file` > inline `api_keys`.
 {
   "port": 5005,
   "num_workers": 4,
+  "max_connections": 10000,
   "keepalive_timeout": 60,
   "shutdown_drain_timeout": 30,
   "upstreams": {
@@ -61,6 +62,7 @@ Key points:
 
 - `admin.enabled` exposes the operations API on a **separate listener** (never the data-plane port). Keep `bind` on `127.0.0.1` (or an mgmt-network address) and require a dedicated key — admin access is a full control-plane capability.
 - `shutdown_drain_timeout` is the graceful-shutdown drain budget; keep it below systemd's `TimeoutStopSec`.
+- `max_connections` caps concurrent client connections process-wide. Set it below the process fd limit (`ulimit -n`) minus the fds needed for upstream connections and the listeners; see §11 for the full budget table and overload behaviour.
 
 ## 4. systemd Service
 
@@ -152,3 +154,29 @@ The `logging` section controls data-plane request logs. `access_log_enabled` dis
 ```
 
 Set either redaction switch to `false` only when logging the corresponding raw values is explicitly acceptable. Request and response bodies are not included in CLF or AUDIT entries.
+
+## 11. Capacity and Resource Budgets
+
+Every resource the gateway consumes is bounded, and each bound has a defined overload behaviour so a flood degrades predictably instead of exhausting fds or memory. Plan capacity from this table, not from an open-ended promise.
+
+| Resource | Bound | Key / default | When exceeded |
+|---|---|---|---|
+| Concurrent client connections | process-wide | `max_connections` (10000) | connection accepted then closed immediately (load shed); counted in `epoll_connections_rejected_total` |
+| Listen backlog (pending accepts) | kernel queue | `backlog` (1024) | kernel stops completing handshakes until room frees |
+| Request line | 8 KB | fixed | 400 + `Connection: close` |
+| Single header line | 8 KB | fixed | 400 + `Connection: close` |
+| Whole header block | 64 KB | fixed | 400 + `Connection: close` |
+| Request body | 1 MB | fixed (`MAX_BODY_SIZE`) | 413 + `Connection: close` |
+| Upstream fan-out concurrency (composite routes) | per process | `upstream_max_inflight` (4) | deterministic 503; requires restart to change |
+| Upstream fan-out queue (composite routes) | per process | `upstream_max_queue` (64) | deterministic 503; requires restart to change |
+| Idle upstream connections | per upstream | fixed (16, 60s idle) | FIFO eviction of the oldest idle connection |
+| Idle client keep-alive | per connection | `keepalive_timeout` (60s) | connection closed by the 1-second reaper |
+| Request rate | per key/IP | `rate_limit` / per-key `rate_limit` | 429 |
+| Worker threads | per process | `thread_pool` min/max | thread pool scales within bounds, then queues |
+
+Notes:
+
+- **`max_connections` is the fd budget in practice.** Set it to `ulimit -n` minus the fds reserved for upstream connections (up to 16 idle per upstream, plus one per in-flight proxied request), the listen sockets (one per worker) and the admin listener. Raise the process `LimitNOFILE` in the systemd unit before raising this value.
+- **`epoll_connections_active`** (gauge) and **`epoll_connections_rejected_total`** (counter) in `/metrics` let you watch how close a deployment runs to its ceiling and whether shedding is happening.
+- `max_connections` and `rate_limit` apply on reload; `upstream_max_inflight` / `upstream_max_queue` are fixed at startup because the executor's threads are sized once.
+- The composite fan-out limits bound the async executor, not the ordinary single-upstream path, which runs inline on worker threads and is bounded by `max_connections`.

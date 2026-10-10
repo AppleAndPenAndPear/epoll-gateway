@@ -234,10 +234,14 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - Parser robustness: bare-LF rejection, whitespace-before-colon rejection, full chunked-trailer consumption
   - Forwarded headers: `X-Forwarded-Proto`/`X-Forwarded-Host` added, `X-Real-IP` overwritten (not appended)
   - Connection-reuse integration test de-flaked (health-probe connections no longer counted)
-- Current verification: 130/130 unit, 127/127 integration (2026-10-10)
+- [x] Resource budgets and overload defence (2026-10-10)
+  - Process-wide `max_connections` enforced by a shared `ConnectionBudget`; over-limit connections are accepted and shed immediately so a flood cannot exhaust fds/memory
+  - Composite fan-out limits (`upstream_max_inflight`/`upstream_max_queue`) made configurable instead of hard-coded
+  - `epoll_connections_active` / `epoll_connections_rejected_total` metrics; full per-resource budget table in [DEPLOYMENT.md](DEPLOYMENT.md) §11
+- Current verification: 139/139 unit, 129/129 integration (2026-10-10)
 
 ### Next in the active sequence
 
-- **Resource budgets and overload behaviour (promote ahead of commercial features).** Define and document explicit caps for max connections, request/response body size, upstream concurrency, file descriptors and memory, and the reject/queue policy when each is exceeded; only then claim commercial capacity. This is the highest-value remaining reliability gap for production use.
+- **Resource budgets and overload behaviour — done 2026-10-10.** Process-wide `max_connections` with accept-time load shedding (RAII budget shared across workers), configurable composite fan-out limits (`upstream_max_inflight` / `upstream_max_queue`), connection metrics, and a full capacity table with per-resource overload behaviour in [DEPLOYMENT.md](DEPLOYMENT.md) §11. Still open: an explicit memory budget and a load/overload test that validates the documented behaviour under sustained pressure (the bounds are enforced, but not yet proven end-to-end at scale).
 - **Supply-chain scanning as a prerequisite, not a follow-up.** Add dependency and artifact scanning (SCA), a SAST pass, SBOM generation and checksums to CI before the next release tag, so a release cannot ship with a known-vulnerable dependency.
 - **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and all AI-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.

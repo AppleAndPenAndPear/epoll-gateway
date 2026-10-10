@@ -7,8 +7,8 @@ Building the core capability set of a commercial API gateway. The regression saf
 ## Current Validation
 
 - C++17 Release build passes.
-- Native Google Test suite: 130/130 passing (2026-10-10, `./build/tests/runTests`).
-- Integration tests: 127/127 passing (2026-10-10, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Native Google Test suite: 139/139 passing (2026-10-10, `./build/tests/runTests`).
+- Integration tests: 129/129 passing (2026-10-10, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
 - Covered: HTTP parser (incl. smuggling vectors, bare-LF and whitespace-before-colon rejection, full chunked-trailer consumption), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots.
 - Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤4 backend connections), forwarded headers (`X-Forwarded-Proto`/`X-Forwarded-Host`, spoofed `X-Real-IP` overwritten), hop-by-hop stripping on both hops, upstream-response header-injection rejection, single-pass gzip of an already-encoded backend response, bounded composite fan-out, and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
@@ -210,13 +210,13 @@ Client connects
 - The upstream connection pool keeps only idle connections in memory (no cross-process sharing); load balancing currently supports `round_robin` only (upstream I/O is now scheduled through the bounded async executor).
 - OpenTelemetry export and full distributed tracing are not integrated; W3C `traceparent` propagation and external audit storage are not yet provided.
 - A dynamic thread pool interface exists, but the main HTTP path still mostly runs on worker threads.
-- **Resource budgets are not yet unified or documented.** Individual caps exist (request-line/header size, `MAX_BODY_SIZE`, accept backlog, pool idle cap, bounded executor queue), but there is no single documented statement of max connections, max upstream concurrency, fd budget, memory budget, and the reject/queue policy when each is exceeded. Until this exists, capacity claims are unproven — this is the top remaining gap.
+- **Resource budgets are enforced and documented; validation at scale is pending.** Every resource now has an explicit limit and a defined overload behaviour, tabulated in [DEPLOYMENT.md](DEPLOYMENT.md) §11, including the new process-wide `max_connections` (accept-time load shedding) and configurable composite fan-out limits. What remains is an explicit **memory** budget and a sustained **load/overload test** proving the documented behaviour end-to-end; until that runs, capacity is bounded by design but not yet demonstrated under pressure.
 - No supply-chain gate yet: CI builds and tests, but does not run dependency/artifact scanning (SCA), SAST, or SBOM/checksum generation. This must be added before the next release tag.
 - Backend mTLS (client certificates), OIDC/JWT, distributed quotas and multi-instance state sharing are deliberately not implemented; the project is single-node and assumes no external coordination service.
 
 ## Next Steps
 
-1. **Resource budgets and overload behaviour (do first).** Define and document explicit caps (connections, request/response body, upstream concurrency, fds, memory) and the reject/queue behaviour past each cap; validate with a load/overload test.
+1. **Finish resource-budget validation.** The caps and overload behaviour are implemented and documented (2026-10-10); add an explicit memory budget and a sustained load/overload test that proves the documented shedding and 503 behaviour end-to-end.
 2. **Supply-chain scanning in CI (prerequisite for the next release).** Add SCA + SAST + SBOM/checksum generation so a release cannot publish a known-vulnerable dependency.
 3. Complete per-route/host/tenant latency histograms and failure-rate metrics.
 4. Profile the known Nginx throughput gap (isolate log-write, buffer-copy and TLS-record costs) before further optimization; record evidence in [BENCHMARKS.md](BENCHMARKS.md).

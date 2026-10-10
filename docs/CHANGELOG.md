@@ -30,7 +30,18 @@ Commercial-readiness hardening pass: a correctness/security audit produced four 
 ### Added
 
 - **Forwarded-request headers completed.** Upstream requests now carry `X-Forwarded-Proto` (always `https`, since the client-facing listener is TLS-only by configuration) and `X-Forwarded-Host` (from the client's `Host`), and `X-Real-IP` is overwritten rather than appended so a client-supplied value cannot survive. All these names are written lowercase to match the parser's lowercased header keys — writing mixed case would create a second map entry alongside a client-supplied name and let the client spoof the value (this exact bug was caught by the new integration assertion).
-- 6 parser unit tests (bare-LF request line / header terminator / end-of-headers, whitespace before colon, full chunked-trailer consumption, keep-alive after a trailer request) and 5 integration groups (forwarded headers incl. spoof overwrite, hop-by-hop stripping, upstream response-header injection, no double gzip, bounded composite fan-out). Totals: 130 unit / 127 integration.
+- 6 parser unit tests (bare-LF request line / header terminator / end-of-headers, whitespace before colon, full chunked-trailer consumption, keep-alive after a trailer request) and 5 integration groups (forwarded headers incl. spoof overwrite, hop-by-hop stripping, upstream response-header injection, no double gzip, bounded composite fan-out). Totals: 130 unit / 127 integration before the resource-budget work below.
+
+### Resource budgets and overload behaviour
+
+The remaining commercial-readiness gap was that capacity was unbounded and its overload behaviour undefined. Each resource now has an explicit limit with a defined response, and the whole set is tabulated in [DEPLOYMENT.md](DEPLOYMENT.md) §11.
+
+- **`max_connections` (default 10000) caps concurrent client connections process-wide.** It is enforced through a new `ConnectionBudget` shared by all workers (a per-worker counter would let the process hold `num_workers × limit`). A slot is reserved at accept and held by an RAII `Ticket` stored in the connection-table entry, so it is released exactly once on any teardown path (idle timeout, peer close, handshake failure, forced drain) — the accounting cannot drift from the real connection set.
+- **Overload sheds, it does not queue.** When the ceiling is reached, the connection is accepted and closed immediately (no TLS handshake, no epoll registration). This deliberately drains the kernel backlog — the listen fd is level-triggered, so leaving connections unaccepted would spin the worker — and keeps the fd/memory cost of a flood bounded.
+- **Composite fan-out limits are now configurable** (`upstream_max_inflight` default 4, `upstream_max_queue` default 64) instead of hard-coded constants, so the async upstream budget is tunable per deployment. Exceeding them returns a deterministic 503. These are fixed at startup because the executor's threads are sized once.
+- **Observability:** `epoll_connections_active` (gauge) and `epoll_connections_rejected_total` (counter) in `/metrics`; the gauge is sampled by the 1-second reaper so the accept/release hot path stays free of metrics work.
+- `max_connections` is validated (`must be > 0`) and applies live on reload; lowering it never evicts existing connections, it only refuses new ones until usage drops below the new ceiling.
+- Tests: 9 unit tests (admission, release, move semantics, live limit changes, and a concurrent-acquire test proving the limit is never exceeded) plus an integration case that runs a dedicated server with `max_connections: 1` and asserts the second connection is shed while the first is kept.
 
 ### Changed
 
