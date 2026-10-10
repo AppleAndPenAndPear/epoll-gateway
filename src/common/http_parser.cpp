@@ -77,8 +77,16 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
             break;
             case State::VERSION:
                 if (c == '\r') {
-                    // skip
+                    cr_seen_ = true;
                 } else if (c == '\n') {
+                    // The request line must end with CRLF; a bare LF is refused
+                    // because some intermediaries treat it as a line terminator
+                    // and others do not, which enables request smuggling.
+                    if (!cr_seen_) {
+                        fail(ParseError::INVALID_HEADER);
+                        return false;
+                    }
+                    cr_seen_ = false;
                     request.version = buffer_;
                     buffer_.clear();
                     state_ = State::HEADER;
@@ -86,6 +94,7 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                     fail(ParseError::INVALID_HEADER);
                     return false;
                 } else {
+                    cr_seen_ = false;
                     buffer_ += c;
                     if (buffer_.size() > MAX_REQUEST_LINE_SIZE) {
                         fail(ParseError::REQUEST_LINE_TOO_LONG);
@@ -115,8 +124,14 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                     return false;
                 }
                 if (c == '\r') {
-                    // skip
+                    cr_seen_ = true;
                 } else if (c == '\n') {
+                    // Header lines must be CRLF-terminated; see State::VERSION.
+                    if (!cr_seen_) {
+                        fail(ParseError::INVALID_HEADER);
+                        return false;
+                    }
+                    cr_seen_ = false;
                     if (buffer_.empty()) {
                         // end of headers; determine the body type that follows
                         consumed = i + 1;   // count the current newline
@@ -185,13 +200,18 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                         }
                         std::string key = buffer_.substr(0, colon);
                         std::string value = buffer_.substr(colon + 1);
-                        // trim leading/trailing whitespace
-                        key.erase(0, key.find_first_not_of(" \t"));
-                        key.erase(key.find_last_not_of(" \t") + 1);
+                        // Only the value is trimmed. The field name is validated
+                        // as raw tchars below, so whitespace before the colon
+                        // ("Foo : bar") is rejected rather than silently accepted
+                        // — that form is a request-smuggling vector when another
+                        // parser on the path is more lenient about it.
                         value.erase(0, value.find_first_not_of(" \t"));
                         value.erase(value.find_last_not_of(" \t") + 1);
-                        // lowercase the key to make lookups case-insensitive
-                        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+                        // lowercase the key to make lookups case-insensitive.
+                        // The cast to unsigned char is required: passing a
+                        // negative char to std::tolower is undefined behaviour.
+                        std::transform(key.begin(), key.end(), key.begin(),
+                                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
                         // Reject illegal characters in the header line
                         if (key.empty()) {
@@ -233,6 +253,7 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                     }
                 }
                 else {
+                    cr_seen_ = false;
                     buffer_ += c;
                     if (buffer_.size() > MAX_HEADER_LINE_SIZE) {
                         fail(ParseError::HEADER_TOO_LONG);
@@ -270,9 +291,10 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                                 }
                                 chunk_size_hex_buffer_.clear();
                                 if (size == 0) {
-                                    // last chunk; prepare to read the trailing CRLF
+                                    // last chunk; read the trailer section (which
+                                    // may be empty) up to its terminating CRLF
                                     chunk_state_ = ChunkState::TRAILER;
-                                    expecting_final_lf_ = false;  // handled via the expecting_final_lf_ member
+                                    buffer_.clear();
                                 } else {
                                     chunk_data_remaining_ = size;
                                     chunk_state_ = ChunkState::DATA;
@@ -303,17 +325,27 @@ bool HttpParser::parse(const char* data, size_t len, HttpRequest& request,size_t
                         }
                         break;
                     case ChunkState::TRAILER:
-                        // trailer after the last chunk (size=0); wait for \r\n
+                        // Trailer section after the last chunk: zero or more
+                        // "field: value" CRLF lines, then a final empty line.
+                        // Consuming only the first CRLF (as before) left the
+                        // terminating CRLF in the stream, which desynced and
+                        // broke the next request on the same connection.
                         if (c == '\r') {
-                            expecting_final_lf_ = true;
-                        } else if (c == '\n' && expecting_final_lf_) {
-                            // final CRLF seen; the whole chunked body is complete
-                            state_ = State::DONE;
-                            consumed = i + 1;
-                            return true;
+                            // ignore CR; the following LF ends the current line
+                        } else if (c == '\n') {
+                            if (buffer_.empty()) {
+                                // empty line: end of the trailer section/message
+                                state_ = State::DONE;
+                                consumed = i + 1;
+                                return true;
+                            }
+                            buffer_.clear();  // finished one trailer field line
                         } else {
-                            // possibly a trailer field; simply ignore it and reset the flag
-                            expecting_final_lf_ = false;
+                            buffer_ += c;
+                            if (buffer_.size() > MAX_HEADER_LINE_SIZE) {
+                                fail(ParseError::HEADER_TOO_LONG);
+                                return false;
+                            }
                         }
                         break;
                     case ChunkState::DONE:
@@ -353,5 +385,5 @@ void HttpParser::reset(){
     chunk_size_hex_buffer_.clear();
     chunk_data_remaining_ = 0;
     chunk_state_ = ChunkState::SIZE;
-    expecting_final_lf_ = false;
+    cr_seen_ = false;
 }

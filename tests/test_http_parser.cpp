@@ -248,3 +248,65 @@ TEST(HttpParserSmugglingTest, ResetClearsErrorState) {
     std::string good = "GET / HTTP/1.1\r\n\r\n";
     EXPECT_TRUE(parser.parse(good.data(), good.size(), request, consumed));
 }
+
+// Bare LF as a line terminator is a request-smuggling vector: some
+// intermediaries normalize it to CRLF and others do not. The parser must
+// require a proper CRLF everywhere the spec demands one.
+TEST(HttpParserSmugglingTest, RejectsBareLfRequestLine) {
+    auto out = parse_raw("GET / HTTP/1.1\nHost: h\r\n\r\n");
+    EXPECT_FALSE(out.done);
+    EXPECT_EQ(out.error, HttpParser::ParseError::INVALID_HEADER);
+}
+
+TEST(HttpParserSmugglingTest, RejectsBareLfHeaderTerminator) {
+    auto out = parse_raw("GET / HTTP/1.1\r\nHost: h\n\r\n");
+    EXPECT_FALSE(out.done);
+    EXPECT_EQ(out.error, HttpParser::ParseError::INVALID_HEADER);
+}
+
+TEST(HttpParserSmugglingTest, RejectsBareLfEndOfHeaders) {
+    auto out = parse_raw("GET / HTTP/1.1\r\nHost: h\r\n\n");
+    EXPECT_FALSE(out.done);
+    EXPECT_EQ(out.error, HttpParser::ParseError::INVALID_HEADER);
+}
+
+// Whitespace before the colon ("Host : value") is forbidden by RFC 7230 and is
+// another smuggling differential between lenient and strict parsers.
+TEST(HttpParserSmugglingTest, RejectsWhitespaceBeforeHeaderColon) {
+    auto out = parse_raw("GET / HTTP/1.1\r\nHost : h\r\n\r\n");
+    EXPECT_FALSE(out.done);
+    EXPECT_EQ(out.error, HttpParser::ParseError::INVALID_HEADER);
+}
+
+// A chunked body with a trailer section must consume the *entire* trailer,
+// including the terminating CRLF. Consuming only the first CRLF left bytes
+// behind that desynced the next request on a keep-alive connection.
+TEST(HttpParserSmugglingTest, ConsumesFullChunkedTrailerSection) {
+    HttpParser parser;
+    HttpRequest request;
+    size_t consumed = 0;
+    const std::string raw =
+        "POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "3\r\nabc\r\n0\r\nX-Sum: 3\r\n\r\n";
+    EXPECT_TRUE(parser.parse(raw.data(), raw.size(), request, consumed));
+    EXPECT_EQ(parser.error(), HttpParser::ParseError::NONE);
+    EXPECT_EQ(request.body, "abc");
+    EXPECT_EQ(consumed, raw.size());
+}
+
+TEST(HttpParserSmugglingTest, KeepAliveAfterChunkedTrailerRequest) {
+    HttpParser parser;
+    HttpRequest request;
+    size_t consumed = 0;
+    const std::string first =
+        "POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "3\r\nabc\r\n0\r\nX-Sum: 3\r\n\r\n";
+    EXPECT_TRUE(parser.parse(first.data(), first.size(), request, consumed));
+
+    // The connection must still be parseable for the next request.
+    parser.reset();
+    request.clear();
+    const std::string second = "GET /next HTTP/1.1\r\n\r\n";
+    EXPECT_TRUE(parser.parse(second.data(), second.size(), request, consumed));
+    EXPECT_EQ(request.path, "/next");
+}

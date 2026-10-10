@@ -96,5 +96,7 @@ private:
     ParseError parse_error_ = ParseError::NONE;  // set when the request is rejected
     std::string chunk_size_hex_buffer_;
     size_t chunk_data_remaining_ = 0;
-    bool expecting_final_lf_ = false;   // used to wait for the final \n in the TRAILER state
+    // True when the previous byte was CR, so a following LF can be required to
+    // form a proper CRLF line ending (bare LF is refused as a smuggling vector).
+    bool cr_seen_ = false;
 };
