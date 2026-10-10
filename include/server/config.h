@@ -142,6 +142,12 @@ struct Config {
     unsigned short port = 5005;
     // listen backlog
     int backlog = 1024;
+    // Process-wide ceiling on concurrent client connections. When reached, new
+    // connections are accepted and immediately closed (load shedding) instead of
+    // being queued, so an overload cannot exhaust file descriptors or memory.
+    // Must stay below the process fd limit (ulimit -n) minus the fds needed for
+    // upstream connections, the listen sockets and the admin listener.
+    size_t max_connections = 10000;
     // Number of worker threads (0 means use hardware_concurrency)
     unsigned int num_workers = 0;
     // Static file root directory
@@ -163,6 +169,14 @@ struct Config {
         size_t scale_up_threshold = 2;
         size_t scale_down_threshold = 1;
     } thread_pool;
+
+    // Composite-route fan-out budget: the number of upstream tasks that may run
+    // concurrently, and how many more may wait in the queue before submissions
+    // are rejected with a deterministic 503. These bound the threads and memory
+    // a burst of composite requests can consume. Changes require a restart,
+    // because the executor's worker threads are sized once at startup.
+    size_t upstream_max_inflight = 4;
+    size_t upstream_max_queue = 64;
 
     UpstreamConfig upstream_config;
 
@@ -199,6 +213,9 @@ struct Config {
         std::vector<std::string> errors;
         if (config.port == 0) errors.push_back("port: must be in [1, 65535]");
         if (config.backlog <= 0) errors.push_back("backlog: must be > 0");
+        if (config.max_connections == 0) errors.push_back("max_connections: must be > 0");
+        if (config.upstream_max_inflight == 0)
+            errors.push_back("upstream_max_inflight: must be > 0");
         if (config.keepalive_timeout <= 0) errors.push_back("keepalive_timeout: must be > 0");
         if (config.shutdown_drain_timeout <= 0) errors.push_back("shutdown_drain_timeout: must be > 0");
         if (config.logging.sensitive_headers.empty())
@@ -514,6 +531,21 @@ struct Config {
             long long v = config.cache_max_file_size_mb;
             if (read_int(j, "cache_max_file_size_mb", 1, 1000000, v, ""))
                 config.cache_max_file_size_mb = static_cast<size_t>(v);
+        }
+        {
+            long long v = static_cast<long long>(config.max_connections);
+            if (read_int(j, "max_connections", 1, 1000000000, v, ""))
+                config.max_connections = static_cast<size_t>(v);
+        }
+        {
+            long long v = static_cast<long long>(config.upstream_max_inflight);
+            if (read_int(j, "upstream_max_inflight", 1, 100000, v, ""))
+                config.upstream_max_inflight = static_cast<size_t>(v);
+        }
+        {
+            long long v = static_cast<long long>(config.upstream_max_queue);
+            if (read_int(j, "upstream_max_queue", 0, 1000000, v, ""))
+                config.upstream_max_queue = static_cast<size_t>(v);
         }
         {
             long long v = config.keepalive_timeout;

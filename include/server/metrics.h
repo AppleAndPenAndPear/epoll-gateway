@@ -43,6 +43,11 @@ private:
     // Gzip compression cache statistics
     std::atomic<uint64_t> gzip_cache_hits_{0};
     std::atomic<uint64_t> gzip_cache_misses_{0};
+
+    // Connection-budget observability: how many connections are currently held
+    // and how many were shed because the ceiling was reached.
+    std::atomic<uint64_t> connections_active_{0};
+    std::atomic<uint64_t> connections_rejected_{0};
     std::array<std::atomic<uint64_t>, 8> upstream_error_counts_{};
 
     mutable std::mutex route_metrics_mutex_;
@@ -92,4 +97,8 @@ public:
     void record_gzip_cache_hit();
     void record_gzip_cache_miss();
     void record_upstream_error(BackendError error);
+
+    // Connection budget: publish the live count and count overload sheds.
+    void set_active_connections(size_t count);
+    void record_connection_rejected();
 };

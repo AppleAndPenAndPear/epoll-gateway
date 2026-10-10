@@ -28,6 +28,10 @@ void Tcpserver::start(unsigned int num_workers, const Config& config, const std:
   Logger::get()->info("Starting {} worker threads with SO_REUSEPORT", num_workers);
 
   auto shared_limiter = std::make_shared<RateLimiterManager>(config.rate_limit_config);
+  // One connection budget shared by all workers: the limit is a process ceiling,
+  // not a per-worker one, so N workers cannot hold N times the connections.
+  auto shared_budget = std::make_shared<ConnectionBudget>(config.max_connections);
+  Logger::get()->info("Connection budget set to {} concurrent connections", config.max_connections);
 
   // Create N listen sockets and start worker threads. All workers share one
   // UpstreamManager so health/circuit state is process-wide (and visible to
@@ -35,7 +39,8 @@ void Tcpserver::start(unsigned int num_workers, const Config& config, const std:
   for (unsigned int i = 0; i < num_workers; ++i) {
     Socket listen_sock = create_listen_sock();
     workers_.emplace_back(std::make_unique<TcpWorker>(std::move(listen_sock), m_threadpool.get(), config,
-                                                      upstream_manager, shared_limiter, config_path));
+                                                      upstream_manager, shared_limiter, shared_budget,
+                                                      config_path));
     threads_.emplace_back(&TcpWorker::run, workers_.back().get());
   }
 

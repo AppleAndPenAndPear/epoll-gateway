@@ -5,6 +5,7 @@
 #include "myepoll.h"
 #include "http_handler.h"
 #include "upstream_manager.h"
+#include "connection_budget.h"
 
 extern std::atomic<bool> stop_server_flag;
 extern std::atomic<uint64_t> config_reload_generation;
@@ -26,8 +27,15 @@ private:
   struct ConnInfo {
     std::shared_ptr<Socket> sock;
     SSLState ssl_state;
+    // Holds one slot of the process-wide connection budget for the lifetime of
+    // this entry. Destroying the entry (any teardown path) releases the slot, so
+    // the accounting cannot drift from the actual connection set.
+    ConnectionBudget::Ticket budget_ticket;
   };
   std::unordered_map<int, ConnInfo> conns_;
+
+  // Shared process-wide connection budget; empty when no limit is configured.
+  std::shared_ptr<ConnectionBudget> connection_budget_;
 
   // Shared process-wide (also used by the admin API) so health and circuit
   // state is consistent no matter which worker served a request.
@@ -55,7 +63,8 @@ private:
 public:
   TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config,
             std::shared_ptr<UpstreamManager> upstream_manager,
-            std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path);
+            std::shared_ptr<RateLimiterManager> rate_limiter_manager,
+            std::shared_ptr<ConnectionBudget> connection_budget, const std::string& config_path);
 
   void run();
   void handle_accept();

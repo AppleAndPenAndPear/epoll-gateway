@@ -94,6 +94,14 @@ void Metrics::record_upstream_error(BackendError error) {
     }
 }
 
+void Metrics::set_active_connections(size_t count) {
+    connections_active_.store(count, std::memory_order_relaxed);
+}
+
+void Metrics::record_connection_rejected() {
+    connections_rejected_.fetch_add(1, std::memory_order_relaxed);
+}
+
 Metrics::Snapshot Metrics::snapshot() const {
     Snapshot s;
     s.total_requests = total_requests_.load(std::memory_order_relaxed);
@@ -153,6 +161,13 @@ std::string Metrics::to_string() const {
         oss << "# HELP epoll_gzip_cache_misses_total Total gzip cache misses\n";
         oss << "# TYPE epoll_gzip_cache_misses_total counter\n";
         oss << "epoll_gzip_cache_misses_total " << gzip_cache_misses_.load() << "\n";
+
+        oss << "# HELP epoll_connections_active Currently open client connections\n";
+        oss << "# TYPE epoll_connections_active gauge\n";
+        oss << "epoll_connections_active " << connections_active_.load() << "\n";
+        oss << "# HELP epoll_connections_rejected_total Connections shed because max_connections was reached\n";
+        oss << "# TYPE epoll_connections_rejected_total counter\n";
+        oss << "epoll_connections_rejected_total " << connections_rejected_.load() << "\n";
 
         oss << "# HELP epoll_upstream_errors_total Upstream proxy errors by type\n";
         oss << "# TYPE epoll_upstream_errors_total counter\n";

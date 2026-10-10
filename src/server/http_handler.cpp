@@ -381,7 +381,9 @@ static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& 
 
 HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager, ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
 cache_(config.cache_max_entries, config.cache_max_file_size_mb), 
-upstream_manager_(upstream_manager), upstream_executor_(4, 64), api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
+upstream_manager_(upstream_manager),
+    upstream_executor_(config.upstream_max_inflight, config.upstream_max_queue),
+    api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
     register_default_routes();
     register_configured_routes();
 }

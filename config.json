@@ -1,6 +1,7 @@
 {
     "port": 5005,
     "backlog": 1024,
+    "max_connections": 10000,
     "num_workers": 2,
     "www_root": "./www",
     "thread_pool": {

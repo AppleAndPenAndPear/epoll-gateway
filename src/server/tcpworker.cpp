@@ -1,18 +1,23 @@
 #include "tcpworker.h"
+#include "metrics.h"
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
+#include <optional>
 
 
 TcpWorker::TcpWorker(Socket&& listen_sock, DynamicThreadPool* pool, const Config& config,
                      std::shared_ptr<UpstreamManager> upstream_manager,
-                     std::shared_ptr<RateLimiterManager> rate_limiter_manager, const std::string& config_path):
+                     std::shared_ptr<RateLimiterManager> rate_limiter_manager,
+                     std::shared_ptr<ConnectionBudget> connection_budget, const std::string& config_path):
   listen_sock_(std::move(listen_sock)),
   pool_(pool),
   closed_(false),
   epoll_(),
+  connection_budget_(std::move(connection_budget)),
   upstream_manager_(std::move(upstream_manager)),
   api_key_manager_(config.api_keys),
   rate_limiter_manager_(std::move(rate_limiter_manager)),
@@ -65,6 +70,11 @@ void TcpWorker::check_timeout() {
     } else {
       handler_.reload_config(reloaded);
       keepalive_timeout_ = reloaded.keepalive_timeout;
+      // max_connections is applied live: the budget is process-wide and lowering
+      // the ceiling never evicts existing connections, it only stops new ones.
+      if (connection_budget_) {
+        connection_budget_->set_limit(reloaded.max_connections);
+      }
 
       // Hot-reload the certificate/private key from the (possibly new) paths.
       // SSL objects hold their own reference to the old context, so freeing it
@@ -112,6 +122,13 @@ void TcpWorker::check_timeout() {
     }
     
     upstream_manager_->check_health();  // Active health check every second
+
+    // Publish the live connection count for capacity monitoring. Sampled here
+    // (once per second) rather than on every accept/release so the hot path
+    // stays lock-free and free of metrics work.
+    if (connection_budget_) {
+      Metrics::instance().set_active_connections(connection_budget_->in_use());
+    }
 
     // Periodically clean up long-unused rate limiters to prevent unbounded memory growth (shared across workers, protected by a mutex)
     if (now - last_limiter_cleanup_ >= 60) {
@@ -226,6 +243,24 @@ void TcpWorker::handle_accept() {
     }
     int clientsock = *client_opt; // Safe dereference
 
+    // Overload control: reserve a slot from the process-wide connection budget
+    // before doing any per-connection work. When the limit is reached we close
+    // the socket immediately (no TLS handshake, no epoll registration). This
+    // drains the kernel backlog so the level-triggered listen fd cannot spin,
+    // and keeps the fd/memory cost of an overload bounded. `ticket` is empty
+    // only when no budget is configured, in which case we do not limit at all.
+    std::optional<ConnectionBudget::Ticket> ticket;
+    if (connection_budget_) {
+      ticket = connection_budget_->try_acquire();
+      if (!ticket) {
+        Metrics::instance().record_connection_rejected();
+        Logger::get()->warn("Connection budget of {} reached ({} in use); shedding new connection",
+                            connection_budget_->limit(), connection_budget_->in_use());
+        ::close(clientsock);
+        continue;
+      }
+    }
+
     // Get the client IP
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client.sin_addr, ip_str, sizeof(ip_str));
@@ -247,7 +282,15 @@ void TcpWorker::handle_accept() {
     }
 
     epoll_.add(clientsock, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT);
-    conns_[clientsock] = {client_sock, SSLState::HANDSHAKING};
+    // Move the reserved slot into the connection entry: from here the slot is
+    // released when the entry is destroyed on any teardown path. Assignment (not
+    // emplace) is deliberate: fd numbers are reused, and an entry for this fd may
+    // still be present if its teardown event has not been processed yet. emplace
+    // would leave that stale entry in place and drop this socket, closing the fd
+    // the kernel just handed us. Overwriting also releases the stale slot.
+    conns_[clientsock] = ConnInfo{client_sock, SSLState::HANDSHAKING,
+                                  ticket ? std::move(*ticket)
+                                         : ConnectionBudget::Ticket{}};
     handler_.on_connect(client_sock.get());   // Initialize the queues
     Logger::get()->info("Worker accepted client fd {}", clientsock);
   }
