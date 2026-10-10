@@ -51,6 +51,10 @@ The remaining commercial-readiness gap was that capacity was unbounded and its o
 - **The connection-reuse integration test was de-flaked.** The mock backend counted every TCP accept, but the gateway's 1-second active health check opens a bare connection to each upstream and never sends a request, so the shared counter was polluted whenever a run straddled a health-check tick. The mock now counts a connection only on the first request it actually serves, which removes the background noise instead of loosening the assertion.
 - Documentation synced to the shipped code: this file's cross-doc links repaired (`docs/…` paths that resolved to `docs/docs/…`), test counts updated across [PROJECT_STATUS.md](PROJECT_STATUS.md) and [ROADMAP.md](ROADMAP.md), the ROADMAP's stale `../CHANGELOG.md` link fixed, and the API-composition rows in [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md) moved from "待做" to their actual implemented state.
 
+### Supply-chain gate
+
+- **SAST + SBOM + SCA now gate a release.** New `scripts/supply_chain.sh` (invoked as `./ci.sh supply-chain`, deliberately not part of `all` so local builds need not install the tools) runs `cppcheck` SAST over `src/` and `include/` failing only on `error` severity, generates an offline CycloneDX 1.5 SBOM of `build/server`'s linked shared libraries to `build/sbom.cdx.json`, and scans it with `osv-scanner`. A missing tool is reported as SKIPPED with its install command, never a silent pass; GitHub Actions installs `cppcheck` and the `osv-scanner` release binary and fails the job if any gate fails. See [SUPPLY_CHAIN.md](SUPPLY_CHAIN.md).
+
 ## 2026-10-09
 
 ### Added
