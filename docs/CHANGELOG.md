@@ -44,6 +44,7 @@ The remaining commercial-readiness gap was that capacity was unbounded and its o
 - **Observability:** `epoll_connections_active` (gauge) and `epoll_connections_rejected_total` (counter) in `/metrics`; the gauge is sampled by the 1-second reaper so the accept/release hot path stays free of metrics work.
 - `max_connections` is validated (`must be > 0`) and applies live on reload; lowering it never evicts existing connections, it only refuses new ones until usage drops below the new ceiling.
 - Tests: 9 unit tests (admission, release, move semantics, live limit changes, and a concurrent-acquire test proving the limit is never exceeded) plus an integration case that runs a dedicated server with `max_connections: 1` and asserts the second connection is shed while the first is kept.
+- **Sustained load/overload test.** A dedicated server runs with `max_connections: 32` while 100 concurrent clients connect-and-hold for a few seconds, asserting the gateway sheds connections (`epoll_connections_rejected_total > 0`), survives, keeps serving afterwards, and keeps its fd count bounded. Short by default; `EPOLL_LOAD_TEST_SECONDS` extends it for a soak. Integration total: 134.
 
 ### Changed
 

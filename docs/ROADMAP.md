@@ -238,10 +238,10 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - Process-wide `max_connections` enforced by a shared `ConnectionBudget`; over-limit connections are accepted and shed immediately so a flood cannot exhaust fds/memory
   - Composite fan-out limits (`upstream_max_inflight`/`upstream_max_queue`) made configurable instead of hard-coded
   - `epoll_connections_active` / `epoll_connections_rejected_total` metrics; full per-resource budget table in [DEPLOYMENT.md](DEPLOYMENT.md) §11
-- Current verification: 139/139 unit, 129/129 integration (2026-10-10)
+- Current verification: 139/139 unit, 134/134 integration (2026-10-10)
 
 ### Next in the active sequence
 
-- **Resource budgets and overload behaviour — done 2026-10-10.** Process-wide `max_connections` with accept-time load shedding (RAII budget shared across workers), configurable composite fan-out limits (`upstream_max_inflight` / `upstream_max_queue`), a configurable `max_response_bytes` cap on the dominant memory term, connection metrics, and a full capacity table plus a memory model with per-resource overload behaviour in [DEPLOYMENT.md](DEPLOYMENT.md) §11. Still open: a sustained load/overload test that validates the documented behaviour end-to-end (the bounds are enforced and documented, but not yet proven at scale).
+- **Resource budgets and overload behaviour — done 2026-10-10.** Process-wide `max_connections` with accept-time load shedding (RAII budget shared across workers), configurable composite fan-out limits (`upstream_max_inflight` / `upstream_max_queue`), a configurable `max_response_bytes` cap on the dominant memory term, connection metrics, and a full capacity table plus a memory model with per-resource overload behaviour in [DEPLOYMENT.md](DEPLOYMENT.md) §11. A sustained load test now drives demand above `max_connections` and asserts shedding, survivability, recovery and a bounded fd count (short by default; `EPOLL_LOAD_TEST_SECONDS` extends it for a soak).
 - **Supply-chain scanning as a prerequisite, not a follow-up.** Add dependency and artifact scanning (SCA), a SAST pass, SBOM generation and checksums to CI before the next release tag, so a release cannot ship with a known-vulnerable dependency.
 - **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and all AI-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.
