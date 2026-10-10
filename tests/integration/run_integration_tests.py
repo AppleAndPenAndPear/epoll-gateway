@@ -54,6 +54,7 @@ PROFILE_USER = 5617  # Composite profile user dependency
 PROFILE_ORDERS = 5618  # Composite profile orders dependency
 PROFILE_RECOMMENDATIONS = 5619  # Composite profile recommendations dependency
 OVERLOAD_PORT = 5620  # Dedicated server with a tiny connection budget for the overload test
+LOAD_PORT = 5621  # Dedicated server for the sustained load/overload test
 
 BASE = "127.0.0.1"
 ADMIN_PORT = 5615   # Admin API listener (separate from the data plane)
@@ -1126,6 +1127,101 @@ def test_connection_budget_overload():
         log_out.close()
 
 
+def test_overload_load():
+    print("\n[..] Sustained load: connections are shed, the server survives and recovers")
+    # Validates the documented overload behaviour end-to-end: under sustained
+    # pressure above max_connections the gateway sheds connections instead of
+    # exhausting fds or memory, stays alive, keeps serving, and counts the sheds.
+    import threading
+    ws = tempfile.mkdtemp(prefix="epoll-load-")
+    os.symlink(os.path.join(REPO, "certs"), os.path.join(ws, "certs"))
+    os.makedirs(os.path.join(ws, "www"))
+    os.makedirs(os.path.join(ws, "logs"))
+    cap = 32
+    cfg = {
+        "port": LOAD_PORT,
+        "num_workers": 2,
+        "max_connections": cap,
+        "max_response_bytes": 1048576,
+        "www_root": "./www",
+        "keepalive_timeout": 5,
+        "tls": {"cert_path": "certs/server.crt", "key_path": "certs/server.key"},
+        "routes": [],
+        # High limits so rate limiting never masks the connection-budget behaviour.
+        "rate_limit": {"capacity": 1000000, "refill_per_second": 1000000},
+    }
+    with open(os.path.join(ws, "config.json"), "w") as f:
+        f.write(json.dumps(cfg, indent=2))
+    log_out = open(os.path.join(ws, "server_stdout.log"), "w")
+    proc = subprocess.Popen([SERVER_BIN], cwd=ws, stdout=log_out, stderr=log_out)
+    try:
+        if not wait_for_port(LOAD_PORT):
+            check("load-test server started", False, "server never came up")
+            return
+        time.sleep(0.3)  # let wait_for_port's own probe release its slot
+
+        # Duration is short by default so CI stays fast; raise it manually with
+        # EPOLL_LOAD_TEST_SECONDS=30 for a longer soak.
+        duration = float(os.environ.get("EPOLL_LOAD_TEST_SECONDS", "3"))
+        clients = 100
+        hold_s = 0.025  # hold each connection long enough to occupy its slot
+        stop = time.time() + duration
+        attempted = [0]
+        lock = threading.Lock()
+
+        def worker():
+            local = 0
+            while time.time() < stop:
+                try:
+                    s = socket.create_connection((BASE, LOAD_PORT), timeout=2)
+                    time.sleep(hold_s)
+                    s.close()
+                    local += 1
+                except OSError:
+                    pass  # a shed connection surfaces as reset/refused; expected
+            with lock:
+                attempted[0] += local
+
+        threads = [threading.Thread(target=worker) for _ in range(clients)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        check("load phase drove concurrent traffic", attempted[0] > 0,
+              f"{attempted[0]} connection attempts")
+        check("server survived sustained overload", proc.poll() is None,
+              f"exit code {proc.poll()}")
+
+        status, _, body = request("/metrics", port=LOAD_PORT, timeout=5)
+        rejected = -1
+        for line in body.decode(errors="replace").splitlines():
+            if line.startswith("epoll_connections_rejected_total "):
+                rejected = int(line.split()[1])
+        check("connections were shed under overload", status == 200 and rejected > 0,
+              f"status={status} rejected={rejected}")
+
+        status_after, _, _ = request("/", port=LOAD_PORT, timeout=5)
+        check("server still serves after overload", status_after > 0,
+              f"status={status_after}")
+
+        # The real point of the budget: fds must not grow without bound. Allow a
+        # generous margin over the cap for listen/admin/upstream fds.
+        try:
+            fd_count = len(os.listdir(f"/proc/{proc.pid}/fd"))
+            check("fd count stayed bounded under overload", fd_count < cap * 4 + 128,
+                  f"{fd_count} fds for a cap of {cap}")
+        except FileNotFoundError:
+            pass  # non-Linux; the fd bound is not observable here
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log_out.close()
+
+
 def cleanup():
     for p in mock_procs:
         if p.poll() is None:
@@ -1246,6 +1342,9 @@ def main():
         # Uses its own server on OVERLOAD_PORT (tiny max_connections); independent
         # of the shared instance above.
         test_connection_budget_overload()
+        # Sustained overload on its own server (LOAD_PORT); asserts shedding,
+        # survivability, recovery and a bounded fd count.
+        test_overload_load()
 
         # Final check: the server stayed alive and responsive throughout
         status, _, _ = request("/")
