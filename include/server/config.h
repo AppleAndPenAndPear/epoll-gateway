@@ -24,7 +24,13 @@ struct ApiKeyConfig {
 // Upstream server
 struct UpstreamServer {
     std::string host;
-    int port;
+    // Default matches the parser's fallback (an absent "port" resolves to 80)
+    // and, more importantly, keeps a non-port-specified server from carrying an
+    // indeterminate value: the parser only assigns port when read_int
+    // succeeds, so without this an entry with an out-of-range port would be
+    // copied into the vector with an uninitialized member (UB) even though
+    // validation then rejects the config.
+    int port = 80;
     // TLS to the backend: "https://host" in the config enables it, "http://"
     // or a bare host keeps plaintext. Loopback backends may keep plaintext
     // (the traffic never leaves the kernel); anything cross-host should be TLS.
