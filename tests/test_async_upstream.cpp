@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <thread>
 
 #include "upstream_async.h"
@@ -57,21 +58,34 @@ TEST(BoundedAsyncUpstreamExecutorTest, ShutdownPreventsNewSubmissions) {
 TEST(BoundedAsyncUpstreamExecutorTest, RejectsSameUpstreamGroupWhenPerGroupLimitIsReached) {
     BoundedAsyncUpstreamExecutor executor(2, 2);
 
-    EXPECT_EQ(executor.submit("svc-a", [] {}), SubmitStatus::Accepted);
-    EXPECT_EQ(executor.submit("svc-a", [] {}), SubmitStatus::Accepted);
+    // The two accepted tasks block on `gate` so they stay in flight (and keep
+    // holding their per-group slot) while the assertions run. With empty task
+    // bodies a worker could finish one before the third submit executes,
+    // releasing the slot and flaking QueueFull into Accepted.
+    std::promise<void> gate;
+    std::shared_future<void> hold = gate.get_future().share();
+
+    EXPECT_EQ(executor.submit("svc-a", [hold] { hold.wait(); }), SubmitStatus::Accepted);
+    EXPECT_EQ(executor.submit("svc-a", [hold] { hold.wait(); }), SubmitStatus::Accepted);
     EXPECT_EQ(executor.submit("svc-a", [] {}), SubmitStatus::QueueFull);
 
+    gate.set_value();  // release before shutdown, else the workers cannot join
     executor.shutdown();
 }
 
 TEST(BoundedAsyncUpstreamExecutorTest, SameGroupIsIsolatedFromOtherUpstreamGroups) {
     BoundedAsyncUpstreamExecutor executor(2, 2);
 
-    EXPECT_EQ(executor.submit("svc-a", [] {}), SubmitStatus::Accepted);
-    EXPECT_EQ(executor.submit("svc-a", [] {}), SubmitStatus::Accepted);
+    std::promise<void> gate;
+    std::shared_future<void> hold = gate.get_future().share();
+
+    EXPECT_EQ(executor.submit("svc-a", [hold] { hold.wait(); }), SubmitStatus::Accepted);
+    EXPECT_EQ(executor.submit("svc-a", [hold] { hold.wait(); }), SubmitStatus::Accepted);
+    // A different group is not blocked by svc-a having reached its own limit.
     EXPECT_EQ(executor.submit("svc-b", [] {}), SubmitStatus::Accepted);
     EXPECT_EQ(executor.submit("svc-a", [] {}), SubmitStatus::QueueFull);
 
+    gate.set_value();
     executor.shutdown();
 }
 
@@ -96,10 +110,15 @@ TEST(UpstreamFlowTest, RouteGroupResolvesToHealthyServerWithinGroupAndIsolatesEx
     EXPECT_EQ(manager.pick_server("orders-service").host, "10.0.0.2");
 
     BoundedAsyncUpstreamExecutor executor(2, 2);
-    EXPECT_EQ(executor.submit("orders-service", [] {}), SubmitStatus::Accepted);
-    EXPECT_EQ(executor.submit("orders-service", [] {}), SubmitStatus::Accepted);
+    // Held in flight (see RejectsSameUpstreamGroupWhenPerGroupLimitIsReached)
+    // so the per-group limit is asserted without racing task completion.
+    std::promise<void> gate;
+    std::shared_future<void> hold = gate.get_future().share();
+    EXPECT_EQ(executor.submit("orders-service", [hold] { hold.wait(); }), SubmitStatus::Accepted);
+    EXPECT_EQ(executor.submit("orders-service", [hold] { hold.wait(); }), SubmitStatus::Accepted);
     EXPECT_EQ(executor.submit("orders-service", [] {}), SubmitStatus::QueueFull);
     EXPECT_EQ(executor.submit("payments-service", [] {}), SubmitStatus::Accepted);
 
+    gate.set_value();
     executor.shutdown();
 }
