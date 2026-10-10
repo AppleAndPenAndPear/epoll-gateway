@@ -25,7 +25,8 @@ jobs:
             zlib1g-dev \
             libssl-dev \
             libgtest-dev \
-            python3
+            python3 \
+            cppcheck
 
       - name: Build
         run: ./ci.sh build
@@ -35,6 +36,28 @@ jobs:
 
       - name: Integration tests
         run: ./ci.sh integration
+
+      - name: Install osv-scanner
+        # Single static binary. The SBOM it scans is generated locally by
+        # ./scripts/supply_chain.sh from build/server's linked libraries.
+        #
+        # Pinned on purpose (osv-scanner v1 CLI: `--sbom <file>`). Two reasons:
+        #   1. `releases/latest` would silently move us to a future major whose
+        #      CLI differs (v2 changed to subcommands), turning `--sbom` into an
+        #      unknown-flag error — the gate would fail for the wrong reason, or
+        #      a silent SKIP could pass as green.
+        #   2. Pinning the tool version is itself a supply-chain control: the
+        #      scanner that vets our dependencies must not float.
+        run: |
+          OSV_VERSION="v1.9.2"
+          mkdir -p "$HOME/.local/bin"
+          curl -sSLo "$HOME/.local/bin/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          chmod +x "$HOME/.local/bin/osv-scanner"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Supply-chain gate (SAST + SBOM + SCA)
+        run: ./ci.sh supply-chain
 
   package:
     # Builds the release tarball on the same glibc baseline as the release

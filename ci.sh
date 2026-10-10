@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-stop CI script: build + unit tests + integration tests.
+# One-stop CI script: build + unit tests + integration tests, plus an opt-in supply-chain gate.
 # Platform-independent: can be invoked directly from local dev, GitHub Actions, Gitee Go, or any other environment.
 #
 # Usage:
@@ -7,6 +7,7 @@
 #   ./ci.sh build        # Build only
 #   ./ci.sh unit         # Unit tests only (requires a prior build)
 #   ./ci.sh integration  # Integration tests only (requires a prior build)
+#   ./ci.sh supply-chain # Supply-chain gate only (SAST/SBOM/SCA; not part of `all`)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -67,14 +68,24 @@ do_integration() {
     python3 tests/integration/run_integration_tests.py
 }
 
+do_supply_chain() {
+    # Kept out of the `all` sequence on purpose: the gate needs cppcheck and
+    # osv-scanner, which a local dev box need not have installed. CI installs
+    # them and runs this explicitly. Needs a prior `build` for the SBOM to see
+    # the linked libraries (it still runs, with a reduced SBOM, without one).
+    echo "==> Supply-chain gate (SAST + SBOM + SCA)"
+    ./scripts/supply_chain.sh
+}
+
 case "$STEP" in
-    build)       do_build ;;
-    unit)        do_unit ;;
-    integration) do_integration ;;
-    all)         do_build; do_unit; do_integration ;;
+    build)        do_build ;;
+    unit)         do_unit ;;
+    integration)  do_integration ;;
+    supply-chain) do_supply_chain ;;
+    all)          do_build; do_unit; do_integration ;;
     *)
         echo "Unknown step: $STEP"
-        echo "Usage: $0 [build|unit|integration|all]"
+        echo "Usage: $0 [build|unit|integration|supply-chain|all]"
         exit 1
         ;;
 esac
