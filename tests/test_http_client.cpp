@@ -56,7 +56,7 @@ TEST(HttpClientTest, ReturnsGatewayTimeoutWhenBackendDoesNotRespond) {
 
     auto start = std::chrono::steady_clock::now();
     BackendResponse response = forward_request(
-        "127.0.0.1", port, "GET", "/slow", {}, "", 50);
+        "127.0.0.1", port, "GET", "/slow", {}, "", 50, 64 * 1024 * 1024);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
 
@@ -68,7 +68,7 @@ TEST(HttpClientTest, ReturnsGatewayTimeoutWhenBackendDoesNotRespond) {
 
 TEST(HttpClientTest, DistinguishesConnectionFailure) {
     BackendResponse response = forward_request(
-        "127.0.0.1", 1, "GET", "/unavailable", {}, "", 50);
+        "127.0.0.1", 1, "GET", "/unavailable", {}, "", 50, 64 * 1024 * 1024);
 
     EXPECT_EQ(response.status_code, 502);
     EXPECT_EQ(response.error, BackendError::ConnectFailed);

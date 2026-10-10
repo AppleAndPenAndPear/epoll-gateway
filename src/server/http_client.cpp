@@ -219,6 +219,7 @@ BackendResponse forward_request(const std::string& host, int port,
                                 const std::unordered_map<std::string, std::string>& req_headers,
                                 const std::string& req_body,
                                 int timeout_ms,
+                                size_t max_response_bytes,
                                 const UpstreamTlsOptions& tls) {
     if (timeout_ms <= 0) {
         return make_error_response(504, BackendError::ConnectTimeout, "Gateway Timeout");
@@ -358,8 +359,10 @@ BackendResponse forward_request(const std::string& host, int port,
         }
 
         // Read exactly one response. Termination depends on the response
-        // framing: Content-Length, chunked, or EOF (Connection: close).
-        constexpr size_t kMaxResponseSize = 64 * 1024 * 1024;
+        // framing: Content-Length, chunked, or EOF (Connection: close). The body
+        // cap comes from config (Config::max_response_bytes): a bounded buffer is
+        // what keeps a hostile or broken backend from exhausting gateway memory.
+        const size_t kMaxResponseSize = max_response_bytes;
         constexpr size_t kMaxHeaderSize = 256 * 1024;
         std::string response = pooled ? std::move(pooled->leftover) : "";
         if (pooled) pooled->leftover.clear();

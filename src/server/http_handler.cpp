@@ -255,7 +255,8 @@ static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& 
                                     const UpstreamConfig& upstream_cfg,
                                     const HttpRequest& req,
                                     const std::string& client_ip,
-                                    const CompositeDependency& dep) {
+                                    const CompositeDependency& dep,
+                                    size_t max_response_bytes) {
     const auto started = std::chrono::steady_clock::now();
     json item = json::object();
     item["required"] = dep.required;
@@ -304,7 +305,7 @@ static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& 
     auto promise = std::make_shared<std::promise<json>>();
     auto future = promise->get_future();
     const SubmitStatus status = executor.submit(dep.upstream_name,
-        [&manager, &req, &client_ip, dep, started, item, promise]() mutable {
+        [&manager, &req, &client_ip, dep, started, item, promise, max_response_bytes]() mutable {
             try {
                 const auto& server = manager.pick_server(dep.upstream_name);
                 if (!manager.allow_request(dep.upstream_name, server, dep.timeout_ms)) {
@@ -322,7 +323,8 @@ static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& 
                     inject_forwarded_headers(upstream_headers, client_ip);
 
                     const BackendResponse be = forward_request(server.host, server.port, dep.method, dep.path,
-                                                               upstream_headers, req.body, dep.timeout_ms, tls);
+                                                               upstream_headers, req.body, dep.timeout_ms,
+                                                               max_response_bytes, tls);
                     if (be.error != BackendError::None) {
                         const bool timed_out = be.error == BackendError::ConnectTimeout ||
                                                be.error == BackendError::WriteTimeout ||
@@ -815,7 +817,8 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
             // which caps concurrency and returns a ready "rejected" item when
             // saturated. No per-request thread is created here.
             futures.push_back(run_composite_dependency(upstream_executor_, upstream_manager_,
-                                                       config_.upstream_config, req, client_ip, dep));
+                                                       config_.upstream_config, req, client_ip, dep,
+                                                       config_.max_response_bytes));
         }
 
         for (size_t i = 0; i < route.composite_target.dependencies.size(); ++i) {
@@ -893,7 +896,8 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
             while (true) {
                 be = forward_request(server.host, server.port, req.method, req.path,
                                      upstream_headers, req.body,
-                                     route.upstream_target.timeout_ms, tls);
+                                     route.upstream_target.timeout_ms,
+                                     config_.max_response_bytes, tls);
                 if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
                     !should_retry_backend_request(req.method, be.error, attempt_count)) {
                     break;

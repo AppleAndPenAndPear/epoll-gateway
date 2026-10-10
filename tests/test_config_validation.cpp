@@ -410,6 +410,28 @@ TEST(ConfigValidationTest, RejectsZeroMaxConnections) {
     EXPECT_TRUE(found);
 }
 
+TEST(ConfigValidationTest, RejectsZeroMaxResponseBytes) {
+    // Zero would reject every proxied response; the cap must admit at least one
+    // byte.
+    Config config;
+    config.max_response_bytes = 0;
+    std::vector<std::string> errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("max_response_bytes") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(FromFileSchemaTest, RejectsZeroMaxResponseBytesFromFile) {
+    const std::string path = write_temp_config("zero_resp", R"({"max_response_bytes": 0})");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(path, &errors);
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_NE(errors[0].find("max_response_bytes"), std::string::npos);
+    EXPECT_EQ(config.max_response_bytes, 64u * 1024 * 1024);  // default kept
+}
+
 TEST(ConfigValidationTest, RejectsZeroUpstreamInflight) {
     // Zero in-flight slots would reject every composite fan-out task.
     Config config;
@@ -426,6 +448,7 @@ TEST(FromFileSchemaTest, ParsesResourceBudgetFields) {
     const std::string path = write_temp_config("budget", R"({
         "port": 6001,
         "max_connections": 2048,
+        "max_response_bytes": 1048576,
         "upstream_max_inflight": 12,
         "upstream_max_queue": 96
     })");
@@ -433,6 +456,7 @@ TEST(FromFileSchemaTest, ParsesResourceBudgetFields) {
     Config config = Config::from_file(path, &errors);
     EXPECT_TRUE(errors.empty()) << errors[0];
     EXPECT_EQ(config.max_connections, 2048u);
+    EXPECT_EQ(config.max_response_bytes, 1048576u);
     EXPECT_EQ(config.upstream_max_inflight, 12u);
     EXPECT_EQ(config.upstream_max_queue, 96u);
 }

@@ -2,6 +2,7 @@
     "port": 5005,
     "backlog": 1024,
     "max_connections": 10000,
+    "max_response_bytes": 67108864,
     "num_workers": 2,
     "www_root": "./www",
     "thread_pool": {

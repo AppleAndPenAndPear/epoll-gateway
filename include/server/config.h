@@ -148,6 +148,12 @@ struct Config {
     // Must stay below the process fd limit (ulimit -n) minus the fds needed for
     // upstream connections, the listen sockets and the admin listener.
     size_t max_connections = 10000;
+    // Cap on a single buffered upstream response body. A proxied response is
+    // held in memory before it is forwarded to the client, so this — multiplied
+    // by the number of concurrently proxied requests — is the dominant memory
+    // term. Lower it on memory-constrained hosts; responses above the cap are
+    // rejected as a framing error (502) rather than buffered unbounded.
+    size_t max_response_bytes = 64 * 1024 * 1024;  // 64 MB
     // Number of worker threads (0 means use hardware_concurrency)
     unsigned int num_workers = 0;
     // Static file root directory
@@ -214,6 +220,7 @@ struct Config {
         if (config.port == 0) errors.push_back("port: must be in [1, 65535]");
         if (config.backlog <= 0) errors.push_back("backlog: must be > 0");
         if (config.max_connections == 0) errors.push_back("max_connections: must be > 0");
+        if (config.max_response_bytes == 0) errors.push_back("max_response_bytes: must be > 0");
         if (config.upstream_max_inflight == 0)
             errors.push_back("upstream_max_inflight: must be > 0");
         if (config.keepalive_timeout <= 0) errors.push_back("keepalive_timeout: must be > 0");
@@ -536,6 +543,13 @@ struct Config {
             long long v = static_cast<long long>(config.max_connections);
             if (read_int(j, "max_connections", 1, 1000000000, v, ""))
                 config.max_connections = static_cast<size_t>(v);
+        }
+        {
+            long long v = static_cast<long long>(config.max_response_bytes);
+            // 1 byte .. 4 GiB: a 64-bit size_t would let a typo request an
+            // unbounded buffer, which defeats the purpose of the cap.
+            if (read_int(j, "max_response_bytes", 1, 4LL * 1024 * 1024 * 1024, v, ""))
+                config.max_response_bytes = static_cast<size_t>(v);
         }
         {
             long long v = static_cast<long long>(config.upstream_max_inflight);

@@ -40,4 +40,5 @@ BackendResponse forward_request(const std::string& host, int port,
                                 const std::unordered_map<std::string, std::string>& req_headers,
                                 const std::string& req_body,
                                 int timeout_ms,
+                                size_t max_response_bytes,
                                 const UpstreamTlsOptions& tls = {});
