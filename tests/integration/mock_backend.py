@@ -30,14 +30,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        # Connection counter: lets integration tests assert that the gateway
-        # reuses pooled keep-alive connections instead of opening one per request.
-        if CONTROL_DIR:
-            try:
-                with open(os.path.join(CONTROL_DIR, "conn_count"), "a") as f:
-                    f.write("1\n")
-            except OSError:
-                pass
+        # Connection counting is deferred to the first request actually served
+        # on this connection (see handle_any). The gateway's active health
+        # check opens a bare TCP connection to every upstream every second and
+        # never sends a request; counting in setup() would let that background
+        # probing inflate the counter and make the connection-reuse assertion
+        # flaky whenever a test run straddles a health-check tick.
+        self._counted = False
+
+    def _count_connection_once(self):
+        if self._counted or not CONTROL_DIR:
+            return
+        self._counted = True
+        try:
+            with open(os.path.join(CONTROL_DIR, "conn_count"), "a") as f:
+                f.write("1\n")
+        except OSError:
+            pass
 
     def _drain_body(self):
         try:
@@ -51,6 +60,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return bool(CONTROL_DIR) and os.path.exists(os.path.join(CONTROL_DIR, "reject"))
 
     def handle_any(self):
+        self._count_connection_once()
         self._drain_body()
         if self._reject_requested():
             self.close_connection = True

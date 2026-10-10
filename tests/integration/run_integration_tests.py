@@ -578,14 +578,34 @@ def test_chunked_trailer():
 def test_forwarded_headers():
     print("\n[07d] Caller identity injected on the upstream hop")
     status, _, body = request("/api/two/echo-headers")
-    ok = False
+    doc = {}
     try:
         doc = json.loads(body.decode())
-        ok = doc.get("xff") == "127.0.0.1" and doc.get("real_ip") == "127.0.0.1"
     except (ValueError, UnicodeDecodeError):
         pass
-    check("backend sees X-Forwarded-For / X-Real-IP", status == 200 and ok,
+    check("backend sees X-Forwarded-For / X-Real-IP",
+          status == 200 and doc.get("xff") == "127.0.0.1" and doc.get("real_ip") == "127.0.0.1",
           "status=%s body=%r" % (status, body[:160]))
+    hop = doc.get("headers", {})
+    check("backend sees X-Forwarded-Proto https", hop.get("x-forwarded-proto") == "https",
+          "headers=%s" % hop)
+    check("backend sees original Host in X-Forwarded-Host",
+          hop.get("x-forwarded-host") == "%s:%d" % (BASE, SERVER_PORT), "headers=%s" % hop)
+    # Client-supplied values for these two must not be trusted.
+    status3, _, body3 = request("/api/two/echo-headers", headers={
+        "X-Forwarded-Proto": "http", "X-Forwarded-Host": "evil.example.com",
+        "X-Real-IP": "9.9.9.9"})
+    hop3 = {}
+    try:
+        hop3 = json.loads(body3.decode()).get("headers", {})
+    except (ValueError, UnicodeDecodeError):
+        pass
+    check("spoofed X-Forwarded-Proto overwritten",
+          status3 == 200 and hop3.get("x-forwarded-proto") == "https", "headers=%s" % hop3)
+    check("spoofed X-Forwarded-Host overwritten",
+          hop3.get("x-forwarded-host") == "%s:%d" % (BASE, SERVER_PORT), "headers=%s" % hop3)
+    check("spoofed X-Real-IP overwritten",
+          hop3.get("x-real-ip") == "127.0.0.1", "headers=%s" % hop3)
     status2, _, body2 = request("/api/two/echo-headers",
                                 headers={"X-Forwarded-For": "203.0.113.9"})
     ok2 = False
