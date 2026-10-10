@@ -2,7 +2,7 @@
 
 The execution plan for taking this project from a personal project to a commercial product. Three parts: positioning and differentiation, the technical evolution plan (P1~P6), and the commercialization validation track.
 
-> Companion documents: [PROJECT_STATUS.md](PROJECT_STATUS.md) records the current capability snapshot, [../CHANGELOG.md](../CHANGELOG.md) records completed changes, and this file plans what comes next.
+> Companion documents: [PROJECT_STATUS.md](PROJECT_STATUS.md) records the current capability snapshot, [CHANGELOG.md](CHANGELOG.md) records completed changes, and this file plans what comes next. **The active plan is §4's "Post-2026-09-29 Engineering Milestones"; §2 (P1~P6) is the original historical framing and is kept only for context.**
 
 ---
 
@@ -24,11 +24,11 @@ The execution plan for taking this project from a personal project to a commerci
 
 1. **Single-binary deployability** — targets: single binary < 10MB, zero external dependencies (no etcd/Postgres/runtime), one JSON config covering the full production surface, runs on ARM out of the box. *Data note (2026-09-29): idle memory was measured at parity with Nginx (~26 MB each), so "lower memory" is NOT a differentiator and must not be used in marketing copy; binary size and dependency-free deployment remain.*
 2. **Fully auditable** — targets: core code kept within tens of thousands of lines, readable end-to-end by one senior engineer in a week. Aimed at Xinchuang (domestic IT), classified intranets, and security-sensitive customers.
-3. **Embeddable** — targets: runs as a standalone process and embeds into third-party products as a static library (gateway built into device firmware).
+3. **Embeddable** *(aspiration — not yet implemented; nothing to sell on today)* — targets: runs as a standalone process and, in a future release, embeds into third-party products as a static library (gateway built into device firmware). **Current reality: the build produces only `server`/`client` executables plus an internal object library — there is no stable C API, no installable library target, and no ABI/versioning promise, so the project cannot yet be embedded.** This differentiator becomes real only when a device/OEM customer requires it (see P5's Edge/OEM row); until then it must not appear in marketing copy as a present capability.
 
 ### One-line Positioning
 
-> For teams with no etcd, no K8s, and no ops department: one API gateway binary — one JSON config, nothing else to install, a codebase you can read in a week, and it embeds cleanly.
+> For teams with no etcd, no K8s, and no ops department: one API gateway binary — one JSON config, nothing else to install, and a codebase you can read in a week. *(Embeddability is a roadmap target, not a shipping feature — see Differentiator #3.)*
 
 ### What We Deliberately Won't Do
 
@@ -46,14 +46,16 @@ The execution plan for taking this project from a personal project to a commerci
 
 ## 2. Technical Evolution Plan (P1~P6)
 
-| Phase | Theme | Exit Criteria (DoD) |
-|---|---|---|
-| **P1** | Regression safety net | One-command integration tests, CI fully green |
-| **P2** | Config + security hardening | Config schema validation live; pass HTTP spec/TLS self-check checklist |
-| **P3** | Performance baseline | Load test report across three scenarios + connection pooling landed |
-| **P4** | Operations productization | Admin API + graceful shutdown + deployment docs |
-| **P5** | Commercial features | Shape branch decided by customer feedback |
-| **P6** | Performance honesty follow-up | Log switch landed; throughput gap vs Nginx profiled and top costs addressed |
+> **Historical framing.** P1~P4 and P6's first item are complete; the project outgrew the single linear P1~P6 track when async upstream execution and composite routes landed. This section is retained to explain how today's design was reached. Do **not** treat it as the active to-do list — the active sequence is §4 "Post-2026-09-29 Engineering Milestones", and current state is authoritative in [PROJECT_STATUS.md](PROJECT_STATUS.md).
+
+| Phase | Theme | Exit Criteria (DoD) | State |
+|---|---|---|---|
+| **P1** | Regression safety net | One-command integration tests, CI fully green | Done (2026-09-12) |
+| **P2** | Config + security hardening | Config schema validation live; pass HTTP spec/TLS self-check checklist | Done (2026-09-17) |
+| **P3** | Performance baseline | Load test report across three scenarios + connection pooling landed | Done (2026-09-17/29) |
+| **P4** | Operations productization | Admin API + graceful shutdown + deployment docs | Done (2026-09-18) |
+| **P5** | Commercial features | Shape branch decided by customer feedback | Superseded by §4 |
+| **P6** | Performance honesty follow-up | Log switch landed; throughput gap vs Nginx profiled and top costs addressed | Log switch done; profiling pending |
 
 ### P1: Integration Tests and the Regression Safety Net
 
@@ -226,4 +228,16 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - TLS partial writes: `SSL_write` WANT_READ/WANT_WRITE re-arms the correct epoll direction via `last_ssl_want()`; TLS static-file sends retain their pending chunk and continue across backpressure (8 MiB delayed-reader test added)
 - [x] Proxied chunked re-frame (2026-10-09, restored)
   - Backend chunked responses are de-chunked and re-framed by `Content-Length` so the client never receives a `Transfer-Encoding: chunked` + `Content-Length` conflict; trailer fields are dropped and the pooled connection stays reusable
-- Current verification: 124/124 unit, 103/103 integration (2026-10-09)
+- [x] Commercial-readiness hardening (2026-10-10)
+  - Four high-severity fixes: no double-gzip of already-encoded upstream responses, bounded composite fan-out (no unbounded `std::async`), full RFC 7230 hop-by-hop stripping both directions, and CR/LF injection guard on upstream response headers
+  - Medium/Low fixes: factory default keys removed from `config.json`, constant-time API-key comparison, unified path-traversal guard, real version in the `Server` header, `std::tolower` UB, rate-limiter default-config race
+  - Parser robustness: bare-LF rejection, whitespace-before-colon rejection, full chunked-trailer consumption
+  - Forwarded headers: `X-Forwarded-Proto`/`X-Forwarded-Host` added, `X-Real-IP` overwritten (not appended)
+  - Connection-reuse integration test de-flaked (health-probe connections no longer counted)
+- Current verification: 130/130 unit, 127/127 integration (2026-10-10)
+
+### Next in the active sequence
+
+- **Resource budgets and overload behaviour (promote ahead of commercial features).** Define and document explicit caps for max connections, request/response body size, upstream concurrency, file descriptors and memory, and the reject/queue policy when each is exceeded; only then claim commercial capacity. This is the highest-value remaining reliability gap for production use.
+- **Supply-chain scanning as a prerequisite, not a follow-up.** Add dependency and artifact scanning (SCA), a SAST pass, SBOM generation and checksums to CI before the next release tag, so a release cannot ship with a known-vulnerable dependency.
+- **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and all AI-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.

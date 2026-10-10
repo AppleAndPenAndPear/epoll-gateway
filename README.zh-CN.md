@@ -2,7 +2,7 @@
 
 # epollthread
 
-基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 与 W3C traceparent 请求追踪、有界异步上游执行、composite（扇出）路由与部分失败语义、AUDIT/CLF 双通道日志（独立访问日志开关 + 默认敏感字段/查询参数脱敏）、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（124/124 通过）、集成测试（103 项断言）及 AddressSanitizer 支持。
+基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 与 W3C traceparent 请求追踪、有界异步上游执行、composite（扇出）路由与部分失败语义、AUDIT/CLF 双通道日志（独立访问日志开关 + 默认敏感字段/查询参数脱敏）、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署，并包含单元测试（130/130 通过）、集成测试（127 项断言）及 AddressSanitizer 支持。
 
 ## 5 分钟快速体验
 
@@ -35,9 +35,12 @@ curl -sk -X POST https://localhost:5005/api/echo -H 'Content-Type: application/j
 curl -sk https://localhost:5005/healthz
 curl -sk https://localhost:5005/version
 
-# Admin API 独立监听在回环地址，强制密钥鉴权：
-curl -s http://127.0.0.1:8105/admin/stats                                   # 401
-curl -s -H 'X-API-Key: admin-demo-key' http://127.0.0.1:8105/admin/stats    # 200
+# Admin API：独立回环监听，默认关闭（出厂配置不含任何密钥）。需先在 config.json 中启用，例如：
+#   "admin": { "enabled": true, "port": 8105, "bind": "127.0.0.1",
+#              "api_keys": [ { "key": "change-me", "name": "admin" } ] }
+# 重启后：
+curl -s http://127.0.0.1:8105/admin/stats                                # 无密钥 401
+curl -s -H 'X-API-Key: change-me' http://127.0.0.1:8105/admin/stats      # 200
 
 # Prometheus 指标
 curl -sk https://localhost:5005/metrics | head
@@ -91,8 +94,8 @@ upstream——见 [examples/](examples/) 下的可运行场景。
 - **运维端点 + Admin API**（P4）：内置 `/healthz`、`/readyz`、`/version`；独立监听、强制鉴权的 Admin API 提供 `/admin/stats`、`/admin/upstreams`（后端健康 + 熔断状态）和 `POST /admin/reload`。详见下方「运维与健康检查」。
 - **配套非阻塞客户端**：独立的状态机 HTTPS 客户端（TLS 握手、证书与主机名校验、连接/发送/接收全流程），展示 epoll 在客户端的使用方法。
 - **Docker 容器化**：提供多阶段构建 `Dockerfile`，一键构建轻量镜像，随处部署。
-- **单元测试**：基于 Google Test，当前 124/124 通过，覆盖 HTTP 解析器（含走私攻击向量与分段/粘包读取）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验（含 `logging` 段）、日志脱敏、有界异步上游执行器语义、TLS 加固（含服务端/客户端共享策略与客户端校验配置）、连接池语义（含 scheme 与校验身份隔离）、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
-- **集成测试**：103 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、带主机名校验的配套客户端、含主机名不匹配拒绝的 upstream TLS 校验、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、composite 扇出路由、流水线请求、TLS 静态文件背压、chunked trailer、访问日志开关与脱敏、优雅停机），仅依赖 Python 3 标准库。
+- **单元测试**：基于 Google Test，当前 130/130 通过，覆盖 HTTP 解析器（含走私攻击向量、裸 LF/冒号前空格拒绝、chunked trailer 完整消费与分段/粘包读取）、LRU 缓存、响应序列化、路由匹配、404/405 语义、路径穿越防护、API Key 策略（含密钥来源优先级）、限流隔离、配置 schema 校验（含 `logging` 段）、日志脱敏、有界异步上游执行器语义、TLS 加固（含服务端/客户端共享策略与客户端校验配置）、连接池语义（含 scheme 与校验身份隔离）、HTTP client 超时、幂等重试、upstream 健康检查、状态快照和熔断等核心模块。
+- **集成测试**：127 项端到端断言，基于真实服务器 + mock 上游（TLS 策略、证书热加载、带主机名校验的配套客户端、含主机名不匹配拒绝的 upstream TLS 校验、来自独立密钥文件的鉴权、限流、故障转移、熔断、reload、运维端点、Admin API、admin 密钥轮换、连接复用、composite 扇出路由、转发头（含伪造值覆盖）、双跳逐跳头剥离、上游响应头注入拒绝、单次 gzip、流水线请求、TLS 静态文件背压、chunked trailer、访问日志开关与脱敏、优雅停机），仅依赖 Python 3 标准库。
 - **性能基线**：`scripts/benchmark/run_benchmark.sh` 一键复现 wrk 压测（静态缓存命中 / 反向代理 / TLS 握手三场景），完整报告见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 - **AddressSanitizer 支持**：Debug 模式下自动启用 ASAN，便于检测内存泄漏和越界访问。
 - **Prometheus 指标暴露**：内置 `/metrics` 端点，输出 Prometheus 格式指标，涵盖请求计数（按状态码分类）、请求延迟直方图、缓存命中率和 upstream 错误类型计数。
@@ -722,7 +725,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 6. **信号处理与优雅关闭**：`SIGINT`/`SIGTERM` 置位全局原子标志，Worker 在每次超时返回时检查并主动退出事件循环；`SIGHUP` 触发 runtime reload；析构顺序保证 Tcpserver → DynamicThreadPool → Logger::Guard，日志最后关闭。
 7. **路由系统**：内置路由通过 `register_default_routes()` 注册，配置路由通过 `register_configured_routes()` 注册；一次请求只匹配一次，`ResolvedRoute` 在鉴权、限流和分发之间复用；支持 method/path/Host/Tenant 四维匹配和 `local`/`upstream`/`composite`/`static` 四类目标，未命中网关路由时 GET/HEAD 回退到静态文件服务。
 8. **空闲超时**：每个连接维护最后活跃时间，epoll_wait 超时时扫描并清理过期连接，支持配置超时阈值。
-9. **单元与集成测试**：使用 Google Test，当前 124/124 通过，覆盖解析（含走私攻击向量与分段/粘包读取）、缓存、路由、鉴权、限流、配置 schema 校验（含 logging）、日志脱敏、有界异步上游执行、TLS 加固（服务端与客户端共享）、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 103 项断言，基于真实服务器 + mock 上游端到端验证（含 composite 扇出路由、流水线、TLS 静态文件背压与 upstream TLS 校验）。
+9. **单元与集成测试**：使用 Google Test，当前 130/130 通过，覆盖解析（含走私攻击向量、裸 LF/冒号前空格拒绝与分段/粘包读取）、缓存、路由、鉴权、限流、配置 schema 校验（含 logging）、日志脱敏、有界异步上游执行、TLS 加固（服务端与客户端共享）、连接池语义、上游超时/重试/健康检查/状态快照/熔断等模块，`ctest` 一键运行；集成测试 127 项断言，基于真实服务器 + mock 上游端到端验证（含 composite 扇出路由、转发头、逐跳头剥离、响应头注入拒绝、单次 gzip、流水线、TLS 静态文件背压与 upstream TLS 校验）。
 
 ## 性能指标
 

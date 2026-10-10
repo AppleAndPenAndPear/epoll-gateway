@@ -2,7 +2,40 @@
 
 Notable changes to the project. Format follows [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/), entries sorted newest first.
 
-> For a detailed snapshot of the current project state, see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md). This file traces back "what was done, when, and why".
+> For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
+
+## 2026-10-10
+
+Commercial-readiness hardening pass: a correctness/security audit produced four high-severity fixes (already committed) followed by a batch of Medium/Low consistency fixes, a parser-robustness batch, and forwarded-header completion. Every change below is covered by a regression test.
+
+### Security
+
+- **Factory default credentials removed.** `config.json` shipped three usable key shapes (`test-key-123`, `premium-key-456`, the data-plane `api_keys` array, and a working `admin-demo-key`) and both the `Dockerfile` (`COPY config.json .`) and `scripts/package_release.sh` bundled the file into release artifacts — a real out-of-the-box exposure. The data-plane `api_keys` array is gone and `admin.enabled` now defaults to `false` with no keys, so a fresh deployment authenticates nobody until an operator configures it. `admin.port`/`admin.bind` are kept so enabling the listener is a one-line change. Keys should be supplied via `api_keys_file` or the `GW_API_KEYS` environment variable, never inline.
+- **API-key validation is now constant-time.** `ApiKeyManager::validate()`/`get()` used `unordered_map::find`, whose hash-then-byte-compare exits at the first mismatch and leaks the matched prefix through response timing. Both now scan every key through a `volatile`-accumulator `constant_time_equals` with no early return, matching the pattern already used by the admin API.
+- **Static-fallback path traversal guard unified.** The static-fallback branch used a naive `path.find("..")` while the `static` route type used `is_safe_static_path()` (canonicalize + require the result to stay under the document root). Encodings the naive check missed on one path were therefore accepted on the other; both now call `is_safe_static_path()`.
+- **`Server` header reports the real version.** It was a hard-coded `EpollHTTP/0.2` while the project is `0.2.1`; it now reads the CMake-generated `GATEWAY_VERSION`, so the banner cannot drift from `/version` again.
+
+### Fixed
+
+- **Already-compressed upstream responses were gzipped a second time.** The upstream `Content-Encoding` check was case-sensitive, so a backend sending `content-encoding: gzip` was treated as uncompressed and the gateway double-gzipped the body, corrupting it. The check is now case-insensitive.
+- **Composite fan-out could exhaust threads.** Dependency fan-out used unbounded `std::async` (one thread per dependency per request), so load scaled thread count without limit; it now submits through the shared bounded upstream executor, which returns a deterministic 503 on overload instead of spawning. The same change fixed a dangling-reference bug where a loop variable was captured by reference by the async tasks.
+- **Incomplete hop-by-hop header stripping.** Request-side and response-side stripping missed several RFC 7230 §6.1 fields (`Proxy-Authorization`, `Proxy-Authenticate`, `Proxy-Connection`, bare `Connection` on the response), so proxy credentials could leak to a backend and backend hop-by-hop fields could reach the client. Both directions now strip the full set plus the tokens named in `Connection`.
+- **Upstream response headers could inject headers toward the client.** A backend header value containing a bare CR or LF was re-emitted verbatim, splitting the response and allowing header injection. Any response header whose name or value contains CR/LF is now discarded entirely.
+- **Bare LF line endings were accepted as CRLF.** A bare-LF request line, header terminator, or end-of-headers was treated as a valid line break — a request-smuggling vector when a front-end proxy disagrees. The parser now tracks whether a CR preceded the LF and rejects bare LF with 400 + `Connection: close`.
+- **Whitespace before a header colon was accepted.** `Foo : bar` was parsed by trimming the field name; RFC 7230 forbids the space before the colon (another smuggling vector). The field name is no longer trimmed, so its raw characters fail the `tchar` check and the request is rejected.
+- **Chunked trailers were not fully consumed.** Only the first CRLF after the last-chunk was consumed, leaving the remainder of the trailer section (and its terminating CRLF) in the buffer, which garbled the next request on a reused connection. The trailer section is now read line by line until the empty line, so the connection stays in sync.
+- **`std::tolower` invoked with a negative `char`.** Header names were lowercased by passing a `char` directly to `std::tolower`, which is undefined behaviour for bytes ≥ 0x80. Both call sites now cast through `unsigned char`.
+- **Rate limiter read its default config outside the lock.** `RateLimiterManager::try_acquire(key)` read `default_config_` without holding the mutex while `update_default_config()` wrote it under the mutex — a data race on reload. Both overloads now take the lock and delegate to a `try_acquire_locked` helper.
+
+### Added
+
+- **Forwarded-request headers completed.** Upstream requests now carry `X-Forwarded-Proto` (always `https`, since the client-facing listener is TLS-only by configuration) and `X-Forwarded-Host` (from the client's `Host`), and `X-Real-IP` is overwritten rather than appended so a client-supplied value cannot survive. All these names are written lowercase to match the parser's lowercased header keys — writing mixed case would create a second map entry alongside a client-supplied name and let the client spoof the value (this exact bug was caught by the new integration assertion).
+- 6 parser unit tests (bare-LF request line / header terminator / end-of-headers, whitespace before colon, full chunked-trailer consumption, keep-alive after a trailer request) and 5 integration groups (forwarded headers incl. spoof overwrite, hop-by-hop stripping, upstream response-header injection, no double gzip, bounded composite fan-out). Totals: 130 unit / 127 integration.
+
+### Changed
+
+- **The connection-reuse integration test was de-flaked.** The mock backend counted every TCP accept, but the gateway's 1-second active health check opens a bare connection to each upstream and never sends a request, so the shared counter was polluted whenever a run straddled a health-check tick. The mock now counts a connection only on the first request it actually serves, which removes the background noise instead of loosening the assertion.
+- Documentation synced to the shipped code: this file's cross-doc links repaired (`docs/…` paths that resolved to `docs/docs/…`), test counts updated across [PROJECT_STATUS.md](PROJECT_STATUS.md) and [ROADMAP.md](ROADMAP.md), the ROADMAP's stale `../CHANGELOG.md` link fixed, and the API-composition rows in [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md) moved from "待做" to their actual implemented state.
 
 ## 2026-10-09
 
@@ -224,9 +257,9 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 ### Documentation
 
-- Added [docs/ROADMAP.md](docs/ROADMAP.md): settled the commercialization positioning (three differentiators — lightweight/auditable/embeddable, see the doc for the competitor analysis) plus the P1~P5 technical evolution plan and the 6-month commercialization validation track. Licensing decision: stay MIT for now; evaluate dual licensing once paid intent appears.
-- Added [docs/CHANGELOG.md](docs/CHANGELOG.md): records changes and decision rationale by date, backfilling the project timeline since 2026-05-08.
-- Cross-checked [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) against the actual code and fully updated the README:
+- Added [ROADMAP.md](ROADMAP.md): settled the commercialization positioning (three differentiators — lightweight/auditable/embeddable, see the doc for the competitor analysis) plus the P1~P5 technical evolution plan and the 6-month commercialization validation track. Licensing decision: stay MIT for now; evaluate dual licensing once paid intent appears.
+- Added [CHANGELOG.md](CHANGELOG.md): records changes and decision rationale by date, backfilling the project timeline since 2026-05-08.
+- Cross-checked [PROJECT_STATUS.md](PROJECT_STATUS.md) against the actual code and fully updated the README:
   - Corrected `/metrics` metric names to the actual output (the `epoll_http_*` series; the `epoll_server_*` names in the previous text do not exist in code).
   - Added route/host/tenant dimension metrics (`epoll_route_requests_total`, `epoll_route_latency_seconds_*`) and upstream error classification metrics.
   - Feature list gained idempotent retries, the basic circuit breaker, `X-Trace-Id`, AUDIT/CLF dual-channel logging, and `SIGHUP` runtime reload.
