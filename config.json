@@ -29,18 +29,13 @@
         ]
     },
     "admin": {
-        "enabled": true,
+        "enabled": false,
         "port": 8105,
-        "bind": "127.0.0.1",
-        "api_keys": ["admin-demo-key"]
+        "bind": "127.0.0.1"
     },
     "rate_limit": {
         "capacity": 20,
         "refill_per_second": 10
     },
-    "api_keys": [
-        {"key": "test-key-123", "name": "Test Client", "rate_limit": {"capacity": 10, "refill_per_second": 3}},
-        {"key": "premium-key-456", "name": "Premium Client", "rate_limit": {"capacity": 1000, "refill_per_second": 100}}
-    ],
     "routes": []
 }

@@ -14,7 +14,7 @@ public:
     }
 
     bool validate(const std::string& key) const {
-        return keys_.find(key) != keys_.end();
+        return find_constant_time(key) != nullptr;
     }
 
     void reload(const std::vector<ApiKeyConfig>& keys) {
@@ -25,9 +25,7 @@ public:
     }
 
     const ApiKeyConfig* get(const std::string& key) const {
-        auto it = keys_.find(key);
-        if (it != keys_.end()) return &it->second;
-        return nullptr;
+        return find_constant_time(key);
     }
 
     bool authorize(const std::string& key, const GatewayRoute& route,
@@ -47,6 +45,33 @@ public:
     }
 
 private:
+    // Length-independent, branch-free comparison: the loop always runs over
+    // the full longer string and never returns early, so response timing does
+    // not reveal how many leading bytes of a candidate key matched.
+    static bool constant_time_equals(const std::string& a, const std::string& b) {
+        volatile unsigned char diff = static_cast<unsigned char>(a.size() ^ b.size());
+        const size_t len = std::max(a.size(), b.size());
+        for (size_t i = 0; i < len; ++i) {
+            const unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+            const unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+            diff |= static_cast<unsigned char>(ca ^ cb);
+        }
+        return diff == 0;
+    }
+
+    // Linear scan over every configured key with a constant-time comparison.
+    // Deliberately avoids unordered_map::find, whose hash lookup plus
+    // early-exit key comparison would leak matched-byte prefixes via timing.
+    const ApiKeyConfig* find_constant_time(const std::string& key) const {
+        const ApiKeyConfig* found = nullptr;
+        for (const auto& entry : keys_) {
+            if (constant_time_equals(entry.first, key)) {
+                found = &entry.second;
+            }
+        }
+        return found;
+    }
+
     static bool contains(const std::vector<std::string>& values, const std::string& value) {
         return std::find(values.begin(), values.end(), value) != values.end();
     }

@@ -68,6 +68,32 @@ std::unordered_set<std::string> response_connection_tokens(
     return tokens;
 }
 
+// Adds the client-identity headers on the upstream hop. Shared by the plain
+// upstream and the composite routes so the two cannot drift apart.
+// All header names here are lowercase because the request parser stores every
+// header key lowercased. Writing a mixed-case name would create a *second*
+// map entry next to a client-supplied one and let the client spoof the value.
+void inject_forwarded_headers(std::unordered_map<std::string, std::string>& headers,
+                              const std::string& client_ip) {
+    if (!client_ip.empty()) {
+        auto xff = headers.find("x-forwarded-for");
+        if (xff != headers.end()) xff->second += ", " + client_ip;
+        else headers["x-forwarded-for"] = client_ip;
+        // Overwrite, never append: a client-supplied X-Real-IP must not survive.
+        headers["x-real-ip"] = client_ip;
+    }
+    // The client-facing listener is always TLS (config validation requires a
+    // cert/key pair), so the original request scheme is https. Overwriting any
+    // client-supplied value keeps backends from trusting a spoofed scheme.
+    headers["x-forwarded-proto"] = "https";
+    // Preserve the client's original Host for backends that route by vhost; the
+    // Host header on the upstream hop itself stays the backend host:port.
+    const auto host_it = headers.find("host");
+    if (host_it != headers.end() && !host_it->second.empty()) {
+        headers["x-forwarded-host"] = host_it->second;
+    }
+}
+
 std::string generate_trace_id() {
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -293,12 +319,7 @@ static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& 
                     tls.skip_verify = server.tls_skip_verify;
 
                     std::unordered_map<std::string, std::string> upstream_headers = req.headers;
-                    if (!client_ip.empty()) {
-                        auto xff = upstream_headers.find("x-forwarded-for");
-                        if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
-                        else upstream_headers["X-Forwarded-For"] = client_ip;
-                        upstream_headers["X-Real-IP"] = client_ip;
-                    }
+                    inject_forwarded_headers(upstream_headers, client_ip);
 
                     const BackendResponse be = forward_request(server.host, server.port, dep.method, dep.path,
                                                                upstream_headers, req.body, dep.timeout_ms, tls);
@@ -866,12 +887,7 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
             if (upstream_headers.count("traceparent") == 0) {
                 upstream_headers["traceparent"] = generate_traceparent();
             }
-            if (!client_ip.empty()) {
-                auto xff = upstream_headers.find("x-forwarded-for");
-                if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
-                else upstream_headers["X-Forwarded-For"] = client_ip;
-                upstream_headers["X-Real-IP"] = client_ip;
-            }
+            inject_forwarded_headers(upstream_headers, client_ip);
             while (true) {
                 be = forward_request(server.host, server.port, req.method, req.path,
                                      upstream_headers, req.body,
@@ -1000,8 +1016,11 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
             resp.headers["Content-Type"] = "text/html";
             resp.chunked = false;
         }
-        // Guard against path traversal attacks; simple approach: reject ".."
-        else if (path.find("..") != std::string::npos) {
+        // Path traversal guard, shared with the "static" route type: canonicalize
+        // the joined path and require it to stay inside the document root. Using
+        // the same helper in both places keeps the two checks from drifting.
+        else if (std::string resolved_static;
+                 !is_safe_static_path("/", path, www_root_, resolved_static)) {
             // Return 403 Forbidden
             resp.status_code = 403;
             resp.status_message = "Forbidden";
@@ -1199,8 +1218,9 @@ after_file:
         resp.headers["Connection"] = "close";
     }
 
-    // ★ Uniformly add the Server header
-    resp.headers["Server"] = "EpollHTTP/0.2";
+    // ★ Uniformly add the Server header, sourced from the same version constant
+    // that /version and the admin endpoints report, so the two can never drift.
+    resp.headers["Server"] = std::string("EpollHTTP/") + GATEWAY_VERSION;
 
     if (req.method != "HEAD" && !already_compressed && should_compress(req, resp)) {
         std::string compressed;
