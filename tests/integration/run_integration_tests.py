@@ -598,6 +598,105 @@ def test_forwarded_headers():
           status2 == 200 and ok2, "status=%s body=%r" % (status2, body2[:160]))
 
 
+def test_hop_by_hop_stripping():
+    print("\n[07e] Hop-by-hop header stripping (request + response side)")
+    # Request side: the gateway must not forward hop-by-hop fields, nor any
+    # field named in the client's Connection header.
+    status, _, body = request("/api/two/echo-headers", headers={
+        "Proxy-Authorization": "Basic c2VjcmV0",
+        "TE": "trailers",
+        "Connection": "X-Custom-Hop",
+        "X-Custom-Hop": "dropme",
+        "X-Keep-Me": "keepme",
+    })
+    hdrs = {}
+    try:
+        hdrs = json.loads(body.decode()).get("headers", {})
+    except (ValueError, UnicodeDecodeError):
+        pass
+    check("request Proxy-Authorization not forwarded upstream",
+          status == 200 and "proxy-authorization" not in hdrs, "hdrs=%s" % hdrs)
+    check("request TE not forwarded upstream", "te" not in hdrs, "hdrs=%s" % hdrs)
+    check("Connection-named request header stripped upstream",
+          "x-custom-hop" not in hdrs, "hdrs=%s" % hdrs)
+    check("benign request header still forwarded upstream",
+          hdrs.get("x-keep-me") == "keepme", "hdrs=%s" % hdrs)
+
+    # Response side: hop-by-hop fields from the backend (including those named
+    # in its Connection header) and Proxy-* must be consumed, not relayed.
+    status, rhdrs, rbody = request("/api/two/hopbyhop")
+    check("backend hopbyhop response proxied", status == 200 and rbody == b"hop",
+          "status=%s body=%r" % (status, rbody[:40]))
+    check("backend Connection-named field stripped", "x-internal" not in rhdrs, "hdrs=%s" % rhdrs)
+    check("backend Proxy-Authenticate stripped", "proxy-authenticate" not in rhdrs, "hdrs=%s" % rhdrs)
+    check("backend Connection header not relayed verbatim",
+          rhdrs.get("connection", "").lower() != "x-internal", "hdrs=%s" % rhdrs)
+    check("benign backend header preserved", rhdrs.get("x-keep") == "visible", "hdrs=%s" % rhdrs)
+
+
+def test_upstream_response_header_injection():
+    print("\n[07f] Upstream response header injection (bare LF in value)")
+    # The backend's X-Inject value carries a bare LF followed by "X-Evil: 1".
+    # Re-emitting the header verbatim would inject X-Evil toward the client.
+    status, hdrs, body = request("/api/two/inject")
+    check("injecting backend response proxied", status == 200 and body == b"ok",
+          "status=%s body=%r" % (status, body[:40]))
+    check("injected header not present in gateway response", "x-evil" not in hdrs, "hdrs=%s" % hdrs)
+    check("header carrying CR/LF dropped entirely", "x-inject" not in hdrs, "hdrs=%s" % hdrs)
+
+
+def test_no_double_gzip():
+    print("\n[07g] Already-compressed upstream body is not re-gzipped")
+    import gzip
+    status, hdrs, body = request("/api/two/gzip", headers={"Accept-Encoding": "gzip"})
+    check("gzip upstream response proxied", status == 200, "got %s" % status)
+    decoded = None
+    try:
+        decoded = gzip.decompress(body)
+    except Exception:
+        decoded = None
+    check("client decodes exactly one gzip layer",
+          decoded is not None and decoded.startswith(b"gateway-gzip-test-payload-"),
+          "body_len=%d" % len(body))
+    check("Content-Encoding not duplicated", hdrs.get("content-encoding") == "gzip",
+          "got %r" % hdrs.get("content-encoding"))
+
+
+def test_composite_fanout_bounded():
+    print("\n[07h] Composite fan-out is bounded under load")
+    import threading
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        st, _, bd = request("/profile", timeout=20)
+        with lock:
+            results.append((st, bd))
+
+    threads = [threading.Thread(target=worker) for _ in range(24)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=40)
+    check("all composite load requests returned", len(results) == 24, "%d/24" % len(results))
+
+    statuses = sorted({st for st, _ in results})
+    check("overload degrades to 200/503 (no hang, no crash)",
+          all(st in (200, 503) for st, _ in results), "statuses=%s" % statuses)
+    structured = 0
+    for _, bd in results:
+        try:
+            doc = json.loads(bd.decode())
+            if isinstance(doc.get("dependencies"), dict):
+                structured += 1
+        except (ValueError, UnicodeDecodeError):
+            pass
+    check("every response is a structured composite document",
+          structured == len(results), "%d/%d structured" % (structured, len(results)))
+    st, _, _ = request("/")
+    check("server responsive after composite burst", st == 200, "got %s" % st)
+
+
 def test_auth():
     print("\n[7] API key auth")
     status, _, _ = request("/api/limited/x")
@@ -1032,6 +1131,10 @@ def main():
         test_profile_composite_route(fail_control_dir)
         test_chunked_trailer()
         test_forwarded_headers()
+        test_hop_by_hop_stripping()
+        test_upstream_response_header_injection()
+        test_no_double_gzip()
+        test_composite_fanout_bounded()
         test_upstream_tls()
         test_auth()
         test_logging_policy(ws)

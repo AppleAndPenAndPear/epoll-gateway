@@ -59,6 +59,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Slow endpoint: holds the request open so tests can exercise the
             # gateway's graceful-shutdown drain with a genuinely in-flight request.
             time.sleep(1.5)
+        if self.path.endswith("/gzip"):
+            # Already-gzipped upstream response. The gateway must pass it
+            # through untouched (a second gzip pass would corrupt the body).
+            import gzip
+            payload = b"gateway-gzip-test-payload-" * 20
+            gz = gzip.compress(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(gz)))
+            self.end_headers()
+            self.wfile.write(gz)
+            return
+        if self.path.endswith("/inject"):
+            # Raw response whose header value carries a bare LF. The gateway's
+            # CRLF-delimited header parser preserves it, so re-emitting the
+            # header verbatim would inject a second header toward the client.
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"X-Inject: a\nX-Evil: 1\r\n"
+                b"Content-Length: 2\r\n"
+                b"\r\n"
+                b"ok"
+            )
+            return
+        if self.path.endswith("/hopbyhop"):
+            # Response whose Connection header names another field, plus
+            # Proxy-* and a benign header. Hop-by-hop fields must be consumed
+            # by the gateway, the benign one preserved.
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Connection: X-Internal\r\n"
+                b"X-Internal: secret\r\n"
+                b"Proxy-Authenticate: Basic realm=x\r\n"
+                b"X-Keep: visible\r\n"
+                b"Content-Length: 3\r\n"
+                b"\r\n"
+                b"hop"
+            )
+            return
         if self.path.endswith("/chunked-trailer"):
             # Raw chunked response with a trailer section, to exercise the
             # gateway's chunked framing end-to-end. Keep-alive stays intact.
@@ -82,6 +124,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # identity on the upstream hop (X-Forwarded-For / X-Real-IP).
             "xff": self.headers.get("X-Forwarded-For", ""),
             "real_ip": self.headers.get("X-Real-IP", ""),
+            # Full received header set (lowercased) so tests can assert which
+            # headers the gateway actually forwarded on the upstream hop.
+            "headers": {k.lower(): v for k, v in self.headers.items()},
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

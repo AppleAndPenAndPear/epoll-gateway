@@ -1,6 +1,25 @@
 #include "gzip_utils.h"
 #include <zlib.h>
 #include <stdexcept>
+#include <algorithm>
+#include <cctype>
+
+namespace {
+// Case-insensitive presence check: upstream response headers keep their
+// original casing, so an exact "Content-Encoding" lookup would miss
+// "content-encoding" and re-compress an already-encoded body.
+bool has_content_encoding(const HttpResponse& resp) {
+    for (const auto& entry : resp.headers) {
+        std::string key = entry.first;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (key == "content-encoding" && !entry.second.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
 
 bool gzip_compress(const std::string& input, std::string& output) {
     if (input.empty()) return false;
@@ -37,6 +56,12 @@ bool gzip_compress(const std::string& input, std::string& output) {
 }
 
 bool should_compress(const HttpRequest& req, const HttpResponse& resp) {
+    // Never re-compress an already-encoded body. A proxied upstream response
+    // can legitimately carry Content-Encoding: gzip (the client's
+    // Accept-Encoding is forwarded on the upstream hop), and gzipping that
+    // payload again would corrupt it for the client.
+    if (has_content_encoding(resp)) return false;
+
     // Check whether the client accepts gzip
     auto it = req.headers.find("accept-encoding");
     if (it == req.headers.end()) return false;

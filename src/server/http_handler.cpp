@@ -26,12 +26,47 @@
 #include <cstdint>
 #include <future>
 #include <functional>
+#include <unordered_set>
 using json = nlohmann::json;
 
 namespace {
 
 std::atomic<uint64_t> g_trace_counter{0};
 std::atomic<uint64_t> g_traceparent_counter{0};
+
+// Hop-by-hop response headers that must be consumed by the gateway and never
+// forwarded to the client (RFC 7230 §6.1); Content-Length/Transfer-Encoding
+// are re-framed by the gateway itself.
+bool is_response_hop_by_hop(const std::string& lower_name) {
+    static const std::unordered_set<std::string> kHopByHop = {
+        "content-length", "transfer-encoding", "connection", "keep-alive",
+        "proxy-authenticate", "proxy-authorization", "proxy-connection",
+        "te", "trailer", "upgrade"};
+    return kHopByHop.count(lower_name) != 0;
+}
+
+// Tokens the backend named in its own Connection header are hop-by-hop too.
+std::unordered_set<std::string> response_connection_tokens(
+        const std::map<std::string, std::string>& headers) {
+    std::unordered_set<std::string> tokens;
+    for (const auto& entry : headers) {
+        std::string key = entry.first;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (key != "connection") continue;
+        std::istringstream stream(entry.second);
+        std::string token;
+        while (std::getline(stream, token, ',')) {
+            const size_t begin = token.find_first_not_of(" \t");
+            const size_t end = token.find_last_not_of(" \t");
+            if (begin == std::string::npos) continue;
+            std::transform(token.begin(), token.end(), token.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            tokens.insert(token.substr(begin, end - begin + 1));
+        }
+    }
+    return tokens;
+}
 
 std::string generate_trace_id() {
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -182,7 +217,14 @@ static HttpResponse run_upstream_task(BoundedAsyncUpstreamExecutor& executor,
     return future.get();
 }
 
-static json run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
+// A ready future for paths that resolve without touching a backend.
+static std::future<json> make_ready_json_future(json value) {
+    std::promise<json> promise;
+    promise.set_value(std::move(value));
+    return promise.get_future();
+}
+
+static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
                                     UpstreamManager& manager,
                                     const UpstreamConfig& upstream_cfg,
                                     const HttpRequest& req,
@@ -210,7 +252,7 @@ static json run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
                             dep.required,
                             item["traceparent"].get<std::string>(),
                             item["duration_ms"].get<int64_t>());
-        return item;
+        return make_ready_json_future(std::move(item));
     }
 
     const auto config_it = upstream_cfg.upstreams.find(dep.upstream_name);
@@ -225,73 +267,77 @@ static json run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
                             dep.required,
                             item["traceparent"].get<std::string>(),
                             item["duration_ms"].get<int64_t>());
-        return item;
+        return make_ready_json_future(std::move(item));
     }
 
-    auto task = [&manager, &req, &client_ip, dep]() -> HttpResponse {
-        HttpResponse local_resp;
-        const auto& server = manager.pick_server(dep.upstream_name);
-        if (!manager.allow_request(dep.upstream_name, server, dep.timeout_ms)) {
-            local_resp.status_code = 503;
-            local_resp.status_message = "Service Unavailable";
-            local_resp.body = "circuit_open";
-            local_resp.headers["Content-Type"] = "text/plain";
-            local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
-            return local_resp;
-        }
+    // Run the backend call through the shared bounded executor instead of
+    // spawning a detached std::async thread per dependency. Creating one
+    // unbounded thread per dependency is a resource-exhaustion vector under
+    // load; the executor caps concurrency and applies backpressure via
+    // SubmitStatus instead.
+    auto promise = std::make_shared<std::promise<json>>();
+    auto future = promise->get_future();
+    const SubmitStatus status = executor.submit(dep.upstream_name,
+        [&manager, &req, &client_ip, dep, started, item, promise]() mutable {
+            try {
+                const auto& server = manager.pick_server(dep.upstream_name);
+                if (!manager.allow_request(dep.upstream_name, server, dep.timeout_ms)) {
+                    item["status"] = "failed";
+                    item["http_status"] = 503;
+                    item["error"] = "circuit_open";
+                } else {
+                    UpstreamTlsOptions tls;
+                    tls.enable = server.tls;
+                    tls.ca_file = server.tls_ca_file;
+                    tls.server_name = server.tls_server_name;
+                    tls.skip_verify = server.tls_skip_verify;
 
-        UpstreamTlsOptions tls;
-        tls.enable = server.tls;
-        tls.ca_file = server.tls_ca_file;
-        tls.server_name = server.tls_server_name;
-        tls.skip_verify = server.tls_skip_verify;
+                    std::unordered_map<std::string, std::string> upstream_headers = req.headers;
+                    if (!client_ip.empty()) {
+                        auto xff = upstream_headers.find("x-forwarded-for");
+                        if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
+                        else upstream_headers["X-Forwarded-For"] = client_ip;
+                        upstream_headers["X-Real-IP"] = client_ip;
+                    }
 
-        std::unordered_map<std::string, std::string> upstream_headers = req.headers;
-        if (!client_ip.empty()) {
-            auto xff = upstream_headers.find("x-forwarded-for");
-            if (xff != upstream_headers.end()) xff->second += ", " + client_ip;
-            else upstream_headers["X-Forwarded-For"] = client_ip;
-            upstream_headers["X-Real-IP"] = client_ip;
-        }
-
-        BackendResponse be = forward_request(server.host, server.port, dep.method, dep.path,
-                                            upstream_headers, req.body, dep.timeout_ms, tls);
-
-        if (be.error != BackendError::None) {
-            const bool timed_out = be.error == BackendError::ConnectTimeout ||
-                                   be.error == BackendError::WriteTimeout ||
-                                   be.error == BackendError::ReadTimeout;
-            local_resp.status_code = timed_out ? 504 : 502;
-            local_resp.status_message = timed_out ? "Gateway Timeout" : "Bad Gateway";
-            local_resp.body = timed_out ? "upstream_timeout" : "upstream_unavailable";
-            local_resp.headers["Content-Type"] = "text/plain";
-            local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
-            return local_resp;
-        }
-
-        local_resp.status_code = be.status_code;
-        local_resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
-        local_resp.body = be.body;
-        local_resp.headers["Content-Type"] = "application/json";
-        local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
-        return local_resp;
-    };
-
-    std::promise<HttpResponse> promise;
-    auto future = promise.get_future();
-    const SubmitStatus status = executor.submit(dep.upstream_name, [&promise, task = std::move(task)]() mutable {
-        try {
-            promise.set_value(task());
-        } catch (...) {
-            HttpResponse fallback;
-            fallback.status_code = 502;
-            fallback.status_message = "Bad Gateway";
-            fallback.body = "Bad Gateway";
-            fallback.headers["Content-Type"] = "text/plain";
-            fallback.headers["Content-Length"] = std::to_string(fallback.body.size());
-            promise.set_value(fallback);
-        }
-    });
+                    const BackendResponse be = forward_request(server.host, server.port, dep.method, dep.path,
+                                                               upstream_headers, req.body, dep.timeout_ms, tls);
+                    if (be.error != BackendError::None) {
+                        const bool timed_out = be.error == BackendError::ConnectTimeout ||
+                                               be.error == BackendError::WriteTimeout ||
+                                               be.error == BackendError::ReadTimeout;
+                        item["status"] = "failed";
+                        item["http_status"] = timed_out ? 504 : 502;
+                        item["error"] = timed_out ? "upstream_timeout" : "upstream_unavailable";
+                        item["timed_out"] = timed_out;
+                    } else {
+                        const bool ok = be.status_code >= 200 && be.status_code < 300;
+                        item["status"] = ok ? "ok" : "failed";
+                        item["http_status"] = be.status_code;
+                        item["backend"] = dep.upstream_name;
+                        item["error"] = ok ? "" : be.body;
+                        item["timed_out"] = be.status_code == 504;
+                        if (ok) item["body"] = be.body;
+                    }
+                }
+            } catch (const std::exception& e) {
+                item["status"] = "failed";
+                item["error"] = std::string("exception: ") + e.what();
+            } catch (...) {
+                item["status"] = "failed";
+                item["error"] = "exception";
+            }
+            item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count());
+            Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} http_status={}",
+                                dep.name.empty() ? "<unnamed>" : dep.name,
+                                item["status"].get<std::string>(),
+                                dep.required,
+                                item["traceparent"].get<std::string>(),
+                                item["duration_ms"].get<int64_t>(),
+                                item.value("http_status", 0));
+            promise->set_value(std::move(item));
+        });
 
     if (status != SubmitStatus::Accepted) {
         item["status"] = "rejected";
@@ -305,29 +351,10 @@ static json run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
                             item["traceparent"].get<std::string>(),
                             item["duration_ms"].get<int64_t>(),
                             item["error"].get<std::string>());
-        return item;
+        return make_ready_json_future(std::move(item));
     }
 
-    HttpResponse response = future.get();
-    item["status"] = response.status_code >= 200 && response.status_code < 300 ? "ok" : "failed";
-    item["http_status"] = response.status_code;
-    item["backend"] = dep.upstream_name;
-    item["error"] = response.status_code >= 200 && response.status_code < 300 ? "" : response.body;
-    item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - started).count());
-    item["timed_out"] = response.status_code == 504;
-    if (response.status_code >= 200 && response.status_code < 300) {
-        item["body"] = response.body;
-    }
-
-    Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} http_status={}",
-                        dep.name.empty() ? "<unnamed>" : dep.name,
-                        item["status"].get<std::string>(),
-                        dep.required,
-                        item["traceparent"].get<std::string>(),
-                        item["duration_ms"].get<int64_t>(),
-                        response.status_code);
-    return item;
+    return future;
 }
 
 
@@ -761,9 +788,11 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
         futures.reserve(route.composite_target.dependencies.size());
 
         for (const auto& dep : route.composite_target.dependencies) {
-            futures.push_back(std::async(std::launch::async, [this, &req, &client_ip, &dep]() -> json {
-                return run_composite_dependency(upstream_executor_, upstream_manager_, config_.upstream_config, req, client_ip, dep);
-            }));
+            // Each dependency is dispatched onto the bounded upstream executor,
+            // which caps concurrency and returns a ready "rejected" item when
+            // saturated. No per-request thread is created here.
+            futures.push_back(run_composite_dependency(upstream_executor_, upstream_manager_,
+                                                       config_.upstream_config, req, client_ip, dep));
         }
 
         for (size_t i = 0; i < route.composite_target.dependencies.size(); ++i) {
@@ -870,13 +899,22 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
             local_resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
             local_resp.body = be.body;
             auto header_key_lower = [](std::string k) {
-                std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+                std::transform(k.begin(), k.end(), k.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 return k;
             };
+            const std::unordered_set<std::string> conn_tokens = response_connection_tokens(be.headers);
             for (const auto& [k, v] : be.headers) {
+                // Drop anything carrying a CR/LF in name or value: a bare LF in
+                // an upstream header would let a compromised backend split the
+                // response or inject headers toward the client.
+                if (k.find('\r') != std::string::npos || k.find('\n') != std::string::npos ||
+                    v.find('\r') != std::string::npos || v.find('\n') != std::string::npos) {
+                    Logger::get()->warn("Dropping unsafe upstream response header '{}' (contains CR/LF)", k);
+                    continue;
+                }
                 const std::string lk = header_key_lower(k);
-                if (lk == "content-length" || lk == "transfer-encoding" ||
-                    lk == "connection" || lk == "keep-alive") continue;
+                if (is_response_hop_by_hop(lk) || conn_tokens.count(lk) != 0) continue;
                 local_resp.headers[k] = v;
             }
             local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());

@@ -13,6 +13,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace {
 
@@ -70,6 +71,36 @@ std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+// RFC 7230 §6.1 hop-by-hop headers must never be forwarded on the upstream
+// hop. This also covers the framing headers the gateway re-emits itself
+// (Host, Content-Length) and Proxy-* credentials, which must not leak to a
+// backend. `lower_name` is expected to be lowercased already.
+bool is_hop_by_hop_header(const std::string& lower_name) {
+    static const std::unordered_set<std::string> kHopByHop = {
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+        "host", "content-length"};
+    return kHopByHop.count(lower_name) != 0;
+}
+
+// Tokens named in the client's Connection header are themselves hop-by-hop
+// (RFC 7230 §6.1) and must be dropped alongside it.
+std::unordered_set<std::string> connection_tokens(
+        const std::unordered_map<std::string, std::string>& headers) {
+    std::unordered_set<std::string> tokens;
+    const auto it = headers.find("connection");
+    if (it == headers.end()) return tokens;
+    std::istringstream stream(it->second);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        const size_t begin = token.find_first_not_of(" \t");
+        const size_t end = token.find_last_not_of(" \t");
+        if (begin == std::string::npos) continue;
+        tokens.insert(to_lower(token.substr(begin, end - begin + 1)));
+    }
+    return tokens;
 }
 
 // Case-insensitive header lookup within the raw header block of a response.
@@ -293,9 +324,10 @@ BackendResponse forward_request(const std::string& host, int port,
         std::ostringstream req_stream;
         req_stream << method << " " << path << " HTTP/1.1\r\n";
         req_stream << "Host: " << host << ":" << port << "\r\n";
+        const std::unordered_set<std::string> conn_tokens = connection_tokens(req_headers);
         for (const auto& [k, v] : req_headers) {
-            if (k == "host" || k == "connection" || k == "keep-alive" ||
-                k == "content-length" || k == "transfer-encoding") continue;
+            const std::string lower_key = to_lower(k);
+            if (is_hop_by_hop_header(lower_key) || conn_tokens.count(lower_key) != 0) continue;
             req_stream << k << ": " << v << "\r\n";
         }
         // Send framing whenever a body is possible: non-empty body, or the
