@@ -9,6 +9,7 @@ add_executable(runTests
     test_upstream_manager.cpp
     test_async_upstream.cpp
     test_config_validation.cpp
+    test_connection_budget.cpp
     test_tls_context.cpp
     test_tls_utils.cpp
     test_client_tls.cpp

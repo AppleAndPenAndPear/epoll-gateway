@@ -398,6 +398,54 @@ TEST(FromFileSchemaTest, RejectsOutOfRangePort) {
     EXPECT_EQ(config.port, 5005);  // default kept
 }
 
+TEST(ConfigValidationTest, RejectsZeroMaxConnections) {
+    // A zero ceiling would shed every connection, which is never a sane config.
+    Config config;
+    config.max_connections = 0;
+    std::vector<std::string> errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("max_connections") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(ConfigValidationTest, RejectsZeroUpstreamInflight) {
+    // Zero in-flight slots would reject every composite fan-out task.
+    Config config;
+    config.upstream_max_inflight = 0;
+    std::vector<std::string> errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("upstream_max_inflight") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(FromFileSchemaTest, ParsesResourceBudgetFields) {
+    const std::string path = write_temp_config("budget", R"({
+        "port": 6001,
+        "max_connections": 2048,
+        "upstream_max_inflight": 12,
+        "upstream_max_queue": 96
+    })");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(path, &errors);
+    EXPECT_TRUE(errors.empty()) << errors[0];
+    EXPECT_EQ(config.max_connections, 2048u);
+    EXPECT_EQ(config.upstream_max_inflight, 12u);
+    EXPECT_EQ(config.upstream_max_queue, 96u);
+}
+
+TEST(FromFileSchemaTest, RejectsZeroMaxConnectionsFromFile) {
+    const std::string path = write_temp_config("zero_conns", R"({"max_connections": 0})");
+    std::vector<std::string> errors;
+    Config config = Config::from_file(path, &errors);
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_NE(errors[0].find("max_connections"), std::string::npos);
+    EXPECT_EQ(config.max_connections, 10000u);  // default kept
+}
+
 TEST(FromFileSchemaTest, RejectsNonIntegerPort) {
     const std::string path = write_temp_config("str_port", R"({"port": "http"})");
     std::vector<std::string> errors;

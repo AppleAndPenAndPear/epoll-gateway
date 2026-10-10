@@ -53,6 +53,7 @@ BACKEND_TLS = 5616   # TLS test backend (https upstream)
 PROFILE_USER = 5617  # Composite profile user dependency
 PROFILE_ORDERS = 5618  # Composite profile orders dependency
 PROFILE_RECOMMENDATIONS = 5619  # Composite profile recommendations dependency
+OVERLOAD_PORT = 5620  # Dedicated server with a tiny connection budget for the overload test
 
 BASE = "127.0.0.1"
 ADMIN_PORT = 5615   # Admin API listener (separate from the data plane)
@@ -1054,6 +1055,77 @@ server_proc = None
 mock_procs = []
 
 
+def test_connection_budget_overload():
+    print("\n[..] Connection budget: excess connections are shed")
+    # This case needs its own server with a deliberately tiny budget, so it
+    # cannot share the main instance. The slot is reserved at accept (before any
+    # TLS handshake), so a bare TCP connection is enough to hold one.
+    ws = tempfile.mkdtemp(prefix="epoll-overload-")
+    os.symlink(os.path.join(REPO, "certs"), os.path.join(ws, "certs"))
+    os.makedirs(os.path.join(ws, "www"))
+    os.makedirs(os.path.join(ws, "logs"))
+    cfg = {
+        "port": OVERLOAD_PORT,
+        "num_workers": 1,
+        "max_connections": 1,
+        "www_root": "./www",
+        "keepalive_timeout": 30,
+        "tls": {"cert_path": "certs/server.crt", "key_path": "certs/server.key"},
+        "routes": [],
+        "rate_limit": {"capacity": 100, "refill_per_second": 50},
+    }
+    with open(os.path.join(ws, "config.json"), "w") as f:
+        f.write(json.dumps(cfg, indent=2))
+    log_out = open(os.path.join(ws, "server_stdout.log"), "w")
+    proc = subprocess.Popen([SERVER_BIN], cwd=ws, stdout=log_out, stderr=log_out)
+    holder = None
+    try:
+        if not wait_for_port(OVERLOAD_PORT):
+            check("overload server started", False, "server never came up")
+            return
+        # wait_for_port()'s own probe connection also consumed the single slot;
+        # give the worker a moment to observe the peer close and release it.
+        time.sleep(0.5)
+
+        holder = socket.create_connection((BASE, OVERLOAD_PORT), timeout=5)
+        time.sleep(0.3)  # let the accept loop reserve the only slot
+
+        # A second connection must be accepted and immediately closed.
+        shed = False
+        extra = socket.create_connection((BASE, OVERLOAD_PORT), timeout=5)
+        try:
+            extra.settimeout(3)
+            shed = (extra.recv(1) == b"")  # b'' == peer closed before any bytes
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            shed = True
+        except socket.timeout:
+            shed = False
+        finally:
+            extra.close()
+        check("excess connection shed at max_connections", shed,
+              "second connection stayed open (budget not enforced)")
+
+        # The connection holding the slot must not be evicted.
+        alive = False
+        holder.settimeout(1)
+        try:
+            alive = (holder.recv(1) != b"")  # timeout (no data) means still open
+        except socket.timeout:
+            alive = True
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            alive = False
+        check("connection within the budget is kept", alive)
+    finally:
+        if holder is not None:
+            holder.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log_out.close()
+
+
 def cleanup():
     for p in mock_procs:
         if p.poll() is None:
@@ -1171,6 +1243,9 @@ def main():
         test_companion_client()
         test_tls_cert_hot_reload(ws)
         test_admin_api(ws)
+        # Uses its own server on OVERLOAD_PORT (tiny max_connections); independent
+        # of the shared instance above.
+        test_connection_budget_overload()
 
         # Final check: the server stayed alive and responsive throughout
         status, _, _ = request("/")
