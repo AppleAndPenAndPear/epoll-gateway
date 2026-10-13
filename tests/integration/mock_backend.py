@@ -16,6 +16,7 @@ Behavior:
 import http.server
 import json
 import os
+import socket
 import sys
 import time
 
@@ -154,8 +155,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _NodelayHTTPServer(http.server.ThreadingHTTPServer):
+    # A response is written as two small segments (headers, then body). With
+    # Nagle enabled the second segment waits for the client's delayed ACK, which
+    # costs a fixed ~40 ms on every proxied response and makes any benchmark of
+    # the gateway's proxy path measure this fixture, not the gateway. There is
+    # no stdlib "disable_nagle_algorithm" attribute, so set TCP_NODELAY on each
+    # accepted socket explicitly.
+    def get_request(self):
+        conn, addr = super().get_request()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return conn, addr
+
+
 def main():
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = _NodelayHTTPServer(("127.0.0.1", PORT), Handler)
     server.allow_reuse_address = True
     if CERT_PATH and KEY_PATH:
         import ssl

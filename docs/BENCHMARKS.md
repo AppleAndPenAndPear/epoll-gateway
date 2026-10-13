@@ -214,11 +214,115 @@ worker tears the connection down on FAILED/HUP before attempting a
 handshake; error queue is cleared per operation. Post-fix, the same load
 produces 11 log lines instead of 225k.
 
+## Profiling pass: locating the proxy-path gap (2026-10-13)
+
+Profiling method, on the same shared 2-vCPU box. `perf` is unusable here
+(`perf_event_paranoid=4`, `ptrace_scope=1`, no passwordless sudo), and no
+valgrind/callgrind/flamegraph is installed, so the toolset was: `strace -c -f`
+started **as the parent** of the gateway (required: `ptrace_scope=1` forbids
+attaching to a non-descendant), `/proc/<pid>/task/*/stat` sampling for the
+user/kernel CPU split, wrk, and config A/B toggles.
+
+### Finding A — the benchmark fixture was still measuring a 40 ms Nagle stall
+
+The comparison section above claims the mock "now sets `TCP_NODELAY`". That was
+never true: `tests/integration/mock_backend.py` set **no** socket option, and
+the `disable_nagle_algorithm` attribute the old text referred to does not exist
+in the Python standard library (`socketserver`/`http.server` expose no such
+attribute — verified). So the fixture wrote each response as two small segments
+(headers, then body) with Nagle on, and every proxied response paid the
+client's delayed-ACK timer.
+
+Evidence (single request path, mock on loopback):
+
+| measurement | p50 | RPS |
+|---|---|---|
+| direct to mock, c4, Nagle (as shipped) | 43.5 ms | 86 |
+| direct to mock, c4, TCP_NODELAY | 3.1 ms | 1074 |
+| `run_benchmark.sh` proxy c50, Nagle | 0 (all timed out) | 19.9, 200 socket timeouts |
+| `run_benchmark.sh` proxy c50, TCP_NODELAY | 74.5 ms | 536, 0 errors |
+
+The fix is in `mock_backend.py` (`_NodelayHTTPServer.get_request` sets
+`TCP_NODELAY` on every accepted socket; the same intent the old doc text
+described, done for real). **Every proxy number taken before this fix — the
+`proxy`/`proxy-light` rows and the whole nginx proxy comparison — is
+contaminated by this stall and should be re-measured.**
+
+### Finding B — the gateway's own HTTP/TLS path is fine; the proxy path is the gap
+
+With the fixture corrected, the gateway's static path (its own request path, no
+upstream) runs at 1580-3290 RPS depending on machine noise, while the proxy
+path sits at ~535-860 RPS — roughly **4-5x slower than static** even though
+proxying does strictly less TLS work. So the throughput gap vs nginx
+(1549-1616 proxy on the same box) localises to the upstream-forwarding path,
+not to the TLS/HTTP front end.
+
+### Finding C — it is not CPU-bound, and not the fan-out / pool caps
+
+CPU sampling (`/proc/<pid>/task/*/stat` deltas over the load window):
+
+| scenario | RPS | CPU of one core | user | sys |
+|---|---|---|---|---|
+| static c50 | 3677 | 0.58 | 29.5% | 28.9% |
+| proxy c50 | 733 | 0.31 | 15.0% | 15.9% |
+
+The proxy path uses **0.31 core** at 733 RPS: it is waiting, not computing
+(~50% of the CPU it does use is kernel time — syscalls, not a user-space hot
+loop). Config A/B confirms the obvious knobs are not the limiter:
+
+| change (proxy c50) | RPS |
+|---|---|
+| default (`upstream_max_inflight` 4) | 441-587 |
+| `upstream_max_inflight` 64 | 515-658 |
+| `upstream_max_inflight` 64 + `thread_pool` 2/10 → 16/64 | 667 |
+| `num_workers` 1 → 2 | 604 → 855 |
+
+Raising the fan-out and pool sizes buys ~15%; doubling the event-loop workers
+buys ~40%. The path scales with event-loop threads and barely responds to
+worker/thread-pool size, which points at the single forwarded-request
+round-trip, not at a queue-depth limit.
+
+### Finding D — structural cause: a blocking, double-threaded forward
+
+A single-upstream request is handled by `run_upstream_task`
+(`src/server/http_handler.cpp`), which submits the work to
+`BoundedAsyncUpstreamExecutor` and then **blocks the calling thread on
+`future.get()`** while the executor runs the same work — the blocking
+upstream `send`/`recv` — on a *second* thread. One in-flight proxied request
+therefore occupies **two** threads, and proxy concurrency is capped at
+`min(thread_pool, upstream_max_inflight)`. `strace` shows the resulting churn
+under load: ~83 `clone3`/`set_robust_list` thread creations per 6 s from the
+dynamic pool scaling up and down (plus `madvise`/`mmap`/`munmap` for the
+stacks). nginx never pays this: its upstream I/O is non-blocking on the same
+event loop that serves the client, so thousands of in-flight upstreams share
+one thread.
+
+This is the leading explanation for the residual gap and the reason the knobs
+in Finding C saturate early. Closing it is a design change (drive upstream
+sockets from the event loop with an `eventfd` wake-up, instead of a blocking
+worker-thread pool), not a tuning flag, so it is listed as follow-up rather
+than applied here.
+
+### Reproducing this pass
+
+```bash
+./ci.sh build
+# fixture-corrected proxy baseline (no timeouts):
+scripts/benchmark/run_benchmark.sh 8
+# fan-out A/B (edit upstream_max_inflight in the run_benchmark.sh heredoc):
+#   4 vs 64 -> ~+17%
+# CPU split of a running gateway while wrk drives it:
+#   sum /proc/<pid>/task/*/stat fields 14/15 before and after the load window
+# thread-creation churn (start the gateway as a child, ptrace_scope=1):
+#   strace -c -f -o /tmp/st.txt build/server   # run wrk, then SIGTERM the server
+```
+
 ## Pending
 
 - Traefik / KrakenD comparison (binary download blocked on this network).
-- Isolating the remaining throughput gap with flame graphs / syscall counts.
-  A per-request access-log switch now exists (`logging.access_log_enabled`,
-  independent of AUDIT), so the log-write share can be measured against
-  `access_log off`; the other candidates (buffer copies, TLS record sizing)
-  still need profiling.
+- Re-run the nginx proxy comparison with the corrected mock fixture
+  (Finding A): the earlier proxy rows are not comparable.
+- Non-blocking upstream forwarding to remove the double-thread blocking
+  round-trip (Finding D), then re-measure.
+- Per-request log-write share via `logging.access_log_enabled` (access log can
+  be turned off independently of AUDIT); not yet isolated with data.
