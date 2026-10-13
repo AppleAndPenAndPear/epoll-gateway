@@ -282,20 +282,27 @@ buys ~40%. The path scales with event-loop threads and barely responds to
 worker/thread-pool size, which points at the single forwarded-request
 round-trip, not at a queue-depth limit.
 
-### Finding D — structural cause: a blocking, double-threaded forward
+### Finding D — structural cause: the event loop blocks on the upstream round trip
 
-A single-upstream request is handled by `run_upstream_task`
-(`src/server/http_handler.cpp`), which submits the work to
-`BoundedAsyncUpstreamExecutor` and then **blocks the calling thread on
-`future.get()`** while the executor runs the same work — the blocking
-upstream `send`/`recv` — on a *second* thread. One in-flight proxied request
-therefore occupies **two** threads, and proxy concurrency is capped at
-`min(thread_pool, upstream_max_inflight)`. `strace` shows the resulting churn
-under load: ~83 `clone3`/`set_robust_list` thread creations per 6 s from the
-dynamic pool scaling up and down (plus `madvise`/`mmap`/`munmap` for the
-stacks). nginx never pays this: its upstream I/O is non-blocking on the same
-event loop that serves the client, so thousands of in-flight upstreams share
-one thread.
+`handle_read` runs on the TcpWorker event-loop thread and processes each
+request inline (`http_handler.cpp`). For an upstream route it calls
+`run_upstream_task`, which submits to `BoundedAsyncUpstreamExecutor` and then
+**blocks the calling thread on `future.get()`** — i.e. it blocks the *event
+loop* for the whole upstream round trip. One worker therefore serves proxied
+requests strictly one at a time: throughput is ~`1/upstream_latency` and does
+not grow with client concurrency. That is exactly the flat 441-667 RPS across
+c8/c50, the latency rising as `concurrency x ~1.4 ms`, and the near-zero
+response to `upstream_max_inflight`. The upstream socket itself is
+non-blocking (`Socket::setnonblocking` plus `Poller::wait` in
+`http_client.cpp`), so the cost is not a blocking syscall: it is one thread
+pinned polling a single round trip while the loop stalls, and a second thread
+(the executor) doing the I/O the loop is waiting on — two threads, no added
+concurrency. `strace` shows the resulting churn under load (~83 `clone3`/
+`set_robust_list` thread creations per 6 s as the dynamic pool scales up and
+down, plus `madvise`/`mmap`/`munmap` for the stacks). `num_workers` raises
+throughput only by multiplying blocked threads (1→2 gave +42%). nginx never
+pays this: it registers the upstream socket in the same epoll and keeps
+serving other clients while the upstream is in flight.
 
 This is the leading explanation for the residual gap and the reason the knobs
 in Finding C saturate early. Closing it is a design change (drive upstream
@@ -322,7 +329,7 @@ scripts/benchmark/run_benchmark.sh 8
 - Traefik / KrakenD comparison (binary download blocked on this network).
 - Re-run the nginx proxy comparison with the corrected mock fixture
   (Finding A): the earlier proxy rows are not comparable.
-- Non-blocking upstream forwarding to remove the double-thread blocking
-  round-trip (Finding D), then re-measure.
+- Event-driven upstream forwarding to remove the event-loop block on the
+  upstream round trip (Finding D), then re-measure.
 - Per-request log-write share via `logging.access_log_enabled` (access log can
   be turned off independently of AUDIT); not yet isolated with data.
