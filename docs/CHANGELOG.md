@@ -4,6 +4,21 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-13
+
+### Added
+
+- **Per-route/host/tenant latency histograms.** The route dimension exposed only latency `sum`/`count` (`epoll_route_latency_seconds_*`), so per-route P95/P99 could not be computed — operators could see *that* a route was slow but not the tail. `Metrics::RouteMetricSample` now keeps a cumulative bucket array per dimension, using the same boundaries as the global histogram (so the two are directly comparable), and `to_string()` exports a proper `epoll_route_request_duration_seconds` histogram (`_bucket`/`_sum`/`_count`, with `le` labels incl. `+Inf`). The old `epoll_route_latency_seconds_sum/_count` series are replaced by this family.
+- **Per-dimension failure-rate metrics.** `epoll_route_requests_total` now reports 2xx/3xx/4xx/5xx (3xx was recorded internally but never exported), so the failure rate is derivable in PromQL as `rate(...{code="5xx"}) / rate(...)`. Three cause-specific counters are now emitted for the first time — `epoll_route_upstream_errors_total`, `epoll_route_auth_failures_total`, `epoll_route_rate_limit_hits_total` — the underlying counts already existed but had no exposition line.
+
+### Tests
+
+- 3 unit tests (bucket values against the documented boundaries, cause breakdown, and bucket monotonicity so `histogram_quantile` stays valid) and 4 integration assertions on the new `/metrics` route families. Totals: 144 unit / 138 integration assertions.
+
+### Changed
+
+- Both READMEs' `/metrics` metric tables and PromQL examples updated to the new `epoll_route_request_duration_seconds` family; [PROJECT_STATUS.md](PROJECT_STATUS.md) Known Limitations drops the "no per-dimension histogram" entry, and its unit/integration counts plus the ROADMAP milestone list are synced to the shipped code.
+
 ## 2026-10-10
 
 Commercial-readiness hardening pass: a correctness/security audit produced four high-severity fixes (already committed) followed by a batch of Medium/Low consistency fixes, a parser-robustness batch, and forwarded-header completion. Every change below is covered by a regression test.

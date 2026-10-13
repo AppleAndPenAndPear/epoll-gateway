@@ -439,8 +439,12 @@ server:5005/metrics
 | `epoll_fd_cache_hits_total` / `epoll_fd_cache_misses_total` | Counter | FD-cache hits/misses |
 | `epoll_gzip_cache_hits_total` / `epoll_gzip_cache_misses_total` | Counter | Gzip compression-cache hits/misses |
 | `epoll_upstream_errors_total{type="..."}` | Counter | Upstream error counts (connect_failed, connect_timeout, write_failed, write_timeout, read_failed, read_timeout, invalid_response) |
-| `epoll_route_requests_total{route,host,tenant,code}` | Counter | 2xx/4xx/5xx requests per route/host/tenant |
-| `epoll_route_latency_seconds_sum/_count{route,host,tenant}` | - | Latency sum/count per route/host/tenant (no dedicated histogram yet) |
+| `epoll_route_requests_total{route,host,tenant,code="2xx\|3xx\|4xx\|5xx"}` | Counter | Requests per route/host/tenant by status class |
+| `epoll_route_request_duration_seconds_bucket{route,host,tenant,le="..."}` | Histogram | Per-route/host/tenant latency distribution (same 11 buckets as the global histogram) |
+| `epoll_route_request_duration_seconds_sum/_count{route,host,tenant}` | Histogram | Per-dimension cumulative latency and request count |
+| `epoll_route_upstream_errors_total{route,host,tenant}` | Counter | Per-dimension upstream (502/503/504) errors |
+| `epoll_route_auth_failures_total{route,host,tenant}` | Counter | Per-dimension authentication failures |
+| `epoll_route_rate_limit_hits_total{route,host,tenant}` | Counter | Per-dimension rate-limit rejections |
 
 ### Adding the Grafana data source
 
@@ -467,8 +471,12 @@ histogram_quantile(0.99, rate(epoll_http_request_duration_seconds_bucket[1m]))
 sum(rate(epoll_cache_hits_total[1m])) /
 sum(rate(epoll_cache_hits_total[1m]) + rate(epoll_cache_misses_total[1m]))
 
-# Per-route average latency
-rate(epoll_route_latency_seconds_sum[1m]) / rate(epoll_route_latency_seconds_count[1m])
+# Per-route P99 latency
+histogram_quantile(0.99, sum(rate(epoll_route_request_duration_seconds_bucket[1m])) by (route, le))
+
+# Per-route 5xx failure rate
+sum(rate(epoll_route_requests_total{code="5xx"}[1m])) by (route) /
+sum(rate(epoll_route_requests_total[1m])) by (route)
 
 # Upstream connect-timeout error rate
 rate(epoll_upstream_errors_total{type="connect_timeout"}[1m])
@@ -651,7 +659,6 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 ## Known Limitations
 
 - Circuit-breaker and health state is now shared process-wide (all workers + the admin API read the same state); load balancing beyond `round_robin` is still not implemented.
-- Route/host/tenant dimensions currently expose latency sum/count only, without a dedicated histogram (so per-dimension P95/P99 cannot be derived directly).
 - Runtime reload is polled by workers at checkpoints; workers do not switch config at the exact same instant.
 - Route matching is a linear scan — fine at the current scale, with no Trie/index structure yet.
 - The connection pool keeps only in-process idle connections; async upstream I/O and multi-algorithm load balancing (beyond `round_robin`) are not implemented yet.
@@ -663,7 +670,7 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 
 1. ~~Add runtime-reload and real-HTTP end-to-end integration tests.~~ ✅ P1
 2. ~~Add config field/range validation, route-conflict checks and reload-failure auditing.~~ ✅ P2 (with request-smuggling protection, TLS hardening and secret management)
-3. Complete route/host/tenant latency histograms and failure-rate metrics.
+3. ~~Complete route/host/tenant latency histograms and failure-rate metrics.~~ ✅ (route/host/tenant histograms with per-dimension P95/P99, plus failure counters broken down by cause)
 4. ~~Evaluate a cross-worker shared circuit-breaker implementation.~~ ✅ P4 (`UpstreamManager` is now process-wide)
 5. ~~Connection pooling~~ ✅ P3 (with the wrk baseline report); async upstream still open.
 6. ~~P4: `/healthz` + `/readyz`, admin API, graceful-shutdown drain, deployment docs.~~ ✅ P4 (plus `/version`, a systemd unit and an upgrade guide)

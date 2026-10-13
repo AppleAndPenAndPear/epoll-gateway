@@ -2,14 +2,14 @@
 
 ## Current Stage
 
-Building the core capability set of a commercial API gateway. The regression safety net, config/security hardening, performance baseline, operations productization (ops endpoints, admin API, graceful shutdown, deployment docs), bounded async upstream execution, composite (fan-out) routes, W3C `traceparent` propagation, the access-log/redaction policy, and the 2026-10-10 correctness/security hardening pass are complete. Next, in priority order: **resource budgets and documented overload behaviour** (the highest-value remaining reliability gap), then **supply-chain scanning (SCA/SAST/SBOM) in CI before the next release**, then commercial features shaped by customer feedback. mTLS, OIDC/JWT, cluster control planes, distributed quotas and AI-gateway features are explicitly deferred until a concrete customer requires them (see [ROADMAP.md](ROADMAP.md) §4).
+Building the core capability set of a commercial API gateway. The regression safety net, config/security hardening, performance baseline, operations productization (ops endpoints, admin API, graceful shutdown, deployment docs), bounded async upstream execution, composite (fan-out) routes, W3C `traceparent` propagation, the access-log/redaction policy, the 2026-10-10 correctness/security hardening pass, resource budgets with documented overload behaviour, the supply-chain gate (SAST/SBOM/SCA), and per-route/host/tenant latency histograms with failure-rate metrics are complete. Next, in priority order: **profile the known Nginx throughput gap** (isolate log-write, buffer-copy and TLS-record costs) before further optimization, then commercial features shaped by customer feedback. mTLS, OIDC/JWT, cluster control planes, distributed quotas and AI-gateway features are explicitly deferred until a concrete customer requires them (see [ROADMAP.md](ROADMAP.md) §4).
 
 ## Current Validation
 
 - C++17 Release build passes.
-- Native Google Test suite: 139/139 passing (2026-10-10, `./build/tests/runTests`).
-- Integration tests: 134/134 passing (2026-10-10, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
-- Covered: HTTP parser (incl. smuggling vectors, bare-LF and whitespace-before-colon rejection, full chunked-trailer consumption), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots.
+- Native Google Test suite: 144/144 passing (2026-10-13, `./build/tests/runTests`).
+- Integration tests: 138 assertions passing (2026-10-13, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Covered: HTTP parser (incl. smuggling vectors, bare-LF and whitespace-before-colon rejection, full chunked-trailer consumption), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots, and route-level metrics (cumulative histogram buckets + failure counters broken down by cause).
 - Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤4 backend connections), forwarded headers (`X-Forwarded-Proto`/`X-Forwarded-Host`, spoofed `X-Real-IP` overwritten), hop-by-hop stripping on both hops, upstream-response header-injection rejection, single-pass gzip of an already-encoded backend response, bounded composite fan-out, and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
 - First-run experience: a 5-minute quickstart at the top of both READMEs (built-in echo routes answer with no backend; the admin auth demo uses a key the operator sets — see the note on default credentials below); runnable scenarios under [examples/](../examples/) — load balancing with health checks and a verified `https://` upstream; dev certificates are generated locally by `scripts/gen_dev_certs.sh` and never committed (`certs/` is gitignored); the server accepts an optional config path argument (`./build/server examples/load-balanced/config.json`).
@@ -158,7 +158,7 @@ Building the core capability set of a commercial API gateway. The regression saf
 - Bounded async upstream boundary (2026-10-08): bounded executor, group-aware overload rejection, and route-to-upstream group semantics are implemented and validated.
 - API composition MVP (2026-10-08): composite profile-route fan-out is implemented and validated end-to-end; success and partial-failure paths pass.
 - TLS write path (2026-10-09): SSL WANT_READ/WANT_WRITE re-arms the correct readiness direction; TLS static-file sends retain pending chunks and continue across backpressure; verified by an 8 MiB delayed-reader integration case.
-- Google Test suite currently 130/130 passing (2026-10-10).
+- Google Test suite currently 144/144 passing (2026-10-13).
 - Covered:
 	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body
@@ -177,7 +177,8 @@ Building the core capability set of a commercial API gateway. The regression saf
 	- Upstream timeouts, connection failures, and idempotent retries
 	- Upstream health checks
 	- Circuit breaker open/reject/recovery probing
-- Integration suite (127 assertions) proves end-to-end behavior including connection reuse, TLS policy, the companion client's certificate/hostname verification, forwarded headers, hop-by-hop stripping, header-injection rejection and single-pass gzip.
+	- Route-level metrics (cumulative histogram buckets + failure counters by cause)
+- Integration suite (138 assertions) proves end-to-end behavior including connection reuse, TLS policy, the companion client's certificate/hostname verification, forwarded headers, hop-by-hop stripping, header-injection rejection, single-pass gzip, and the route/host/tenant metric families.
 - Benchmark harness `scripts/benchmark/run_benchmark.sh` + report in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Request Flow
@@ -204,7 +205,6 @@ Client connects
 
 ## Known Limitations
 
-- The route/host/tenant dimensions currently provide latency sum/count but no dedicated histogram, so per-dimension P95/P99 is not directly available.
 - Runtime reload uses periodic worker polling; workers are not guaranteed to switch configuration at exactly the same instant.
 - Route matching is still a linear scan — simple and reliable at the current scale, with no Trie or index structure for large route sets yet.
 - The upstream connection pool keeps only idle connections in memory (no cross-process sharing); load balancing currently supports `round_robin` only (upstream I/O is now scheduled through the bounded async executor).
@@ -216,10 +216,10 @@ Client connects
 
 ## Next Steps
 
-1. **Supply-chain scanning in CI (do before the next release tag).** Add dependency/artifact scanning (SCA), SAST and SBOM generation so a release cannot ship with a known-vulnerable dependency.
-2. Complete per-route/host/tenant latency histograms and failure-rate metrics.
-3. Profile the known Nginx throughput gap (isolate log-write, buffer-copy and TLS-record costs) before further optimization; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
-4. Deferred until a concrete customer requires them: OIDC/JWT, upstream mTLS, distributed quotas, cluster control plane, and AI-gateway features; each claimed capability needs integration coverage and deployment guidance.
+1. Profile the known Nginx throughput gap (isolate log-write, buffer-copy and TLS-record costs) before further optimization; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
+2. Deferred until a concrete customer requires them: OIDC/JWT, upstream mTLS, distributed quotas, cluster control plane, and AI-gateway features; each claimed capability needs integration coverage and deployment guidance.
+
+Two prerequisites from the previous list are now complete: the supply-chain gate (SAST/SBOM/SCA) runs in CI, and the per-route/host/tenant latency histograms plus failure-rate metrics are implemented.
 
 ## Recent Decisions
 

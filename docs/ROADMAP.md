@@ -74,7 +74,7 @@ The execution plan for taking this project from a personal project to a commerci
 
 - wrk baseline across three scenarios: static small files (cache hits), reverse proxy (local backend), TLS handshake + request; output a P50/P99/QPS report (usable directly as marketing material)
 - Upstream connection pooling: per-request TCP connection → pooled + keep-alive; expected to be the single highest-yield optimization
-- Add a per-route latency histogram
+- Add a per-route latency histogram — done 2026-10-13
 - Confirm hotspots with flame graphs before deciding on a route Trie/index (avoid premature optimization)
 
 ### P4: Operations Productization
@@ -238,10 +238,15 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - Process-wide `max_connections` enforced by a shared `ConnectionBudget`; over-limit connections are accepted and shed immediately so a flood cannot exhaust fds/memory
   - Composite fan-out limits (`upstream_max_inflight`/`upstream_max_queue`) made configurable instead of hard-coded
   - `epoll_connections_active` / `epoll_connections_rejected_total` metrics; full per-resource budget table in [DEPLOYMENT.md](DEPLOYMENT.md) §11
-- Current verification: 139/139 unit, 134/134 integration (2026-10-10)
+- [x] Supply-chain gate (2026-10-13)
+  - `scripts/supply_chain.sh` wired into CI (`./ci.sh supply-chain`): `cppcheck` SAST (blocking only on `error` severity), an offline CycloneDX 1.5 SBOM of `build/server`'s linked libraries, and an `osv-scanner` SCA pass over that SBOM; a missing tool reports SKIPPED with its install command, never a silent pass
+  - Caught a real defect on its first run: an uninitialised `UpstreamServer::port` (fixed); see [SUPPLY_CHAIN.md](SUPPLY_CHAIN.md)
+- [x] Per-route/host/tenant latency histograms + failure-rate metrics (2026-10-13)
+  - The route dimension now exports a full `epoll_route_request_duration_seconds` histogram (`_bucket`/`_sum`/`_count`) with the same bucket boundaries as the global histogram, so per-dimension P95/P99 is available
+  - Request counters report 2xx/3xx/4xx/5xx per dimension (failure rate derivable in PromQL) and cause-specific counters (`epoll_route_upstream_errors_total`, `epoll_route_auth_failures_total`, `epoll_route_rate_limit_hits_total`)
+- Current verification: 144/144 unit, 138 integration assertions (2026-10-13)
 
 ### Next in the active sequence
 
-- **Resource budgets and overload behaviour — done 2026-10-10.** Process-wide `max_connections` with accept-time load shedding (RAII budget shared across workers), configurable composite fan-out limits (`upstream_max_inflight` / `upstream_max_queue`), a configurable `max_response_bytes` cap on the dominant memory term, connection metrics, and a full capacity table plus a memory model with per-resource overload behaviour in [DEPLOYMENT.md](DEPLOYMENT.md) §11. A sustained load test now drives demand above `max_connections` and asserts shedding, survivability, recovery and a bounded fd count (short by default; `EPOLL_LOAD_TEST_SECONDS` extends it for a soak).
-- **Supply-chain scanning as a prerequisite, not a follow-up.** Add dependency and artifact scanning (SCA), a SAST pass, SBOM generation and checksums to CI before the next release tag, so a release cannot ship with a known-vulnerable dependency.
+- **Profile the known Nginx throughput gap (do first).** Isolate log-write, buffer-copy and TLS-record costs with flame graphs / syscall counts on the existing bench setup, then re-run the comparison with the same methodology; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
 - **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and all AI-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.

@@ -499,8 +499,12 @@ server:5005/metrics
 | `epoll_fd_cache_hits_total` / `epoll_fd_cache_misses_total` | Counter | FD 缓存命中/未命中 |
 | `epoll_gzip_cache_hits_total` / `epoll_gzip_cache_misses_total` | Counter | Gzip 压缩缓存命中/未命中 |
 | `epoll_upstream_errors_total{type="..."}` | Counter | upstream 错误分类计数（connect_failed、connect_timeout、write_failed、write_timeout、read_failed、read_timeout、invalid_response） |
-| `epoll_route_requests_total{route,host,tenant,code}` | Counter | route/host/tenant 维度的 2xx/4xx/5xx 请求数 |
-| `epoll_route_latency_seconds_sum/_count{route,host,tenant}` | - | route/host/tenant 维度的延迟 sum/count（尚未提供独立 histogram） |
+| `epoll_route_requests_total{route,host,tenant,code="2xx\|3xx\|4xx\|5xx"}` | Counter | 按状态码分类的 route/host/tenant 维度请求数 |
+| `epoll_route_request_duration_seconds_bucket{route,host,tenant,le="..."}` | Histogram | route/host/tenant 维度延迟分布（与全局直方图相同的 11 个桶） |
+| `epoll_route_request_duration_seconds_sum/_count{route,host,tenant}` | Histogram | route/host/tenant 维度延迟累计值与请求数 |
+| `epoll_route_upstream_errors_total{route,host,tenant}` | Counter | route/host/tenant 维度 upstream（502/503/504）错误数 |
+| `epoll_route_auth_failures_total{route,host,tenant}` | Counter | route/host/tenant 维度鉴权失败数 |
+| `epoll_route_rate_limit_hits_total{route,host,tenant}` | Counter | route/host/tenant 维度限流拒绝数 |
 
 ### 在 Grafana 中添加数据源
 
@@ -527,8 +531,12 @@ histogram_quantile(0.99, rate(epoll_http_request_duration_seconds_bucket[1m]))
 sum(rate(epoll_cache_hits_total[1m])) /
 sum(rate(epoll_cache_hits_total[1m]) + rate(epoll_cache_misses_total[1m]))
 
-# route 维度平均延迟
-rate(epoll_route_latency_seconds_sum[1m]) / rate(epoll_route_latency_seconds_count[1m])
+# route 维度 P99 延迟
+histogram_quantile(0.99, sum(rate(epoll_route_request_duration_seconds_bucket[1m])) by (route, le))
+
+# route 维度 5xx 失败率
+sum(rate(epoll_route_requests_total{code="5xx"}[1m])) by (route) /
+sum(rate(epoll_route_requests_total[1m])) by (route)
 
 # upstream 连接超时错误速率
 rate(epoll_upstream_errors_total{type="connect_timeout"}[1m])
@@ -744,7 +752,6 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 ## 已知限制
 
 - 熔断与健康状态已改为进程级共享（所有 Worker + Admin API 同一份）；但除 `round_robin` 之外的负载均衡算法仍未实现。
-- route/host/tenant 维度目前只有 latency sum/count，暂无独立 histogram（无法直接得到维度级 P95/P99）。
 - runtime reload 采用 Worker 周期检查，各 Worker 不保证同一时刻切换配置。
 - 路由匹配为线性遍历，适合当前规模，未引入 Trie/索引。
 - 连接池仅维护进程内空闲连接（无跨进程共享）；异步 upstream 与 `round_robin` 之外的多负载均衡算法尚未实现。
@@ -756,7 +763,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 
 1. ~~补充 runtime reload 和真实 HTTP 端到端集成测试。~~ ✅ P1
 2. ~~增加配置字段范围校验、路由冲突检查和 reload 失败审计。~~ ✅ P2（含请求走私防护、TLS 加固、密钥管理）
-3. 完善 route/host/tenant 维度的 latency histogram 和失败率指标。
+3. ~~完善 route/host/tenant 维度的 latency histogram 和失败率指标。~~ ✅（已提供维度级 P95/P99 直方图，并按原因拆分失败计数）
 4. ~~评估跨 Worker 共享熔断状态的实现方式。~~ ✅ P4（UpstreamManager 已改为进程级共享）
 5. ~~连接池~~ ✅ P3（含 wrk 基线压测报告）；异步 upstream 仍待做。
 6. ~~P4：`/healthz` + `/readyz`、管理 API、优雅停机 drain、部署文档。~~ ✅ P4（含 `/version`、systemd unit 与升级指南）
