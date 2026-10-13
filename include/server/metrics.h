@@ -12,6 +12,15 @@ private:
     Metrics();
 
     struct RouteMetricSample {
+        // Per-dimension latency histogram: the same bucket boundaries as the
+        // global histogram, plus a final +Inf bucket holding every request.
+        // Keeping the boundaries identical means per-dimension P95/P99 can be
+        // compared directly against the global figures.
+        static constexpr size_t kBucketCount = 12;  // 11 finite boundaries + +Inf
+        RouteMetricSample() {
+            for (auto& b : duration_buckets) b.store(0, std::memory_order_relaxed);
+        }
+
         std::atomic<uint64_t> total_requests{0};
         std::atomic<uint64_t> requests_2xx{0};
         std::atomic<uint64_t> requests_3xx{0};
@@ -22,6 +31,7 @@ private:
         std::atomic<uint64_t> rate_limit_hits{0};
         std::atomic<double> duration_sum{0.0};
         std::atomic<uint64_t> duration_count{0};
+        std::array<std::atomic<uint64_t>, kBucketCount> duration_buckets{};
     };
 
     std::array<double, 11> bucket_boundaries_;      // Latency bucket boundaries (seconds)

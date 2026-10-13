@@ -59,6 +59,15 @@ void Metrics::record_route_request(const std::string& route_name,
                                                      std::memory_order_relaxed)) {
     }
     sample.duration_count.fetch_add(1, std::memory_order_relaxed);
+    // Update the per-dimension histogram buckets with the same boundaries as the
+    // global histogram so P95/P99 can be derived per route/host/tenant.
+    for (size_t i = 0; i < bucket_boundaries_.size(); ++i) {
+        if (duration_seconds <= bucket_boundaries_[i]) {
+            sample.duration_buckets[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    // +Inf bucket (all requests)
+    sample.duration_buckets[bucket_boundaries_.size()].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Metrics::record_cache_hit() {
@@ -180,8 +189,20 @@ std::string Metrics::to_string() const {
                 << upstream_error_counts_[i].load() << "\n";
         }
 
+        // Route/host/tenant dimension. The code-labelled counters make the
+        // failure rate derivable in PromQL (rate(...{code="5xx"}) / rate(...));
+        // the specialised counters break failures down by cause, and the full
+        // histogram exposes per-dimension P95/P99.
         oss << "# HELP epoll_route_requests_total Route-level request totals by route, host, tenant\n";
         oss << "# TYPE epoll_route_requests_total counter\n";
+        oss << "# HELP epoll_route_upstream_errors_total Route-level upstream (502/503/504) errors\n";
+        oss << "# TYPE epoll_route_upstream_errors_total counter\n";
+        oss << "# HELP epoll_route_auth_failures_total Route-level authentication failures\n";
+        oss << "# TYPE epoll_route_auth_failures_total counter\n";
+        oss << "# HELP epoll_route_rate_limit_hits_total Route-level rate-limit rejections\n";
+        oss << "# TYPE epoll_route_rate_limit_hits_total counter\n";
+        oss << "# HELP epoll_route_request_duration_seconds Route-level request duration in seconds\n";
+        oss << "# TYPE epoll_route_request_duration_seconds histogram\n";
         for (const auto& [key, sample] : route_metrics_) {
             std::string route = key;
             auto sep1 = route.find('|');
@@ -189,16 +210,22 @@ std::string Metrics::to_string() const {
             std::string route_name = sep1 == std::string::npos ? route : route.substr(0, sep1);
             std::string host = sep1 == std::string::npos ? "-" : route.substr(sep1 + 1, sep2 - sep1 - 1);
             std::string tenant = sep2 == std::string::npos ? "-" : route.substr(sep2 + 1);
-            oss << "epoll_route_requests_total{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\",code=\"2xx\"} "
-                << sample.requests_2xx.load() << "\n";
-            oss << "epoll_route_requests_total{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\",code=\"4xx\"} "
-                << sample.requests_4xx.load() << "\n";
-            oss << "epoll_route_requests_total{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\",code=\"5xx\"} "
-                << sample.requests_5xx.load() << "\n";
-            oss << "epoll_route_latency_seconds_sum{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\"} "
-                << sample.duration_sum.load() << "\n";
-            oss << "epoll_route_latency_seconds_count{route=\"" << route_name << "\",host=\"" << host << "\",tenant=\"" << tenant << "\"} "
-                << sample.duration_count.load() << "\n";
+            const std::string labels = "route=\"" + route_name + "\",host=\"" + host + "\",tenant=\"" + tenant + "\"";
+            oss << "epoll_route_requests_total{" << labels << ",code=\"2xx\"} " << sample.requests_2xx.load() << "\n";
+            oss << "epoll_route_requests_total{" << labels << ",code=\"3xx\"} " << sample.requests_3xx.load() << "\n";
+            oss << "epoll_route_requests_total{" << labels << ",code=\"4xx\"} " << sample.requests_4xx.load() << "\n";
+            oss << "epoll_route_requests_total{" << labels << ",code=\"5xx\"} " << sample.requests_5xx.load() << "\n";
+            oss << "epoll_route_upstream_errors_total{" << labels << "} " << sample.timeout_errors.load() << "\n";
+            oss << "epoll_route_auth_failures_total{" << labels << "} " << sample.auth_failures.load() << "\n";
+            oss << "epoll_route_rate_limit_hits_total{" << labels << "} " << sample.rate_limit_hits.load() << "\n";
+            for (size_t i = 0; i < bucket_boundaries_.size(); ++i) {
+                oss << "epoll_route_request_duration_seconds_bucket{" << labels << ",le=\"" << bucket_boundaries_[i] << "\"} "
+                    << sample.duration_buckets[i].load() << "\n";
+            }
+            oss << "epoll_route_request_duration_seconds_bucket{" << labels << ",le=\"+Inf\"} "
+                << sample.duration_buckets[bucket_boundaries_.size()].load() << "\n";
+            oss << "epoll_route_request_duration_seconds_sum{" << labels << "} " << sample.duration_sum.load() << "\n";
+            oss << "epoll_route_request_duration_seconds_count{" << labels << "} " << sample.duration_count.load() << "\n";
         }
 
         oss << "# EOF\n";

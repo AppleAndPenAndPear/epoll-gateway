@@ -10,10 +10,12 @@ add_executable(runTests
     test_async_upstream.cpp
     test_config_validation.cpp
     test_connection_budget.cpp
+    test_metrics.cpp
     test_tls_context.cpp
     test_tls_utils.cpp
     test_client_tls.cpp
     ${CMAKE_SOURCE_DIR}/src/server/rate_limiter.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/metrics.cpp
     ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
     ${CMAKE_SOURCE_DIR}/src/server/connection_pool.cpp
     ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp

@@ -888,6 +888,13 @@ def test_metrics():
     check("metrics 200", status == 200, "got %s" % status)
     check("request counter metric present", b"epoll_http_requests_total" in body)
     check("latency histogram metric present", b"epoll_http_request_duration_seconds" in body)
+    # Route/host/tenant dimension: the full histogram replaces the old sum/count
+    # pair so per-dimension P95/P99 can be computed, and the specialised
+    # counters expose the failure rate broken down by cause.
+    check("route histogram metric present", b"epoll_route_request_duration_seconds_bucket" in body)
+    check("route histogram has +Inf bucket", b'epoll_route_request_duration_seconds_bucket{' in body and b'le="+Inf"' in body)
+    check("route request counters present", b"epoll_route_requests_total{" in body and b'code="5xx"' in body)
+    check("route upstream-error counter present", b"epoll_route_upstream_errors_total{" in body)
 
 
 def test_chunked():
