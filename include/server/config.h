@@ -182,12 +182,20 @@ struct Config {
         size_t scale_down_threshold = 1;
     } thread_pool;
 
-    // Composite-route fan-out budget: the number of upstream tasks that may run
-    // concurrently, and how many more may wait in the queue before submissions
-    // are rejected with a deterministic 503. These bound the threads and memory
-    // a burst of composite requests can consume. Changes require a restart,
-    // because the executor's worker threads are sized once at startup.
-    size_t upstream_max_inflight = 4;
+    // Upstream-forwarding concurrency budget: the number of upstream round
+    // trips that may run concurrently, and how many more may wait in the queue
+    // before submissions are rejected with a deterministic 503. These bound the
+    // threads and memory a burst of proxied/composite requests can consume.
+    // Changes require a restart, because the executor's worker threads are
+    // sized once at startup.
+    //
+    // The default is 64 so a single upstream is not artificially capped: the
+    // executor enforces a per-upstream-group limit equal to this value, so any
+    // sustained concurrency above it is rejected with 503. 4 (the former
+    // default) meant "at most 4 concurrent requests per upstream", which turned
+    // ordinary proxy load into 503s once the event loop stopped serializing
+    // backend calls.
+    size_t upstream_max_inflight = 64;
     size_t upstream_max_queue = 64;
 
     UpstreamConfig upstream_config;

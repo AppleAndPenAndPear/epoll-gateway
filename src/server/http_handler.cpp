@@ -210,39 +210,6 @@ static std::string to_hex(size_t n) {
     return oss.str();
 }
 
-static HttpResponse run_upstream_task(BoundedAsyncUpstreamExecutor& executor,
-                                      const std::string& upstream_key,
-                                      std::function<HttpResponse()> task) {
-    std::promise<HttpResponse> promise;
-    auto future = promise.get_future();
-
-    const SubmitStatus status = executor.submit(upstream_key, [&promise, task = std::move(task)]() mutable {
-        try {
-            promise.set_value(task());
-        } catch (...) {
-            HttpResponse fallback;
-            fallback.status_code = 502;
-            fallback.status_message = "Bad Gateway";
-            fallback.body = "Bad Gateway";
-            fallback.headers["Content-Type"] = "text/plain";
-            fallback.headers["Content-Length"] = std::to_string(fallback.body.size());
-            promise.set_value(fallback);
-        }
-    });
-
-    if (status != SubmitStatus::Accepted) {
-        HttpResponse fallback;
-        fallback.status_code = 503;
-        fallback.status_message = "Service Unavailable";
-        fallback.body = "Upstream executor is overloaded";
-        fallback.headers["Content-Type"] = "text/plain";
-        fallback.headers["Content-Length"] = std::to_string(fallback.body.size());
-        return fallback;
-    }
-
-    return future.get();
-}
-
 // A ready future for paths that resolve without touching a backend.
 static std::future<json> make_ready_json_future(json value) {
     std::promise<json> promise;
@@ -391,6 +358,9 @@ upstream_manager_(upstream_manager),
 }
 
 HttpHandler::~HttpHandler() {
+    // Composite fan-out still uses the bounded executor; join its workers so no
+    // task can outlive the handler. Single-upstream calls are driven by the
+    // event loop itself and hold no threads of their own.
     upstream_executor_.shutdown();
 }
 
@@ -618,7 +588,7 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                             // No route matched: still hand off to send_response, letting the static-file fallback decide the outcome.
                             Logger::get()->debug("No matching route for {} {} on fd {}", req.method, req.path, fd);
                             last_requests_[sock_ptr] = req;
-                            send_response(sock_ptr, req, resolved);
+                            send_response(sock, req, resolved);
                             parsers_[sock_ptr].reset();
                             continue;
                         }
@@ -680,10 +650,19 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         }
 
                         // Prepare the response (using the request parsed above)
-                        send_response(sock_ptr, req, resolved);
+                        send_response(sock, req, resolved);
 
                         // Reset the parser for the next request
                         parsers_[sock_ptr].reset();
+
+                        // An upstream route is now being driven by the event loop.
+                        // Leave the fd disarmed (EPOLLONESHOT already fired) and
+                        // stop parsing further pipelined requests on this connection:
+                        // complete_exchange() frames and sends the response, then the
+                        // write path picks up any buffered follow-up request.
+                        if (client_upstream_.count(sock_ptr)) {
+                            return;
+                        }
 
                         // ★ Key: break out of the inner loop; handle the next request after sending completes
                         break;
@@ -722,12 +701,9 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                 else { throw_system_error("recv"); }
             }
         }
-        // Re-arm read events (if the connection is still alive)
-        if (!send_queues_[sock_ptr].empty()) {
-            epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
-        } else {
-            epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);
-        }
+        // Re-arm read events (unless an upstream round trip is in flight on this
+        // connection, in which case rearm_reads() leaves the fd disarmed).
+        rearm_reads(sock_ptr);
     } catch (const std::exception& e) {
         Logger::get()->error("Exception in handle_read: {}", e.what());
         cleanup(sock);
@@ -737,7 +713,8 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
     }
 }
 
-void HttpHandler::process_request(Socket* sock_ptr){
+void HttpHandler::process_request(std::shared_ptr<Socket> sock){
+    Socket* sock_ptr = sock.get();
     HttpRequest& req = requests_[sock_ptr];
     // Check the connection header (keys are normalized to lowercase)
     auto it = req.headers.find("connection");
@@ -749,7 +726,7 @@ void HttpHandler::process_request(Socket* sock_ptr){
         keep_alive_[sock_ptr] = true; // HTTP/1.1 defaults to keep-alive
     }
     auto matched = resolve_route(req);
-    send_response(sock_ptr, req, matched); // Prepare the response
+    send_response(sock, req, matched); // Prepare the response
     request_ready_[sock_ptr] = false; // Allow the next request to be parsed
     parsers_[sock_ptr].reset();       // Reset the parser state
 }
@@ -857,93 +834,11 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
     }
 
     if (matched.route->route.target_type == "upstream") {
-        const auto& route = matched.route->route;
-        const std::string upstream_key = resolve_upstream_group_id(route);
-        const auto task = [this, &req, &matched, &client_ip, upstream_key]() -> HttpResponse {
-            HttpResponse local_resp;
-            const auto& route = matched.route->route;
-            const std::string& upstream_name = upstream_key;
-            auto it = config_.upstream_config.upstreams.find(upstream_name);
-            if (it == config_.upstream_config.upstreams.end() || it->second.servers.empty()) {
-                local_resp.status_code = 502;
-                local_resp.status_message = "Bad Gateway";
-                local_resp.body = "Bad Gateway: no upstream server";
-                local_resp.headers["Content-Type"] = "text/plain";
-                local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
-                return local_resp;
-            }
-
-            const auto& server = upstream_manager_.pick_server(upstream_name);
-            if (!upstream_manager_.allow_request(upstream_name, server, route.upstream_target.circuit_recovery_timeout_ms)) {
-                return make_error_response(503, "Service Unavailable", "Upstream circuit is open");
-            }
-
-            BackendResponse be;
-            be.status_code = 502;
-            be.body = "Bad Gateway";
-            be.error = BackendError::ConnectFailed;
-            int attempt_count = 0;
-            UpstreamTlsOptions tls;
-            tls.enable = server.tls;
-            tls.ca_file = server.tls_ca_file;
-            tls.server_name = server.tls_server_name;
-            tls.skip_verify = server.tls_skip_verify;
-            std::unordered_map<std::string, std::string> upstream_headers = req.headers;
-            if (upstream_headers.count("traceparent") == 0) {
-                upstream_headers["traceparent"] = generate_traceparent();
-            }
-            inject_forwarded_headers(upstream_headers, client_ip);
-            while (true) {
-                be = forward_request(server.host, server.port, req.method, req.path,
-                                     upstream_headers, req.body,
-                                     route.upstream_target.timeout_ms,
-                                     config_.max_response_bytes, tls);
-                if (be.error == BackendError::None || attempt_count >= route.upstream_target.max_retries ||
-                    !should_retry_backend_request(req.method, be.error, attempt_count)) {
-                    break;
-                }
-                ++attempt_count;
-            }
-            if (be.error != BackendError::None) {
-                upstream_manager_.record_failure(upstream_name, server, route.upstream_target.circuit_failure_threshold, route.upstream_target.circuit_recovery_timeout_ms);
-                Metrics::instance().record_upstream_error(be.error);
-                const bool timed_out = be.error == BackendError::ConnectTimeout ||
-                                       be.error == BackendError::WriteTimeout ||
-                                       be.error == BackendError::ReadTimeout;
-                return make_error_response(
-                    timed_out ? 504 : 502,
-                    timed_out ? "Gateway Timeout" : "Bad Gateway",
-                    timed_out ? "The upstream service timed out"
-                              : "The upstream service returned an invalid response or could not be reached");
-            }
-            upstream_manager_.record_success(upstream_name, server);
-            local_resp.status_code = be.status_code;
-            local_resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
-            local_resp.body = be.body;
-            auto header_key_lower = [](std::string k) {
-                std::transform(k.begin(), k.end(), k.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                return k;
-            };
-            const std::unordered_set<std::string> conn_tokens = response_connection_tokens(be.headers);
-            for (const auto& [k, v] : be.headers) {
-                // Drop anything carrying a CR/LF in name or value: a bare LF in
-                // an upstream header would let a compromised backend split the
-                // response or inject headers toward the client.
-                if (k.find('\r') != std::string::npos || k.find('\n') != std::string::npos ||
-                    v.find('\r') != std::string::npos || v.find('\n') != std::string::npos) {
-                    Logger::get()->warn("Dropping unsafe upstream response header '{}' (contains CR/LF)", k);
-                    continue;
-                }
-                const std::string lk = header_key_lower(k);
-                if (is_response_hop_by_hop(lk) || conn_tokens.count(lk) != 0) continue;
-                local_resp.headers[k] = v;
-            }
-            local_resp.headers["Content-Length"] = std::to_string(local_resp.body.size());
-            return local_resp;
-        };
-
-        resp = run_upstream_task(upstream_executor_, upstream_key, std::move(task));
+        // Unreachable in practice: send_response() intercepts upstream routes
+        // and dispatches them through start_upstream_async() before calling
+        // here. Kept as a defensive fallback so a direct caller still gets a
+        // framed response instead of an empty one.
+        resp = make_error_response(500, "Internal Server Error", "upstream route dispatched synchronously");
         return;
     }
 
@@ -987,8 +882,9 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
     resp.headers["Content-Length"] = std::to_string(resp.body.size());
 }
 
-void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched){
-    last_requests_[sock] = req;
+void HttpHandler::send_response(std::shared_ptr<Socket> sock, const HttpRequest& req, const ResolvedRoute& matched){
+    Socket* sock_ptr = sock.get();
+    last_requests_[sock_ptr] = req;
     HttpResponse resp;
     resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
     resp.headers["Traceparent"] = req.headers.count("traceparent") ? req.headers.at("traceparent") : generate_traceparent();
@@ -1000,7 +896,15 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
     bool path_handled = false;
 
     if (matched.route) {
-        auto ip_it = client_ip_map_.find(sock);
+        if (matched.route->route.target_type == "upstream") {
+            // Upstream routes are dispatched through the event loop: the
+            // exchange drives the backend socket from this same epoll, so the
+            // call consumes no worker thread while it waits. The response is
+            // framed later, when drive_exchange() sees the exchange finish.
+            start_upstream_exchange(std::move(sock), req, matched);
+            return;
+        }
+        auto ip_it = client_ip_map_.find(sock_ptr);
         const std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "";
         dispatch_route(req, matched, client_ip, resp);
         resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
@@ -1064,7 +968,8 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                     resp.headers["Content-Length"] = std::to_string(resp.body.size());
                     resp.headers["Content-Type"] = "text/html";
                     resp.chunked = false;
-                    goto after_file;
+                    finalize_response(sock_ptr, req, resp, false);
+                    return;
                 }
 
                 // Try to validate an existing cache entry
@@ -1088,7 +993,8 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                         resp.headers["Content-Length"] = std::to_string(resp.body.size());
                         resp.headers["Content-Type"] = "text/html";
                         resp.chunked = false;
-                        goto after_file;
+                        finalize_response(sock_ptr, req, resp, false);
+                        return;
                     }
                 }
             }
@@ -1137,7 +1043,8 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                                     resp.headers["Content-Length"] = std::to_string(resp.body.size());
 
                                     resp.chunked = false;
-                                    goto after_file;  // Jump out of file handling
+                                    finalize_response(sock_ptr, req, resp, false);
+                                    return;
                                 }
                             }
                             std::string compressed;
@@ -1185,7 +1092,8 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                                     resp.headers["Content-Type"] = "text/html";
                                     resp.headers["Content-Length"] = std::to_string(resp.body.size());
                                     resp.chunked = false;
-                                    goto after_file;
+                                    finalize_response(sock_ptr, req, resp, false);
+                                    return;
                                 }
                             }
                             // fd is cached; FdCache owns its lifetime, do not close it
@@ -1199,9 +1107,9 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
                             resp.status_message = "OK";
                             resp.headers["Content-Type"] = get_content_type(path);
                             resp.headers["Content-Length"] = std::to_string(st.st_size);
-                            file_fds_[sock] = file_fd;
-                            file_offsets_[sock] = 0;
-                            file_sizes_[sock] = st.st_size;
+                            file_fds_[sock_ptr] = file_fd;
+                            file_offsets_[sock_ptr] = 0;
+                            file_sizes_[sock_ptr] = st.st_size;
                             resp.body.clear();
                             Logger::get()->debug("Large file via sendfile: {}", path);
                         }
@@ -1216,7 +1124,21 @@ void HttpHandler::send_response(Socket* sock, const HttpRequest& req, const Reso
             }
         }
     } // if (!path_handled)
-after_file:
+
+    finalize_response(sock_ptr, req, resp, already_compressed);
+}
+
+void HttpHandler::finalize_response(Socket* sock, const HttpRequest& req, HttpResponse& resp, bool already_compressed) {
+    // Ensure the trace-correlation headers are present even for responses built
+    // off the event loop (upstream completions) that never ran the
+    // send_response() prologue.
+    if (resp.headers.count("X-Trace-Id") == 0) {
+        resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
+    }
+    if (resp.headers.count("Traceparent") == 0) {
+        resp.headers["Traceparent"] = req.headers.count("traceparent") ? req.headers.at("traceparent") : generate_traceparent();
+    }
+
     if (keep_alive_[sock]) {
         resp.headers["Connection"] = "keep-alive";
     } 
@@ -1293,6 +1215,246 @@ after_file:
     epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
 }
 
+void HttpHandler::start_upstream_exchange(std::shared_ptr<Socket> sock, const HttpRequest& req, const ResolvedRoute& matched) {
+    const GatewayRoute& route = matched.route->route;
+    const std::string upstream_key = resolve_upstream_group_id(route);
+    Socket* sock_ptr = sock.get();
+
+    // Snapshot every value the exchange needs while we are still on the
+    // event-loop thread: `config_` and `routes_` are reassigned in place on a
+    // hot reload, and `matched.route` points into `routes_`, so nothing may be
+    // read once control returns to the loop.
+    const auto up_it = config_.upstream_config.upstreams.find(upstream_key);
+    const bool has_upstream =
+        up_it != config_.upstream_config.upstreams.end() && !up_it->second.servers.empty();
+    if (!has_upstream) {
+        // A route whose upstream group has no servers: answer inline, like the
+        // former synchronous overload/no-server paths did.
+        HttpResponse resp = make_error_response(502, "Bad Gateway", "Bad Gateway: no upstream server");
+        finalize_response(sock_ptr, req, resp, false);
+        return;
+    }
+
+    const auto ip_it = client_ip_map_.find(sock_ptr);
+    const std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "";
+    // Copy the picked server: pick_server() returns a reference into the
+    // manager's config, which reload() can replace underneath us.
+    const UpstreamServer server = upstream_manager_.pick_server(upstream_key);
+    const int circuit_recovery_timeout_ms = route.upstream_target.circuit_recovery_timeout_ms;
+    if (!upstream_manager_.allow_request(upstream_key, server, circuit_recovery_timeout_ms)) {
+        HttpResponse resp = make_error_response(503, "Service Unavailable", "Upstream circuit is open");
+        finalize_response(sock_ptr, req, resp, false);
+        return;
+    }
+
+    auto st = std::make_unique<ExchangeState>();
+    st->client = sock;
+    st->req = req;
+    st->server = server;
+    st->upstream_key = upstream_key;
+    st->max_retries = route.upstream_target.max_retries;
+    st->circuit_failure_threshold = route.upstream_target.circuit_failure_threshold;
+    st->circuit_recovery_timeout_ms = circuit_recovery_timeout_ms;
+    st->params.host = server.host;
+    st->params.port = server.port;
+    st->params.method = req.method;
+    st->params.path = req.path;
+    st->params.headers = req.headers;
+    st->params.body = req.body;
+    st->params.timeout_ms = route.upstream_target.timeout_ms;
+    st->params.max_response_bytes = config_.max_response_bytes;
+    st->params.tls.enable = server.tls;
+    st->params.tls.ca_file = server.tls_ca_file;
+    st->params.tls.server_name = server.tls_server_name;
+    st->params.tls.skip_verify = server.tls_skip_verify;
+    if (st->params.headers.count("traceparent") == 0) {
+        st->params.headers["traceparent"] = generate_traceparent();
+    }
+    inject_forwarded_headers(st->params.headers, client_ip);
+
+    const bool idempotent = st->params.method == "GET" || st->params.method == "HEAD" ||
+                            st->params.method == "OPTIONS";
+    st->ex = std::make_unique<UpstreamExchange>(st->params, idempotent);
+
+    // Publish the exchange BEFORE driving it: the very first step can finish
+    // synchronously (immediate failure) and the completion path looks it up
+    // through this map, so it must already be present.
+    client_upstream_[sock_ptr] = std::move(st);
+    drive_exchange(sock_ptr, 0);
+}
+
+void HttpHandler::drive_exchange(Socket* client, uint32_t events) {
+    auto it = client_upstream_.find(client);
+    if (it == client_upstream_.end()) return;
+    ExchangeState* st = it->second.get();
+
+    const UpstreamExchange::Want want = st->ex->advance(events);
+
+    // Always unregister before re-registering, never mod(): the exchange may
+    // have dropped its previous socket (pooled -> fresh retry) and fd() may now
+    // be a recycled fd number whose old registration was auto-removed by
+    // close(). A stale mod() would then fail with ENOENT, while del()+add() is
+    // correct in every case.
+    if (st->fd >= 0) {
+        epoll_.del(st->fd);
+        upstream_fd_owner_.erase(st->fd);
+        st->fd = -1;
+    }
+    const int upstream_fd = st->ex->fd();
+    if (want != UpstreamExchange::Want::Done && upstream_fd >= 0) {
+        // EPOLLONESHOT so a level-triggered upstream fd cannot re-fire while we
+        // are still processing this event; the fd is disarmed until the next
+        // advance() decides which direction it needs.
+        const uint32_t event = want == UpstreamExchange::Want::Read ? EPOLLIN : EPOLLOUT;
+        epoll_.add(upstream_fd, event | EPOLLONESHOT);
+        upstream_fd_owner_[upstream_fd] = client;
+        st->fd = upstream_fd;
+    }
+
+    if (want == UpstreamExchange::Want::Done) {
+        complete_exchange(client, st);
+    }
+}
+
+void HttpHandler::complete_exchange(Socket* client, ExchangeState* st) {
+    UpstreamExchange* ex = st->ex.get();
+
+    if (ex->succeeded()) {
+        upstream_manager_.record_success(st->upstream_key, st->server);
+        const BackendResponse& be = ex->result();
+        HttpResponse resp;
+        resp.status_code = be.status_code;
+        resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
+        resp.body = be.body;
+        auto header_key_lower = [](std::string k) {
+            std::transform(k.begin(), k.end(), k.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return k;
+        };
+        const std::unordered_set<std::string> conn_tokens = response_connection_tokens(be.headers);
+        for (const auto& [k, v] : be.headers) {
+            // Drop anything carrying a CR/LF in name or value: a bare LF in an
+            // upstream header would let a compromised backend split the response
+            // or inject headers toward the client.
+            if (k.find('\r') != std::string::npos || k.find('\n') != std::string::npos ||
+                v.find('\r') != std::string::npos || v.find('\n') != std::string::npos) {
+                Logger::get()->warn("Dropping unsafe upstream response header '{}' (contains CR/LF)", k);
+                continue;
+            }
+            const std::string lk = header_key_lower(k);
+            if (is_response_hop_by_hop(lk) || conn_tokens.count(lk) != 0) continue;
+            resp.headers[k] = v;
+        }
+        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        // fd() was unregistered by drive_exchange() before we got here, so the
+        // keep-alive socket may now safely go back to the shared pool.
+        ex->reuse_to_pool();
+        finalize_response(client, st->req, resp, false);
+        client_upstream_.erase(client);
+        return;
+    }
+
+    const BackendError error = ex->result().error;
+    upstream_manager_.record_failure(st->upstream_key, st->server,
+                                     st->circuit_failure_threshold, st->circuit_recovery_timeout_ms);
+    Metrics::instance().record_upstream_error(error);
+
+    // Route-level retry: a transient failure on an idempotent method may be
+    // replayed on a fresh connection up to max_retries times.
+    // should_retry_backend_request() additionally caps the total at two tries,
+    // mirroring the former retry loop.
+    if (st->attempt_count < st->max_retries &&
+        should_retry_backend_request(st->req.method, error, st->attempt_count)) {
+        ++st->attempt_count;
+        const bool idempotent = st->params.method == "GET" || st->params.method == "HEAD" ||
+                                st->params.method == "OPTIONS";
+        st->ex = std::make_unique<UpstreamExchange>(st->params, idempotent);
+        drive_exchange(client, 0);
+        return;
+    }
+
+    const bool timed_out = error == BackendError::ConnectTimeout ||
+                           error == BackendError::WriteTimeout ||
+                           error == BackendError::ReadTimeout;
+    HttpResponse resp = make_error_response(
+        timed_out ? 504 : 502,
+        timed_out ? "Gateway Timeout" : "Bad Gateway",
+        timed_out ? "The upstream service timed out"
+                  : "The upstream service returned an invalid response or could not be reached");
+    // finalize_response() reads st->req, so it must run before the state is
+    // erased from the map (which destroys it).
+    finalize_response(client, st->req, resp, false);
+    client_upstream_.erase(client);
+}
+
+void HttpHandler::abort_upstream_for_client(Socket* client) {
+    auto it = client_upstream_.find(client);
+    if (it == client_upstream_.end()) return;
+    ExchangeState* st = it->second.get();
+    if (st->fd >= 0) {
+        epoll_.del(st->fd);
+        upstream_fd_owner_.erase(st->fd);
+        st->fd = -1;
+    }
+    // Dropping the state destroys the upstream socket (closing it, or removing
+    // it from the pool checkout) and frees the snapshotted request. The client
+    // socket is still held by `st->client` until this erase completes.
+    client_upstream_.erase(it);
+}
+
+bool HttpHandler::is_upstream_fd(int fd) const {
+    return upstream_fd_owner_.count(fd) != 0;
+}
+
+void HttpHandler::on_upstream_event(int fd, uint32_t events) {
+    const auto it = upstream_fd_owner_.find(fd);
+    if (it == upstream_fd_owner_.end()) return;
+    drive_exchange(it->second, events);
+}
+
+int HttpHandler::poll_timeout_ms() const {
+    if (client_upstream_.empty()) return 1000;
+    using clock = std::chrono::steady_clock;
+    const clock::time_point now = clock::now();
+    int best = 1000;
+    for (const auto& [client, st] : client_upstream_) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(st->ex->deadline() - now).count();
+        const int ms = remaining < 0 ? 0 : static_cast<int>(remaining);
+        if (ms < best) best = ms;
+    }
+    return best;
+}
+
+void HttpHandler::check_upstream_timeouts() {
+    if (client_upstream_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    // Snapshot the expired clients first: driving an exchange can complete (and
+    // therefore erase) it, which would invalidate an iterator over the map.
+    std::vector<Socket*> expired;
+    expired.reserve(client_upstream_.size());
+    for (const auto& [client, st] : client_upstream_) {
+        if (st->ex->deadline() <= now) expired.push_back(client);
+    }
+    for (Socket* client : expired) {
+        if (client_upstream_.count(client) != 0) drive_exchange(client, 0);
+    }
+}
+
+void HttpHandler::rearm_reads(Socket* sock) {
+    // While an upstream round trip is in flight, leave the fd disarmed: EPOLLONESHOT
+    // has already fired, and re-arming here would let a pipelined second request be
+    // parsed and dispatched while the first is still outstanding, breaking
+    // request/response ordering. complete_exchange() re-arms once the response is framed.
+    if (client_upstream_.count(sock)) return;
+    const int fd = sock->getFd();
+    if (!send_queues_[sock].empty()) {
+        epoll_.mod(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT);
+    } else {
+        epoll_.mod(fd, EPOLLIN | EPOLLET | EPOLLONESHOT);
+    }
+}
+
 void HttpHandler::send_error_response(Socket* sock, int code, const std::string& message,const std::string& allow_methods){
     HttpResponse resp = make_error_response(code, message, message);
     auto req_it = last_requests_.find(sock);
@@ -1357,6 +1519,10 @@ void HttpHandler::cleanup(std::shared_ptr<Socket> sock){
     client_ip_map_.erase(sock_ptr);
     request_start_time_.erase(sock_ptr);
     last_requests_.erase(sock_ptr);
+    // Drop any in-flight upstream round trip for this connection: unregister its
+    // upstream fd and free the snapshotted state. The exchange keeps the client
+    // Socket alive via its own shared_ptr, so it is closed last.
+    abort_upstream_for_client(sock_ptr);
     Logger::get()->info("HttpHandler: connection closed on fd {}", fd);
 }
 
@@ -1601,6 +1767,12 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                 if (!read_bufs_[sock_ptr].empty()) {
                     std::string ip = client_ip_map_[sock_ptr]; // Reuse the IP
                     handle_read(sock, ip);
+                    // A pipelined request may have been handed to an upstream
+                    // exchange; the fd is intentionally left disarmed until
+                    // complete_exchange() delivers its response.
+                    if (client_upstream_.count(sock_ptr)) {
+                        return;
+                    }
                     // Loop again to try sending the newly generated data
                     continue;
                 }
@@ -1662,6 +1834,10 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
 
 bool HttpHandler::has_inflight_work(Socket* sock) const {
     if (sock == nullptr) return false;
+    // An in-flight upstream round trip keeps this connection busy even though its
+    // send queue is still empty; the graceful-shutdown drain must wait for it
+    // rather than close the connection mid-flight.
+    if (client_upstream_.count(sock)) return true;
     const auto rb = read_bufs_.find(sock);
     if (rb != read_bufs_.end() && !rb->second.empty()) return true;
     const auto rr = request_ready_.find(sock);

@@ -9,6 +9,8 @@
 #include "file_cache.h"
 #include <functional>
 #include <map>
+#include <mutex>
+#include <unordered_set>
 #include "fd_cache.h"
 #include "config.h"
 #include "upstream_manager.h"
@@ -16,6 +18,7 @@
 #include "rate_limiter_manager.h"
 #include "api_key_manager.h"
 #include "upstream_async.h"
+#include "http_client.h"
 
 class HttpHandler {
 private:
@@ -33,6 +36,26 @@ private:
         // True when path, Host and Tenant matched but the HTTP method did not; used to return 405.
         bool path_matched = false;
         std::string allow_methods;
+    };
+
+    // One in-flight single-upstream round trip, owned by the event loop.
+    // Everything the exchange touches is snapshotted by value: `config_` and
+    // `routes_` are reassigned in place on a hot reload, and `matched.route`
+    // points into `routes_`, so neither may be read once the request leaves the
+    // current turn. `client` keeps the client Socket alive even if its
+    // connection entry is torn down (idle timeout) while the backend is busy.
+    struct ExchangeState {
+        std::unique_ptr<UpstreamExchange> ex;
+        UpstreamExchange::Params params;
+        int fd = -1;                        // upstream fd currently in epoll, or -1
+        std::shared_ptr<Socket> client;
+        HttpRequest req;
+        UpstreamServer server;
+        std::string upstream_key;
+        int max_retries = 0;
+        int circuit_failure_threshold = 0;
+        int circuit_recovery_timeout_ms = 0;
+        int attempt_count = 0;
     };
 
     Epoll& epoll_;
@@ -58,7 +81,27 @@ private:
     std::string www_root_;      // Document root
     FileCache cache_;   // File cache
 
-    void send_response(Socket* sock, const HttpRequest& req, const ResolvedRoute& matched);
+    void send_response(std::shared_ptr<Socket> sock, const HttpRequest& req, const ResolvedRoute& matched);
+    // Frame + enqueue a fully built response and arm EPOLLOUT. Shared by the
+    // synchronous path and by the upstream completion path.
+    void finalize_response(Socket* sock, const HttpRequest& req, HttpResponse& resp, bool already_compressed = false);
+    // Hand an upstream route to the event loop as a non-blocking UpstreamExchange:
+    // build the snapshotted params, pick a backend, register the upstream fd and
+    // return. The backend round trip consumes no thread while it waits.
+    void start_upstream_exchange(std::shared_ptr<Socket> sock, const HttpRequest& req, const ResolvedRoute& matched);
+    // Drive one step of an exchange owned by `client` and apply the result:
+    // (re)register its upstream fd, or, on Done, unregister it and frame/send the
+    // upstream response (retrying first when the route allows it).
+    void drive_exchange(Socket* client, uint32_t events);
+    void complete_exchange(Socket* client, ExchangeState* st);
+    // Drop an in-flight upstream exchange for a connection that is going away:
+    // unregister its upstream fd and free the state without sending anything.
+    void abort_upstream_for_client(Socket* client);
+    // Re-arm the client fd for reading, unless an upstream round trip is in
+    // flight on this connection (EPOLLONESHOT is intentionally left disarmed
+    // until the response is delivered, so a pipelined second request cannot run
+    // concurrently with the first).
+    void rearm_reads(Socket* sock);
     void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp);
     ResolvedRoute resolve_route(const HttpRequest& req) const;
     void register_default_routes();
@@ -81,7 +124,14 @@ private:
     Config config_;                      // Runtime config snapshot, updatable via reload
 
     UpstreamManager& upstream_manager_;  // Reference used to select backends
-    BoundedAsyncUpstreamExecutor upstream_executor_;             // Bound task queue for async upstream work
+    BoundedAsyncUpstreamExecutor upstream_executor_;             // Bound task queue for composite fan-out
+
+    // ── In-flight upstream round trips (event-loop owned) ──
+    // One entry per client connection with a backend call outstanding, plus a
+    // reverse index so the worker can dispatch an event for an upstream fd
+    // straight to the owning exchange. Both live only on the event-loop thread.
+    std::unordered_map<Socket*, std::unique_ptr<ExchangeState>> client_upstream_;
+    std::unordered_map<int, Socket*> upstream_fd_owner_;
 
     std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // Rate limiter shared across workers
     ApiKeyManager& api_key_manager_;                             // API key authentication
@@ -89,6 +139,7 @@ private:
     // Whether the request requires auth (public routes like static files and /metrics need none)
     bool requires_auth(const HttpRequest& req) const;
     bool should_rate_limit(const HttpRequest& req, const GatewayRoute& route, const std::string& client_ip, const ApiKeyConfig* api_key_cfg) const;
+    // ── Public API ──
 public:
     explicit HttpHandler(Epoll& epoll, const Config& config,UpstreamManager& upstream_manager,ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager);
     ~HttpHandler();
@@ -100,10 +151,22 @@ public:
     bool has_pending_ssl_write(Socket* sock) const;
     void cleanup(std::shared_ptr<Socket> sock);
     // True when the connection still has work to finish: a partially received
-    // request, a parsed request awaiting dispatch, or response data queued
-    // for sending. Used by the graceful-shutdown drain phase.
+    // request, a parsed request awaiting dispatch, response data queued for
+    // sending, or an upstream round trip still in flight. Used by the
+    // graceful-shutdown drain phase.
     bool has_inflight_work(Socket* sock) const;
-    void process_request(Socket* sock_ptr);
+    // True when `fd` is an in-flight upstream socket owned by an exchange.
+    bool is_upstream_fd(int fd) const;
+    // Drives the exchange owning `fd` for the given epoll event mask. Must be
+    // called on the event-loop thread.
+    void on_upstream_event(int fd, uint32_t events);
+    // epoll_wait budget: the nearest upstream idle deadline (capped at 1s) so a
+    // backend timeout is noticed on time even when the loop is otherwise busy.
+    int poll_timeout_ms() const;
+    // Fails exchanges whose idle deadline elapsed. Called by the worker after
+    // every epoll_wait iteration, including the graceful-shutdown drain.
+    void check_upstream_timeouts();
+    void process_request(std::shared_ptr<Socket> sock);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // Register a route: method is "GET", "POST", etc.; path like "/api/hello"
     void addRoute(const GatewayRoute& route, RouteHandler handler);
     std::string extract_api_key(const HttpRequest& req);

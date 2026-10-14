@@ -282,6 +282,11 @@ buys ~40%. The path scales with event-loop threads and barely responds to
 worker/thread-pool size, which points at the single forwarded-request
 round-trip, not at a queue-depth limit.
 
+> The rows above were measured **with the blocking loop still in place**, so the
+> knobs looked inert. With the loop unblocked (the fix below) they do matter, and
+> the `upstream_max_inflight` default has since been raised to 64; the "default
+> 4" row describes the state at profiling time.
+
 ### Finding D — structural cause: the event loop blocks on the upstream round trip
 
 `handle_read` runs on the TcpWorker event-loop thread and processes each
@@ -310,11 +315,92 @@ sockets from the event loop with an `eventfd` wake-up, instead of a blocking
 worker-thread pool), not a tuning flag, so it is listed as follow-up rather
 than applied here.
 
+### Fix — the event loop no longer blocks on the upstream round trip (2026-10-13)
+
+Finding D's minimal fix is applied. Previously `run_upstream_task` submitted the
+backend call to `BoundedAsyncUpstreamExecutor` and then blocked the **event-loop
+thread** on `future.get()`, so a worker served proxied requests strictly one at a
+time. Now the loop hands the round trip to the executor and returns immediately:
+each `HttpHandler` owns an `eventfd`; the worker pushes its finished
+`AsyncUpstreamResult` under a mutex and bumps the eventfd, and the loop drains it
+in `drain_async()` (dispatched by `TcpWorker` when the registered `async_fd`
+becomes readable) to frame and send the response. Every per-connection map stays
+single-threaded on the loop; the worker touches only the mutex-guarded result
+vector and the eventfd, and snapshots `config_`/route fields by value so a
+concurrent `SIGHUP` reload cannot dangle underneath it. While a round trip is in
+flight the client fd is intentionally left disarmed (`EPOLLONESHOT` already
+fired), so a pipelined second request cannot run concurrently with the first.
+
+Measured on the same shared 2-vCPU box (1 worker, single mock backend, `wrk -t1`,
+~4-6 s per run, repeated because the box is noisy — absolute numbers are not
+portable, only the before/after ratio is):
+
+| scenario | before (blocking loop) | after (async loop) |
+|---|---|---|
+| proxy c8 | 589 RPS, p50 9.3 ms, 0 err | ~820-1110 RPS, p50 ~8 ms |
+| proxy c50 | 389 RPS, p50 126 ms, 0 err | ~680-1250 RPS |
+
+Proxy throughput is no longer pinned to `1/upstream_latency`: it grows with client
+concurrency, like the static path. At c50 the residual timeouts/non-2xx come from
+the **single-threaded Python mock** saturating, not the gateway — the mock alone
+reports the same timeouts at c50 (`wrk -c50 http://127.0.0.1:<mock>`), and several
+of them cascade into the gateway's circuit breaker (503).
+
+#### Side effect: the default fan-out budget had to be raised 4 -> 64
+
+`BoundedAsyncUpstreamExecutor` caps each upstream *group* at
+`max_group_inflight_ == upstream_max_inflight`, counting running **and** queued
+tasks. With the old default of 4, unblocking the loop turned "slow under
+concurrency" into "rejected under concurrency": a single upstream served at most
+4 concurrent requests and answered `503 Upstream executor is overloaded` for the
+rest (35% of responses at c8, 54% at c50). The default is now **64** so ordinary
+concurrency is served instead of rejected, at the cost of up to 64 executor
+threads per worker process (fixed at startup).
+
+> Superseded on 2026-10-14: the single-upstream path no longer goes through the
+> executor at all (see the next section), so `upstream_max_inflight` /
+> `upstream_max_queue` now bound **composite** fan-out only. The 64 default is
+> kept; it constrains composite dependency fan-out, not a single upstream.
+
+#### Fixed: the upstream socket is registered in the same epoll (full Finding D, 2026-10-14)
+
+The follow-up above is implemented. The single-upstream round trip is now a
+non-blocking state machine (`UpstreamExchange`, `src/server/http_client.cpp`)
+driven by the worker's own `epoll`. The upstream socket is registered with
+`EPOLLONESHOT` and the loop advances it through connect / TLS handshake / send /
+read on readiness, so **no executor thread is involved and there is no
+per-request thread bound**; concurrency is bounded only by connection fds, not by
+a thread count. Re-arming uses `del()` + `add()` rather than `mod()` (an internal
+retry `close()`s the old fd, which the kernel auto-removes, and the new socket may
+reuse the same fd number). Idle deadlines map to the route's Connect/Write/Read
+timeouts (504 on expiry). The retry rules are unchanged: a pooled connection the
+backend closed before send is retried once on a fresh connection for idempotent
+methods only, and a request whose bytes reached the backend is never retried. The
+`BoundedAsyncUpstreamExecutor` — and with it `upstream_max_inflight` /
+`upstream_max_queue` — now serves composite dependency fan-out only.
+
+**Honest caveat — this box cannot measure the change.** The follow-up is justified
+on structure (one fewer thread per round trip, all per-connection state on the
+loop), not on a throughput win measured here. This is a 2-vCPU shared box with the
+client, gateway and a single-threaded Python mock backend all on it; the mock
+saturates at ~800 RPS on its own (`wrk` direct, no gateway), which is at or below
+the numbers the gateway already reached, and the IDE background load sits around
+2.3. `scripts/benchmark/run_benchmark.sh` runs in that state land inside the
+mock's own noise band (e.g. proxy c50 ~328 RPS, proxy-light c8 ~553 RPS — *below*
+the earlier eventfd rows, consistent with a busy box, not a regression signal). A
+known trade-off: with `num_workers: 1` all upstream I/O now runs on the one loop
+thread, whereas the eventfd path could spill I/O onto a second core; on a 2-core
+box under external load that can lower throughput. The deliverables are the
+removal of the thread bound and the single-threaded-per-connection model; a
+defensible before/after needs a quieter, higher-core host.
+
 ### Reproducing this pass
 
 ```bash
 ./ci.sh build
-# fixture-corrected proxy baseline (no timeouts):
+# fixture-corrected proxy baseline; the box is noisy and the Python mock
+# saturates at c50, so the strict harness may flag c50 proxy timeouts
+# (environment, not a gateway error):
 scripts/benchmark/run_benchmark.sh 8
 # fan-out A/B (edit upstream_max_inflight in the run_benchmark.sh heredoc):
 #   4 vs 64 -> ~+17%
@@ -329,7 +415,12 @@ scripts/benchmark/run_benchmark.sh 8
 - Traefik / KrakenD comparison (binary download blocked on this network).
 - Re-run the nginx proxy comparison with the corrected mock fixture
   (Finding A): the earlier proxy rows are not comparable.
-- Event-driven upstream forwarding to remove the event-loop block on the
-  upstream round trip (Finding D), then re-measure.
+- Fully event-driven upstream forwarding is **done** (2026-10-14): the upstream
+  socket is registered in the same epoll and the round trip runs as a non-blocking
+  state machine on the loop, with no executor thread (see the section above). The
+  before/after was **not** measurable on this shared 2-vCPU box.
+- Re-run the nginx comparison after the fully event-driven upstream change: the
+  earlier proxy rows predate the mock `TCP_NODELAY` fix, the eventfd wake-up and
+  the epoll-registered upstream socket.
 - Per-request log-write share via `logging.access_log_enabled` (access log can
   be turned off independently of AUDIT); not yet isolated with data.

@@ -4,7 +4,29 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-14
+
+### Changed
+
+- **Single-upstream forwarding is now driven by the worker's own epoll, not a per-request executor thread.** The 2026-10-13 `eventfd` fix removed the *event-loop block* but still ran the round trip on a blocking `BoundedAsyncUpstreamExecutor` thread, so proxy concurrency was bounded by the executor's thread count. The round trip is now a non-blocking state machine (`UpstreamExchange` in `src/server/http_client.cpp`): the upstream socket is registered in the same epoll as the client sockets and the loop advances it through `Connect -> Connecting -> TlsHandshake -> Send -> Read -> Done` on readiness, so there is no thread per request and the "thread bound" is gone (the full Finding D design; see [BENCHMARKS.md](BENCHMARKS.md)).
+  - Reasons for the design choices: re-arming uses `del()` + `add()` rather than `mod()`, because an internal retry `close()`s the old fd (which the kernel auto-removes from epoll) and the new socket can reuse the same fd number — `mod()` would then fail with `ENOENT` or silently re-arm a stale registration. Readiness is only consulted after a real event (never a bare `SO_ERROR` read) so an in-progress connect is not mistaken for success. Each phase transition and successful I/O refreshes an idle deadline mapped to the route's Connect/Write/Read timeout (504 on expiry), and both the `epoll_wait` timeout and the reaper call `check_upstream_timeouts()` so a stalled round trip is never left to an unbounded wait.
+  - The safety invariants are unchanged: a pooled connection that the backend closed before send is retried **once** on a fresh connection and only for idempotent methods; a request whose bytes reached the backend is never retried. Bytes past the framed response end are re-checked into the pool as leftover, as before. TLS policy stays part of the pool key.
+  - The `eventfd`, `async_fd`, and the single-upstream use of `BoundedAsyncUpstreamExecutor` are removed; the executor is retained only for composite dependency fan-out, so `upstream_max_inflight` / `upstream_max_queue` now bound composite routes only, not single-upstream routes ([DEPLOYMENT.md](DEPLOYMENT.md) §11 updated).
+
+### Added
+
+- **Concurrent proxy isolation integration case** (`test_concurrent_proxy_isolation` in `tests/integration/run_integration_tests.py`): multiple connections to one upstream route at once each receive their own correct response, asserted for no cross-talk (responses not mis-delivered between connections) and no loss. This is a correctness regression guard for the new loop-driven forwarding, which moved per-connection state onto the same thread.
+
+### Tests
+
+- Unit 144/144, integration 140/140 assertions (2026-10-14). The benchmark comparison for this change is **not** conclusive on this host — see the honest caveat in [BENCHMARKS.md](BENCHMARKS.md); the box is 2 vCPU with a single-threaded Python mock saturating at ~800 RPS and background load ~2.3.
+
 ## 2026-10-13
+
+### Fixed
+
+- **The event loop no longer blocks on an upstream round trip.** `handle_read` runs on the TcpWorker event-loop thread and, for an upstream route, called `run_upstream_task`, which submitted the backend call to `BoundedAsyncUpstreamExecutor` and then **blocked the event-loop thread on `future.get()`** — one worker served proxied requests strictly one at a time, so proxy throughput was pinned to `1/upstream_latency` regardless of client concurrency. Each `HttpHandler` now owns an `eventfd`; the loop hands the round trip to the executor and returns immediately, the worker pushes its finished `AsyncUpstreamResult` under a mutex and bumps the eventfd, and the loop frames and sends it from `drain_async()` (dispatched by `TcpWorker` when the registered `async_fd` becomes readable). Every per-connection map stays single-threaded on the loop; the worker snapshots `config_`/route fields by value (a concurrent SIGHUP reload reassigns them in place) and touches only the mutex-guarded result vector plus the eventfd. A connection with a round trip in flight is left disarmed (`EPOLLONESHOT` already fired), so a pipelined second request cannot run concurrently with the first. Rationale: proxy throughput now grows with client concurrency like the static path (see [BENCHMARKS.md](BENCHMARKS.md), measured ≈1.5-2x at c8/c50 on the shared box).
+- **Default upstream concurrency raised 4 -> 64.** `BoundedAsyncUpstreamExecutor` caps each upstream *group* at `max_group_inflight_ == upstream_max_inflight`, counting running **and** queued tasks. With the pre-fix default of 4 that cap was invisible (the blocking loop serialized requests); once the loop stopped blocking, a single upstream could serve at most 4 concurrent requests and answered `503 Upstream executor is overloaded` for the rest. The default is now 64 so ordinary concurrency is served instead of rejected, at the cost of up to 64 executor threads per worker process (sized once at startup; changing it requires a restart).
 
 ### Added
 

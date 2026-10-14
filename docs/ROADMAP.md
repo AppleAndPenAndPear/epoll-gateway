@@ -244,9 +244,14 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
 - [x] Per-route/host/tenant latency histograms + failure-rate metrics (2026-10-13)
   - The route dimension now exports a full `epoll_route_request_duration_seconds` histogram (`_bucket`/`_sum`/`_count`) with the same bucket boundaries as the global histogram, so per-dimension P95/P99 is available
   - Request counters report 2xx/3xx/4xx/5xx per dimension (failure rate derivable in PromQL) and cause-specific counters (`epoll_route_upstream_errors_total`, `epoll_route_auth_failures_total`, `epoll_route_rate_limit_hits_total`)
-- Current verification: 144/144 unit, 138 integration assertions (2026-10-13)
+- [x] Fully event-driven single-upstream forwarding (2026-10-14)
+  - The single-upstream round trip is now a non-blocking state machine (`UpstreamExchange`) registered in the worker's own epoll, so no executor thread and no per-request thread are involved; concurrency is bounded by connection fds, not thread count
+  - The `eventfd` wake-up path and the single-upstream use of `BoundedAsyncUpstreamExecutor` are removed; the executor (and `upstream_max_inflight`/`upstream_max_queue`) now serve composite fan-out only
+  - New `test_concurrent_proxy_isolation` integration case guards the correctness of the loop-driven forwarding (N simultaneous connections each get their own correct response, no cross-talk or loss)
+  - The throughput before/after could not be measured on this shared 2-vCPU box (a single-threaded mock saturates near the gateway's own rate); the change is justified on structure, not a measured win
+- Current verification: 144/144 unit, 140 integration assertions (2026-10-14)
 
 ### Next in the active sequence
 
-- **Profile the known Nginx throughput gap (do first).** Isolate log-write, buffer-copy and TLS-record costs with flame graphs / syscall counts on the existing bench setup, then re-run the comparison with the same methodology; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
+- **Re-baseline the Nginx throughput gap on a quieter host (do first).** The structural cause behind [BENCHMARKS.md](BENCHMARKS.md) Finding D is closed (eventfd wake-up 2026-10-13, fully event-driven upstream forwarding 2026-10-14). Re-run the comparison against the corrected fixture on a box with more cores and less background load, and isolate any remaining log-write, buffer-copy and TLS-record costs; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
 - **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and all AI-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.

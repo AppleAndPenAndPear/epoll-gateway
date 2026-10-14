@@ -36,6 +36,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -528,6 +529,45 @@ def test_connection_reuse(control_dir):
     check("10 proxied requests succeeded", ok == 10, "%d/10 ok" % ok)
     check("backend connections reused by the pool", new_conns <= 4,
           "%d new backend connections for 10 requests" % new_conns)
+
+
+def test_concurrent_proxy_isolation():
+    print("\n[06c] Concurrent proxied requests: each response matches its own request")
+    # Regression guard for the async upstream path. The event loop no longer
+    # blocks on the backend round trip, so several requests can be in flight on
+    # the same worker at once. Every connection here asks for a distinct path and
+    # the mock echoes back the path it actually saw, so a response delivered to
+    # the wrong connection (or a lost one) shows up as a body that does not carry
+    # this request's own marker.
+    n = 8
+    barrier = threading.Barrier(n)
+    results = [None] * n
+
+    def worker(i):
+        try:
+            conn = http.client.HTTPSConnection(BASE, SERVER_PORT, context=TLS_CTX, timeout=15)
+            barrier.wait(timeout=10)  # release all n requests at the same instant
+            conn.request("GET", "/api/two/parallel-%d" % i)
+            resp = conn.getresponse()
+            results[i] = (resp.status, resp.read())
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - surfaced through the assertion below
+            results[i] = (0, repr(exc).encode())
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = [r[0] if r else None for r in results]
+    check("all concurrent proxied requests returned 200", statuses == [200] * n,
+          "statuses=%r" % statuses)
+
+    mismatched = [i for i, r in enumerate(results)
+                  if not r or r[0] != 200 or (b"/parallel-%d" % i) not in r[1]]
+    check("each response body carries its own request marker", not mismatched,
+          "requests with a wrong/absent marker: %r" % mismatched)
 
 
 def test_profile_composite_route(fail_control_dir):
@@ -1323,6 +1363,7 @@ def main():
         test_404_403()
         test_proxy()
         test_connection_reuse(fail_control_dir)
+        test_concurrent_proxy_isolation()
         test_profile_composite_route(fail_control_dir)
         test_chunked_trailer()
         test_forwarded_headers()

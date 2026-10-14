@@ -142,7 +142,10 @@ void TcpWorker::run(){
   epoll_event evs[MAX_EVENTS];
 
   while (!closed_ && !stop_server_flag.load()) {
-    auto wait_result = epoll_.wait(evs, MAX_EVENTS, 1000);  // 1s timeout, configurable
+    // Wait budget follows the nearest in-flight upstream deadline, so a backend
+    // timeout fires on time even when the loop is otherwise kept busy by other
+    // connections (capped at 1s to keep the periodic maintenance ticking).
+    auto wait_result = epoll_.wait(evs, MAX_EVENTS, handler_.poll_timeout_ms());
     if (!wait_result) {
       // No ready events (timeout or interrupted)
       if (wait_result.interrupted) {
@@ -151,6 +154,7 @@ void TcpWorker::run(){
       if (wait_result.timeout) {
           if (stop_server_flag.load()) break;
           check_timeout();   // Periodic cleanup of expired connections
+          handler_.check_upstream_timeouts();
           continue;
       }
       continue;
@@ -159,11 +163,18 @@ void TcpWorker::run(){
       int fd = evs[i].data.fd;
       if (fd == listen_sock_.getFd()) {
         handle_accept();
+      } else if (handler_.is_upstream_fd(fd)) {
+        // An in-flight backend socket became readable/writable; drive the
+        // exchange that owns it (they share this worker's epoll).
+        handler_.on_upstream_event(fd, evs[i].events);
       } else {
         // update_active is already called in handle_client(); avoid duplicating it here
         handle_client(fd, evs[i].events);
       }
     }
+    // Upstream timeouts are deadline-based, not event-based: check them on every
+    // turn so a silent backend still fails within its configured budget.
+    handler_.check_upstream_timeouts();
     // Even when events keep arriving, check timeouts periodically (under high load epoll_wait may never time out)
     time_t now = time(nullptr);
     if (now - last_timeout_check_ >= 1) {
@@ -199,16 +210,22 @@ void TcpWorker::drain_connections() {
                           shutdown_drain_timeout_, conns_.size());
       break;
     }
-    // Keep processing events so in-flight requests can complete.
-    auto wait_result = epoll_.wait(evs, MAX_EVENTS, 100);
+    // Keep processing events so in-flight requests can complete. Backend fds
+    // share this epoll, so upstream progress must be dispatched here too.
+    auto wait_result = epoll_.wait(evs, MAX_EVENTS, handler_.poll_timeout_ms());
     if (wait_result) {
       for (int i = 0; i < wait_result.event_count; ++i) {
         const int fd = evs[i].data.fd;
-        if (fd != listen_sock_.getFd()) {
+        if (handler_.is_upstream_fd(fd)) {
+          handler_.on_upstream_event(fd, evs[i].events);
+        } else if (fd != listen_sock_.getFd()) {
           handle_client(fd, evs[i].events);
         }
       }
     }
+    // In-flight upstream round trips must still be delivered (or timed out)
+    // during the drain window, otherwise the connection never becomes idle.
+    handler_.check_upstream_timeouts();
     // Phase 2: close connections that are between requests (idle keep-alive)
     // or stuck in handshake; keep those with an in-flight request/response.
     for (auto it = conns_.begin(); it != conns_.end();) {
