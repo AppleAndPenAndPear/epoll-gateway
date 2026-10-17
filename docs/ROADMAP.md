@@ -121,6 +121,8 @@ The comparison in [BENCHMARKS.md](BENCHMARKS.md) established: memory parity, 2.5
 | Month 3 | English README + technical articles published (Juejin/Zhihu/V2EX/HN) | 100+ stars or steady external issues |
 | Month 4~6 | Collect feedback while building P4 | 10+ real users, ≥1 paid/customization intent |
 
+> **Actual progress (2026-10-17).** The Month 1~3 *engineering* goals are met (CI green, benchmark + Nginx comparison table, English README). But the Month-3 outreach item (publish the articles) never started and the Month 4~6 measure (10+ real users, ≥1 paid intent) has not happened — the six-month validation window is now past its midpoint with **zero demand-side signal**. That is the current binding constraint, not the feature surface.
+
 ### How to Gather Market Signals
 
 - Proactively interview nearby companies doing backend/ops/embedded work (5 conversations give real signal)
@@ -249,9 +251,22 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - The `eventfd` wake-up path and the single-upstream use of `BoundedAsyncUpstreamExecutor` are removed; the executor (and `upstream_max_inflight`/`upstream_max_queue`) now serve composite fan-out only
   - New `test_concurrent_proxy_isolation` integration case guards the correctness of the loop-driven forwarding (N simultaneous connections each get their own correct response, no cross-talk or loss)
   - The throughput before/after could not be measured on this shared 2-vCPU box (a single-threaded mock saturates near the gateway's own rate); the change is justified on structure, not a measured win
-- Current verification: 144/144 unit, 140 integration assertions (2026-10-14)
+- Current verification: 144/144 unit, 140 integration assertions (2026-10-17)
+
+### Direction decision (2026-10-17)
+
+Reviewed after the engineering milestones above cleared out. Decision: **keep the API gateway as the stable core and add AI-gateway capability as an optional upper layer** (already the recommendation in [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md)); do **not** pivot the whole product to an AI gateway. The binding constraint is now the demand side, not the feature surface — every remaining unchecked box in §4 is non-engineering (publish, interview). Order: **validate first (low engineering cost, but it costs calendar time), then invest in the AI layer only if a real signal appears.**
 
 ### Next in the active sequence
 
-- **Re-baseline the Nginx throughput gap on a quieter host (do first).** The structural cause behind [BENCHMARKS.md](BENCHMARKS.md) Finding D is closed (eventfd wake-up 2026-10-13, fully event-driven upstream forwarding 2026-10-14). Re-run the comparison against the corrected fixture on a box with more cores and less background load, and isolate any remaining log-write, buffer-copy and TLS-record costs; record evidence in [BENCHMARKS.md](BENCHMARKS.md).
-- **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and all AI-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.
+- **[Now · validation first, low engineering cost] Unblock the demand side before building anything new.**
+  - Publish the first architecture article (draft already in [docs/articles/](articles/)) to Juejin/Zhihu/V2EX/HN — the §3 Month-3 item that never started.
+  - Interview 5 potential users (backend/ops/embedded teams, plus AI-platform teams) — the §3 Month 4~6 signal item that never happened.
+  - Gate for the next step: ≥1 real deployment, or ≥1 concrete paid/customization intent. Zero signal means the feature surface does **not** expand, and the unmet Month 4~6 measure is reported honestly rather than papered over.
+- **[Conditional · only after a concrete AI signal] AI traffic layer — one epic with a dependency order, not three independent features.**
+  1. **Model routing + model-level observability** — smallest change; reuses the existing upstream/circuit/metrics machinery and adds a model-name → provider mapping plus model/token/first-token metrics.
+  2. **SSE / streaming passthrough** — ⚠ the deepest change: today the response path buffers the whole backend response before re-framing it (`forward_request` / `UpstreamExchange`), so low-latency streaming is genuinely not supported yet; this needs a streaming re-frame with end-to-end backpressure, client-disconnect cancellation, and idle/first-token timing.
+  3. **Token / cost quota** — depends on (1) for model identity and on (2) to read usage off the stream; the existing request-level token bucket stays separate, and cost figures are labelled estimates, never billing-grade.
+  The three do not conflict — they compose into one AI layer — but land them **one at a time, each triggered by a concrete user need**; a solo-maintainer "all three at once" branch is exactly the unvalidated big-bang this plan exists to avoid.
+- **[Later pipeline] Re-baseline the Nginx throughput gap on a quieter host.** The structural cause behind [BENCHMARKS.md](BENCHMARKS.md) Finding D is closed (eventfd wake-up 2026-10-13, fully event-driven upstream forwarding 2026-10-14). Re-run the comparison against the corrected fixture on a box with more cores and less background load, and isolate any remaining log-write, buffer-copy and TLS-record costs; record evidence in [BENCHMARKS.md](BENCHMARKS.md). Not on the critical path for commercial validation.
+- **Deferred by decision (do not start without a concrete customer signal).** mTLS to backends, OIDC/JWT, cluster control plane / distributed quotas, and prompt-guardrail / semantic-cache / MCP-gateway features. Each is a large, customer-shaped commitment; the single-node, zero-external-dependency positioning stays intact until a real user requires otherwise.
