@@ -15,12 +15,15 @@ Poller::WaitResult Poller::wait(int fd, Event event, int timeout_ms) {
     while (true) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0) {
+        // A zero timeout is a single non-blocking probe: it must poll once so a
+        // caller can cheaply test a pooled socket for EOF/error. Only a non-zero
+        // budget that has already elapsed short-circuits straight to Timeout.
+        if (remaining <= 0 && timeout_ms != 0) {
             return WaitResult::Timeout;
         }
 
         pollfd descriptor{fd, events, 0};
-        int result = ::poll(&descriptor, 1, static_cast<int>(remaining));
+        int result = ::poll(&descriptor, 1, remaining > 0 ? static_cast<int>(remaining) : 0);
         if (result > 0) {
             if (descriptor.revents & (POLLNVAL | POLLERR)) {
                 return WaitResult::Error;
@@ -35,6 +38,10 @@ Poller::WaitResult Poller::wait(int fd, Event event, int timeout_ms) {
         }
         if (errno != EINTR) {
             return WaitResult::Error;
+        }
+        // A zero timeout must not spin on repeated EINTR.
+        if (timeout_ms == 0) {
+            return WaitResult::Timeout;
         }
     }
 }

@@ -229,8 +229,12 @@ BackendResponse forward_request(const std::string& host, int port,
     const bool idempotent = method == "GET" || method == "HEAD" || method == "OPTIONS";
     // Pool identity includes the verification policy: a session verified for
     // one server name is only reusable by upstreams with the same policy.
+    // The CA file is part of the identity too (matching the SSL_CTX cache key in
+    // get_upstream_ssl_ctx): two upstreams sharing host:port and server name but
+    // trusting different CAs must not hand each other a session verified against
+    // the other's trust store.
     const std::string pool_scheme = !tls.enable ? ""
-        : tls.skip_verify ? "tls/insecure|" : "tls/" + tls.server_name + "|";
+        : tls.skip_verify ? "tls/insecure|" : "tls/" + tls.ca_file + "|" + tls.server_name + "|";
 
     // Two rounds: first try a pooled keep-alive connection (it may have been
     // closed by the backend while idle), then a brand-new connection. Failures
@@ -568,8 +572,10 @@ UpstreamExchange::UpstreamExchange(Params params, bool idempotent)
     result_ = make_error_response(502, BackendError::ConnectFailed, "Bad Gateway");
     // Pool identity includes the verification policy: a session verified for
     // one server name is only reusable by upstreams with the same policy.
+    // The CA file is part of the identity too (matching the SSL_CTX cache key in
+    // get_upstream_ssl_ctx); see forward_request for the rationale.
     pool_scheme_ = !params_.tls.enable ? ""
-        : params_.tls.skip_verify ? "tls/insecure|" : "tls/" + params_.tls.server_name + "|";
+        : params_.tls.skip_verify ? "tls/insecure|" : "tls/" + params_.tls.ca_file + "|" + params_.tls.server_name + "|";
     refresh_deadline();
     if (params_.timeout_ms <= 0) {
         phase_ = Phase::Done;

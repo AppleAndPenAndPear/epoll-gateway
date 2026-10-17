@@ -7,8 +7,8 @@ Building the core capability set of a commercial API gateway. The regression saf
 ## Current Validation
 
 - C++17 Release build passes.
-- Native Google Test suite: 144/144 passing (2026-10-14, `./build/tests/runTests`).
-- Integration tests: 140 assertions passing (2026-10-14, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
+- Native Google Test suite: 144/144 passing (2026-10-17, `./build/tests/runTests`).
+- Integration tests: 140 assertions passing (2026-10-17, `python3 tests/integration/run_integration_tests.py`, launching a real server + mock upstreams).
 - Covered: HTTP parser (incl. smuggling vectors, bare-LF and whitespace-before-colon rejection, full chunked-trailer consumption), file cache, response serialization, routing, security policies, upstream timeouts, retries, health checks, circuit breaker basics, config schema validation (incl. admin section), TLS context hardening (incl. the policy shared with the companion client and its CA/hostname verification settings), upstream TLS (pooled-connection identity separated by verification policy), connection-pool reuse and eviction, upstream health/circuit status snapshots, and route-level metrics (cumulative histogram buckets + failure counters broken down by cause).
 - Integration layer covers TLS (incl. TLS 1.1 refusal and cert hot reload), the companion C++ client (verified request + hostname-mismatch rejection), upstream TLS (verified https:// backend incl. hostname-mismatch rejection, skip-verify escape hatch, pool reuse over TLS), Keep-Alive, Trace-Id, 405+Allow, 404/403, authentication (keys loaded from a separate file), rate limiting, failover, circuit breaking, reload, corrupted-config rejection, /metrics, /healthz + /readyz + /version, probe rate-limit exemption, admin API (auth + stats + upstream status + reload), Chunked (incl. trailer section), connection-pool reuse (10 requests ≤4 backend connections), forwarded headers (`X-Forwarded-Proto`/`X-Forwarded-Host`, spoofed `X-Real-IP` overwritten), hop-by-hop stripping on both hops, upstream-response header-injection rejection, single-pass gzip of an already-encoded backend response, bounded composite fan-out, concurrent proxy isolation (each of N simultaneous connections to one upstream route receives its own correct response, with no cross-talk and no loss), and SIGTERM graceful shutdown (in-flight request completes, new requests refused, clean exit).
 - Benchmark report: [BENCHMARKS.md](BENCHMARKS.md) — P50/P99/QPS across static, proxy, and TLS-handshake scenarios, reproducible via `scripts/benchmark/run_benchmark.sh`.
@@ -159,7 +159,7 @@ Building the core capability set of a commercial API gateway. The regression saf
 - Fully event-driven single-upstream forwarding (2026-10-14): the upstream socket is registered in the worker's epoll and the round trip runs as a non-blocking state machine (`UpstreamExchange`), so no executor thread and no per-request thread are involved; the bounded executor now serves composite fan-out only. Concurrency for single-upstream routes is bounded by connection fds, not thread count.
 - API composition MVP (2026-10-08): composite profile-route fan-out is implemented and validated end-to-end; success and partial-failure paths pass.
 - TLS write path (2026-10-09): SSL WANT_READ/WANT_WRITE re-arms the correct readiness direction; TLS static-file sends retain pending chunks and continue across backpressure; verified by an 8 MiB delayed-reader integration case.
-- Google Test suite currently 144/144 passing (2026-10-14).
+- Google Test suite currently 144/144 passing (2026-10-17).
 - Covered:
 	- HTTP request parsing, incl. request-smuggling vectors (duplicate CL, CL+TE, header characters, line limits)
 	- Query and body

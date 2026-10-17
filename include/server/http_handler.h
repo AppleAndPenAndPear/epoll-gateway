@@ -147,7 +147,6 @@ public:
     void on_connect(Socket* sock);                          // Initialize
     void handle_read(std::shared_ptr<Socket> sock,const std::string& client_ip);         // Handle read events
     void handle_write(std::shared_ptr<Socket> sock);
-    void close_connection(std::shared_ptr<Socket> sock);
     bool has_pending_ssl_write(Socket* sock) const;
     void cleanup(std::shared_ptr<Socket> sock);
     // True when the connection still has work to finish: a partially received
@@ -166,7 +165,6 @@ public:
     // Fails exchanges whose idle deadline elapsed. Called by the worker after
     // every epoll_wait iteration, including the graceful-shutdown drain.
     void check_upstream_timeouts();
-    void process_request(std::shared_ptr<Socket> sock);
     void addRoute(const std::string& method, const std::string& pattern, RouteHandler handler);    // Register a route: method is "GET", "POST", etc.; path like "/api/hello"
     void addRoute(const GatewayRoute& route, RouteHandler handler);
     std::string extract_api_key(const HttpRequest& req);

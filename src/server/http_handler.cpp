@@ -161,7 +161,7 @@ std::string classify_failure_reason(int status_code, const BackendError* error =
     if (status_code == 413) return "payload_too_large";
     if (status_code == 429) return "rate_limited";
     if (status_code == 503) return "upstream_circuit_open";
-    if (status_code == 502) return error == nullptr ? "upstream_unavailable" : "upstream_unavailable";
+    if (status_code == 502) return "upstream_unavailable";
     if (status_code == 504) return "upstream_timeout";
     if (status_code == 500) return "internal_error";
     if (error != nullptr) {
@@ -643,7 +643,9 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         auto it = req.headers.find("connection");
                         if (it != req.headers.end()) {
                             std::string conn = it->second;
-                            std::transform(conn.begin(), conn.end(), conn.begin(), ::tolower);
+                            // ::tolower is UB for bytes >= 0x80; go through unsigned char (project convention).
+                            std::transform(conn.begin(), conn.end(), conn.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                             keep_alive_[sock_ptr] = (conn != "close");
                         } else {
                             keep_alive_[sock_ptr] = true; // HTTP/1.1 defaults to keep-alive
@@ -711,24 +713,6 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
         Logger::get()->error("Unknown exception in handle_read");
         cleanup(sock);
     }
-}
-
-void HttpHandler::process_request(std::shared_ptr<Socket> sock){
-    Socket* sock_ptr = sock.get();
-    HttpRequest& req = requests_[sock_ptr];
-    // Check the connection header (keys are normalized to lowercase)
-    auto it = req.headers.find("connection");
-    if (it != req.headers.end()) {
-        std::string conn = it->second;
-        std::transform(conn.begin(), conn.end(), conn.begin(), ::tolower);
-        keep_alive_[sock_ptr] = (conn == "keep-alive");
-    } else {
-        keep_alive_[sock_ptr] = true; // HTTP/1.1 defaults to keep-alive
-    }
-    auto matched = resolve_route(req);
-    send_response(sock, req, matched); // Prepare the response
-    request_ready_[sock_ptr] = false; // Allow the next request to be parsed
-    parsers_[sock_ptr].reset();       // Reset the parser state
 }
 
 HttpResponse HttpHandler::make_error_response(int code, const std::string& status, const std::string& message) const {
@@ -835,9 +819,10 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
 
     if (matched.route->route.target_type == "upstream") {
         // Unreachable in practice: send_response() intercepts upstream routes
-        // and dispatches them through start_upstream_async() before calling
-        // here. Kept as a defensive fallback so a direct caller still gets a
-        // framed response instead of an empty one.
+        // and dispatches them through start_upstream_exchange() (the event-loop
+        // driven UpstreamExchange) before calling here. Kept as a defensive
+        // fallback so a direct caller still gets a framed response instead of
+        // an empty one.
         resp = make_error_response(500, "Internal Server Error", "upstream route dispatched synchronously");
         return;
     }
@@ -1796,10 +1781,6 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
     }
 }
 
-void HttpHandler::close_connection(std::shared_ptr<Socket> sock){
-    cleanup(sock);
-}
-
 void HttpHandler::addRoute(const std::string& method, const std::string& pattern, RouteHandler handler) {
     GatewayRoute route;
     route.method = method;
@@ -1820,16 +1801,6 @@ void HttpHandler::addRoute(const GatewayRoute& route, RouteHandler handler) {
     route_policy.host = route_policy.host.empty() ? "*" : route_policy.host;
     route_policy.tenant = route_policy.tenant.empty() ? "*" : route_policy.tenant;
     routes_.push_back({route_policy, std::move(handler)});
-}
-
-std::vector<std::string> split(const std::string& s, char delimiter) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(s);
-    while (std::getline(tokenStream, token, delimiter)) {
-        if (!token.empty()) tokens.push_back(token);
-    }
-    return tokens;
 }
 
 bool HttpHandler::has_inflight_work(Socket* sock) const {

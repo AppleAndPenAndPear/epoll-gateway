@@ -4,6 +4,22 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-17
+
+### Fixed
+
+- **The pooled-connection liveness probe was silently a no-op.** `Poller::wait(fd, event, 0)` returned `Timeout` before calling `poll` at all — the elapsed-budget guard `remaining <= 0` fired first for a zero budget — so the 0-timeout readiness check on checkout in both `forward_request` and `UpstreamExchange::open_connection` always concluded "not ready" and used the pooled socket unconditionally. A connection the backend had closed while idle was therefore only discovered at send/read time (surfacing as a wasted round trip or an RST/502) instead of being discarded at checkout, which is what [PROJECT_STATUS.md](PROJECT_STATUS.md) and the architecture note describe. `timeout_ms == 0` now performs exactly one non-blocking `poll` and reports readiness immediately; a non-zero budget that has already elapsed still short-circuits to `Timeout`, and a zero timeout no longer spins on repeated `EINTR`.
+- **Two undefined-behaviour `::tolower` sites.** `std::transform(..., ::tolower)` on a raw `char` is UB for bytes ≥ 0x80. The live `handle_read` connection-header normalization (keep-alive decision) now goes through `unsigned char`, matching the convention already used in `http_parser.cpp`; the second site was in dead code (removed below).
+- **Upstream pool identity now includes the CA file.** The pool key was `tls/<server_name>|` (or `tls/insecure|`), so two upstreams sharing host:port and server name but trusting **different** CA bundles could hand each other a pooled session that had been verified against the other's trust store — a verification-policy mismatch. The key is now `tls/<ca_file>|<server_name>|`, matching the SSL_CTX cache key in `get_upstream_ssl_ctx` (which already partitions by CA file). Narrow in practice (needs a duplicated host:port with a divergent CA), but it restores the documented invariant that pool identity carries the full verification policy.
+
+### Changed
+
+- Removed dead code with no callers in the tree: `HttpHandler::process_request` (a stale duplicate of the `handle_read` keep-alive logic, and the second UB `::tolower` site), `HttpHandler::close_connection` (a one-line `cleanup` wrapper), and the file-local `split()` helper. The redundant `error == nullptr ? "upstream_unavailable" : "upstream_unavailable"` ternary in the 502 code mapper collapsed to a single string literal. No behaviour change.
+
+### Tests
+
+- Unit 144/144, integration 140/140 assertions (2026-10-17). The pool/probe fix is exercised by the existing connection-reuse integration cases.
+
 ## 2026-10-14
 
 ### Changed
