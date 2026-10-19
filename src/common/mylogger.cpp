@@ -34,9 +34,16 @@ void Logger::init(const string& log_file_path){
             
             // production: level set to debug for easier troubleshooting
             logger->set_level(spdlog::level::debug);
-            // flush immediately after every info-or-higher log so `tail -f` shows it in real time
-            // (otherwise the async logger buffers content in the FILE* buffer and low-frequency messages only hit disk at process exit)
-            logger->flush_on(spdlog::level::info);
+            // Flush policy: flushing on every info message put an fflush+write
+            // syscall on the request hot path (AUDIT + access log are info, so
+            // every proxied request paid two disk flushes and dominated P50
+            // latency; see BENCHMARKS.md). Errors and above still flush
+            // immediately; info/warn content is flushed by the periodic
+            // flusher below, so `tail -f` stays near-real-time and graceful
+            // shutdown still flushes everything via spdlog::shutdown(). A hard
+            // crash can lose at most one flush interval of info-level logs.
+            logger->flush_on(spdlog::level::err);
+            spdlog::flush_every(std::chrono::seconds(1));
             logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 
             // 4. register and set as default

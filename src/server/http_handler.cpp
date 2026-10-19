@@ -24,6 +24,7 @@
 #include "gateway_version.h"
 #include <atomic>
 #include <cstdint>
+#include <cstdio>              // needed for std::snprintf
 #include <functional>
 #include <unordered_set>
 using json = nlohmann::json;
@@ -32,6 +33,24 @@ namespace {
 
 std::atomic<uint64_t> g_trace_counter{0};
 std::atomic<uint64_t> g_traceparent_counter{0};
+
+// ASCII-only case mapping for header names: locale-independent, branchless
+// enough, and no libc call per character (profiled hot: std::tolower in the
+// per-response header scan). Bytes >= 0x80 pass through unchanged, which keeps
+// the historical std::tolower-with-unsigned-char semantics for ASCII input.
+inline char ascii_to_lower(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+}
+
+// Case-insensitive ASCII comparison of a header name against a lowercase
+// literal, without allocating a lowercase copy of the name.
+bool iequals_ascii_lower(const std::string& name, const char* lower_literal) {
+    size_t i = 0;
+    for (; i < name.size() && lower_literal[i] != '\0'; ++i) {
+        if (ascii_to_lower(static_cast<unsigned char>(name[i])) != lower_literal[i]) return false;
+    }
+    return i == name.size() && lower_literal[i] == '\0';
+}
 
 // Hop-by-hop response headers that must be consumed by the gateway and never
 // forwarded to the client (RFC 7230 §6.1); Content-Length/Transfer-Encoding
@@ -48,21 +67,33 @@ bool is_response_hop_by_hop(const std::string& lower_name) {
 std::unordered_set<std::string> response_connection_tokens(
         const std::map<std::string, std::string>& headers) {
     std::unordered_set<std::string> tokens;
+    // Only the Connection header contributes tokens; find it with a
+    // case-insensitive compare instead of allocating a lowercase copy of every
+    // header name (profiled hot on the proxy path).
+    const std::string* conn_value = nullptr;
     for (const auto& entry : headers) {
-        std::string key = entry.first;
-        std::transform(key.begin(), key.end(), key.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (key != "connection") continue;
-        std::istringstream stream(entry.second);
-        std::string token;
-        while (std::getline(stream, token, ',')) {
-            const size_t begin = token.find_first_not_of(" \t");
-            const size_t end = token.find_last_not_of(" \t");
-            if (begin == std::string::npos) continue;
-            std::transform(token.begin(), token.end(), token.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            tokens.insert(token.substr(begin, end - begin + 1));
+        if (iequals_ascii_lower(entry.first, "connection")) {
+            conn_value = &entry.second;
+            break;
         }
+    }
+    if (conn_value == nullptr) return tokens;
+    // Split on commas without istringstream; trim and lowercase in place.
+    const std::string& value = *conn_value;
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        size_t comma = value.find(',', pos);
+        if (comma == std::string::npos) comma = value.size();
+        size_t begin = pos;
+        size_t end = comma;
+        while (begin < end && (value[begin] == ' ' || value[begin] == '\t')) ++begin;
+        while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t')) --end;
+        if (begin < end) {
+            std::string token = value.substr(begin, end - begin);
+            for (char& c : token) c = ascii_to_lower(static_cast<unsigned char>(c));
+            tokens.insert(std::move(token));
+        }
+        pos = comma + 1;
     }
     return tokens;
 }
@@ -97,10 +128,12 @@ std::string generate_trace_id() {
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const uint64_t seq = ++g_trace_counter;
-    std::ostringstream oss;
-    oss << std::hex << std::setw(8) << std::setfill('0') << (now_ns & 0xffffffffULL)
-        << std::setw(8) << std::setfill('0') << (seq & 0xffffffffULL);
-    return oss.str();
+    // snprintf instead of ostringstream (profiled hot on the request path).
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%08llx%08llx",
+                  static_cast<unsigned long long>(now_ns & 0xffffffffULL),
+                  static_cast<unsigned long long>(seq & 0xffffffffULL));
+    return std::string(buf, 16);
 }
 
 std::string normalize_trace_id_for_traceparent(const std::string& trace_id) {
@@ -121,9 +154,12 @@ std::string generate_traceparent(const std::string& trace_id = "", const std::st
     const std::string normalized_trace_id = normalize_trace_id_for_traceparent(trace_id.empty() ? generate_trace_id() : trace_id);
     const uint64_t parent_id_seed = std::hash<std::string>{}(dep_name.empty() ? std::string("dependency") : dep_name + ":" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const uint64_t parent_id = parent_id_seed & 0xffffffffffffffffULL;
-    std::ostringstream oss;
-    oss << "00-" << normalized_trace_id << "-" << std::hex << std::setw(16) << std::setfill('0') << parent_id << "-01";
-    return oss.str();
+    // snprintf instead of ostringstream (profiled hot on the request path).
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "00-%s-%016llx-01",
+                  normalized_trace_id.c_str(),
+                  static_cast<unsigned long long>(parent_id));
+    return std::string(buf);
 }
 
 bool is_hex_string(const std::string& value) {
@@ -1018,11 +1054,20 @@ void HttpHandler::finalize_response(Socket* sock, const HttpRequest& req, HttpRe
     resp_size_[sock] = total_bytes;
 
     auto& queue = send_queues_[sock];
-    queue.emplace_back(header_str.begin(), header_str.end());
-
-    // If there is an inline body (error page), put it in the queue as well
-    if (!resp.body.empty()) {
-        queue.emplace_back(resp.body.begin(), resp.body.end());
+    // Coalesce header + small body into a single buffer: one SSL_write (one TLS
+    // record) and one syscall per response instead of one per chunk. Large
+    // bodies keep the two-chunk layout so peak memory stays bounded. HEAD
+    // requests have no body here (cleared above).
+    constexpr size_t kMaxCoalesceBytes = 64 * 1024;
+    const bool has_body = !is_head && !resp.body.empty();
+    if (has_body && resp.body.size() <= kMaxCoalesceBytes) {
+        header_str.append(resp.body);
+        queue.emplace_back(header_str.begin(), header_str.end());
+    } else {
+        queue.emplace_back(header_str.begin(), header_str.end());
+        if (has_body) {
+            queue.emplace_back(resp.body.begin(), resp.body.end());
+        }
     }
 
     // Enable write events
@@ -1327,12 +1372,11 @@ void HttpHandler::finish_child(Socket* client, ExchangeState* st, size_t idx) {
         resp.status_code = be.status_code;
         resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
         resp.body = be.body;
-        auto header_key_lower = [](std::string k) {
-            std::transform(k.begin(), k.end(), k.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            return k;
-        };
         const std::unordered_set<std::string> conn_tokens = response_connection_tokens(be.headers);
+        // One reusable lowercase buffer for all header names of this response;
+        // a fresh std::string per header measured hot (alloc + tolower loop).
+        std::string lk;
+        lk.reserve(48);
         for (const auto& [k, v] : be.headers) {
             // Drop anything carrying a CR/LF in name or value: a bare LF in an
             // upstream header would let a compromised backend split the response
@@ -1342,7 +1386,8 @@ void HttpHandler::finish_child(Socket* client, ExchangeState* st, size_t idx) {
                 Logger::get()->warn("Dropping unsafe upstream response header '{}' (contains CR/LF)", k);
                 continue;
             }
-            const std::string lk = header_key_lower(k);
+            lk.clear();
+            for (char c : k) lk += ascii_to_lower(static_cast<unsigned char>(c));
             if (is_response_hop_by_hop(lk) || conn_tokens.count(lk) != 0) continue;
             resp.headers[k] = v;
         }
@@ -1573,24 +1618,41 @@ void HttpHandler::send_error_response(Socket* sock, int code, const std::string&
 
     std::string header = headers_to_string(resp);
     auto& queue = send_queues_[sock];
+    // Coalesce header + error body into one send chunk (one TLS record/ syscall);
+    // make_error_response bodies are small inline HTML.
+    header.append(resp.body);
+    const size_t total_resp_bytes = header.size();
     queue.emplace_back(header.begin(), header.end());
-    queue.emplace_back(resp.body.begin(), resp.body.end());
 
     resp_status_[sock] = code;
-    resp_size_[sock] = header.size() + resp.body.size();
+    resp_size_[sock] = total_resp_bytes;
 
     int fd = sock->getFd();
     epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
 }
 
 std::string HttpHandler::headers_to_string(const HttpResponse& resp) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 " << resp.status_code << " " << resp.status_message << "\r\n";
+    // Direct string building with one reserve; ostringstream measured hot on
+    // the per-response serialization path.
+    size_t est = 32 + resp.status_message.size() + 4;
     for (const auto& [key, value] : resp.headers) {
-        oss << key << ": " << value << "\r\n";
+        est += key.size() + value.size() + 4;
     }
-    oss << "\r\n";   // Blank line separating headers and body
-    return oss.str();
+    std::string out;
+    out.reserve(est);
+    out += "HTTP/1.1 ";
+    out += std::to_string(resp.status_code);
+    out += ' ';
+    out += resp.status_message;
+    out += "\r\n";
+    for (const auto& [key, value] : resp.headers) {
+        out += key;
+        out += ": ";
+        out += value;
+        out += "\r\n";
+    }
+    out += "\r\n";   // Blank line separating headers and body
+    return out;
 }
 
 void HttpHandler::cleanup(std::shared_ptr<Socket> sock){

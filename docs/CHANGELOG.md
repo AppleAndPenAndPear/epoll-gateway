@@ -6,6 +6,19 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 ## 2026-10-19
 
+### Performance (profile-driven hot-path optimization)
+
+- **Proxy hot path optimization after a `perf` profile under c50 load.** The profile attributed the gap to nginx to four concrete costs, each addressed with a bounded change in [http_handler.cpp](../src/server/http_handler.cpp) / [mylogger.cpp](../src/common/mylogger.cpp):
+  - **Response coalescing**: the send queue received the serialized header and the body as two separate chunks, so every proxied response paid two `SSL_write` calls (two TLS records) and two syscalls. Header and body are now coalesced into a single buffer when the body is ≤ 64 KB (large bodies keep the two-chunk layout to bound peak memory), so a small response is one TLS record and one syscall.
+  - **`headers_to_string` rewritten from `std::ostringstream` to direct string building with a size pre-pass**, and `generate_trace_id` / `generate_traceparent` from ostringstream stream formatting to `snprintf`. All three run once per request.
+  - **Allocation-free response-header filtering**: the per-response scan used to lowercase a copy of *every* upstream header name (one allocation + libc `tolower` per character each) and parsed the `Connection` header through `std::istringstream`. It now uses a case-insensitive ASCII compare against the literal, one reusable lowercase buffer for the whole loop, and manual comma splitting. `ascii_to_lower` keeps the project's unsigned-char convention.
+  - **Log flush policy: `flush_on(info)` → `flush_on(err)` + 1 s periodic flush.** AUDIT and the access log are info-level, so `flush_on(info)` put an `fflush` + write syscall on the hot path *twice per request*; this was the largest fixed per-request latency term found under load. Errors and above still flush immediately, `spdlog::flush_every(1s)` keeps `tail -f` near-real-time, and graceful shutdown flushes everything via `spdlog::shutdown()`. **Behavior change**: a hard crash can now lose up to one second of info-level (AUDIT/access) log lines — previously only the un-flushed stdio buffer could be lost. Request-path AUDIT entries are info-level and rely on the periodic flush; admin AUDIT failure paths are warn/error-level and still flush per message.
+- **Quantitative validation status**: functional proof (unit 137/137, integration 155/155) and `perf` evidence support the changes, but the planned same-conditions re-baseline against nginx could not produce a trustworthy number on the shared 2-vCPU box this sprint: background load from IDE tooling pushed the same binary between ~410 and ~1015 RPS across windows, swamping the measured effect. The re-baseline procedure is unchanged ([BENCHMARKS.md](BENCHMARKS.md)) and should be re-run in a quiet window; absolute values from this window must not be compared with the 2026-09-29 baseline.
+
+### Tests
+
+- Unit 137/137, integration 155/155 (2026-10-19, after the optimization changes).
+
 ### Changed
 
 - **`composite_target.name` now has a runtime effect: it is surfaced as the `aggregate` field of the composite JSON response** (`{"route", "aggregate", "status", "dependencies"}`). Previously the field was required by validation but never read at runtime — the sample configs happened to set it equal to the route name, which masked that it did nothing. `route` continues to identify the matched route (the same value used by metrics and the audit log); `aggregate` identifies the composition itself, so the two can legitimately differ. The non-empty validation is unchanged and is now meaningful.

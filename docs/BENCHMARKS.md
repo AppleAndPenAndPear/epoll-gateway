@@ -470,13 +470,55 @@ loaded pass before quoting.
 - ~~Re-run the nginx proxy comparison with the corrected mock fixture~~ and
   ~~re-run it after the fully event-driven upstream change~~ — **done
   2026-10-19**, see the re-baseline section above (both stale rows replaced).
-- **Profile before optimizing** (new, from the re-baseline fork): flamegraph
-  the proxy path under c50, then attack the top costs — per-request
-  allocations/copies, hot-path log writes, TLS record sizing, allocator.
-  Stop rule: ≤1.5x of nginx on the same scenario.
+- ~~**Profile before optimizing** (new, from the re-baseline fork)~~ — **profiled
+  2026-10-19**, see the optimization-sprint section below; the quantitative
+  ≤1.5x stop-rule check is still pending a quiet benchmark window.
 - **Idle-vs-loaded RSS pass** — the 2026-10-19 RSS sample was taken under
   load and counted one extra pid; re-measure cleanly before quoting either
   number.
 - Per-request log-write share via `logging.access_log_enabled` (access log can
   be turned off independently of AUDIT); not yet isolated with data.
 - Traefik / KrakenD comparison (binary download blocked on this network).
+
+---
+
+# Profile-driven hot-path optimization sprint (2026-10-19)
+
+A `perf record -F 999 -g -p <worker>` capture under the c50 proxy load
+(12,989 samples) attributed the request path's CPU and fixed latency costs.
+Findings and the bounded changes made in response:
+
+| profile evidence | change |
+|---|---|
+| `handle_write` 22% children: every response issued **two `SSL_write` calls** (header chunk + body chunk = two TLS records, two syscalls) | header + body coalesced into one send chunk for bodies ≤ 64 KB ([http_handler.cpp](../src/server/http_handler.cpp) `send_response`) |
+| `malloc`/`_int_free` ≈ 3.5% + `std::tolower` 0.77% + `getline` 0.67%: the per-response header filter allocated a lowercase copy of **every** upstream header name and parsed `Connection` via `istringstream`; `headers_to_string`, `generate_trace_id`, `generate_traceparent` used `ostringstream` | case-insensitive ASCII compare against literals, one reusable lowercase buffer, manual comma split; string building with reserve; `snprintf` for trace IDs |
+| `pthread_cond_signal`/futex + `__GI___write` cluster under spdlog; **`flush_on(info)` meant an `fflush`+write syscall twice per request** (AUDIT + CLF are both info) | flush policy `flush_on(err)` + `spdlog::flush_every(1s)` ([mylogger.cpp](../src/common/mylogger.cpp)) |
+
+TLS itself (~21% children in `SSL_write`+`SSL_read`) and kernel network time
+(~17% in unsymbolized `[k]` frames) are paid by nginx equally and were left
+alone, as was jemalloc (not installed on the box; the project is zero-dependency).
+
+## Validation status: functional yes, quantitative pending
+
+- Unit 137/137, integration 155/155 after all changes.
+- **The planned ≤1.5x-of-nginx stop-rule check did not produce a trustworthy
+  number this sprint.** The shared 2-vCPU box was contended by background IDE
+  tooling (steady ~30% CPU before the sprint; transient load spikes 6-10
+  during runs). The *same binary* measured 414-1015 RPS at c8 across windows;
+  interleaved old-vs-new rounds flipped sign with background load. Absolute
+  numbers from this window must not be compared with the 2026-09-29 baseline.
+- What remains valid: the profile attributions (taken at load 3-4, consistent
+  with the earlier 43 ms / Nagle findings), the removal of the per-request
+  double TLS record and double flush — both are structural per-request costs,
+  not statistical artifacts.
+- Re-run `run_matrix.sh` (same methodology) in a quiet window
+  (`/proc/loadavg` 1-min < 1.5 sustained) to get the stop-rule number.
+
+## Measurement trap (new): self-induced benchmark noise
+
+On a 2-vCPU box, the development IDE's own agent processes and the file
+watcher triggered by large rebuilds (a `-g` build emits a 34 MB binary plus
+hundreds of objects) can consume more CPU than the system under test. Signs:
+`vmstat 1` shows 20%+ sys time with no benchmark running; same-binary RPS
+varies >2x between minutes. Run `vmstat 1` alongside any benchmark and treat
+numbers from contended windows as invalid.
