@@ -627,24 +627,28 @@ HttpResponse HttpHandler::make_error_response(int code, const std::string& statu
 
 HttpHandler::ResolvedRoute HttpHandler::resolve_route(const HttpRequest& req) const {
     ResolvedRoute matched;
+    // Host/tenant are loop-invariant: look them up once, not per route.
+    const auto host_it = req.headers.find("host");
+    const auto tenant_it = req.headers.find("x-tenant-id");
+    const std::string host = host_it == req.headers.end() ? "" : host_it->second;
+    const std::string tenant = tenant_it == req.headers.end() ? "" : tenant_it->second;
     for (const auto& registered : routes_) {
         RouteParams params;
-        const auto host_it = req.headers.find("host");
-        const auto tenant_it = req.headers.find("x-tenant-id");
-        const std::string host = host_it == req.headers.end() ? "" : host_it->second;
-        const std::string tenant = tenant_it == req.headers.end() ? "" : tenant_it->second;
+        // Path/host/tenant match once per route; the method test below reuses
+        // the result instead of re-running the whole path match (routeMatchesPath
+        // used to be evaluated twice per route, per request).
         if (routeMatchesPath(registered.route, host, tenant, req.path, params)) {
             matched.path_matched = true;
-            const std::string method = registered.route.method.empty() ? "*" : registered.route.method;
+            const std::string& method = registered.route.method;
             if (!matched.allow_methods.empty()) {
                 matched.allow_methods += ", ";
             }
-            matched.allow_methods += method;
-        }
-        if (routeMatchesRequest(registered.route, req.method, host, tenant, req.path, params)) {
-            matched.route = &registered;
-            matched.params = std::move(params);
-            return matched;
+            matched.allow_methods += method.empty() ? "*" : method;
+            if (method.empty() || method == "*" || method == req.method) {
+                matched.route = &registered;
+                matched.params = std::move(params);
+                return matched;
+            }
         }
     }
     return matched;

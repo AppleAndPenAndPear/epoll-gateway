@@ -1,11 +1,10 @@
 #pragma once
 #include "config.h"
-#include <vector>
 #include <string>
-#include <sstream>
 #include <map>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 
 inline std::string normalize_header_value(const std::string& value) {
@@ -21,15 +20,22 @@ inline std::string normalize_header_value(const std::string& value) {
     return normalized;
 }
 
-// Split a path, e.g. "/users/123" -> {"users", "123"}
-inline std::vector<std::string> splitPath(const std::string& path, char delimiter = '/') {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(path);
-    while (std::getline(tokenStream, token, delimiter)) {
-        if (!token.empty()) tokens.push_back(token);
-    }
-    return tokens;
+// Advance `pos` to the next non-empty '/'-separated segment of `s`. Returns
+// false once no segment remains; otherwise [*seg, *seg + *len) is the segment.
+// Matching walks the two strings in place instead of splitting them into
+// token vectors: the previous istringstream + std::vector<std::string>
+// splitPath() ran for every route on every request and profiled hot on the
+// request path (istream/locale construction, a vector alloc per segment).
+inline bool next_path_segment(const std::string& s, size_t& pos,
+                              const char*& seg, size_t& len) {
+    while (pos < s.size() && s[pos] == '/') ++pos;
+    if (pos >= s.size()) return false;
+    const size_t slash = s.find('/', pos);
+    const size_t stop = (slash == std::string::npos) ? s.size() : slash;
+    seg = s.data() + pos;
+    len = stop - pos;
+    pos = stop;
+    return true;
 }
 
 // Match a route pattern and extract parameters
@@ -40,21 +46,23 @@ inline bool matchRoute(const std::string& pattern, const std::string& path,std::
         return path.compare(0, prefix.size(), prefix) == 0;
     }
 
-    auto patternParts = splitPath(pattern);
-    auto pathParts = splitPath(path);
-    if (patternParts.size() != pathParts.size()) return false;
-
-    for (size_t i = 0; i < patternParts.size(); ++i) {
-        const std::string& p = patternParts[i];
-        const std::string& actual = pathParts[i];
-        if (!p.empty() && p[0] == '{' && p.back() == '}') {
-            std::string paramName = p.substr(1, p.size() - 2);
-            params[paramName] = actual;
-        } else if (p != actual) {
+    size_t pattern_pos = 0;
+    size_t path_pos = 0;
+    for (;;) {
+        const char* pseg = nullptr;
+        const char* sseg = nullptr;
+        size_t plen = 0;
+        size_t slen = 0;
+        const bool has_pattern = next_path_segment(pattern, pattern_pos, pseg, plen);
+        const bool has_path = next_path_segment(path, path_pos, sseg, slen);
+        if (has_pattern != has_path) return false;  // different segment counts
+        if (!has_pattern) return true;
+        if (plen >= 2 && pseg[0] == '{' && pseg[plen - 1] == '}') {
+            params[std::string(pseg + 1, plen - 2)] = std::string(sseg, slen);
+        } else if (plen != slen || std::memcmp(pseg, sseg, plen) != 0) {
             return false;
         }
     }
-    return true;
 }
 
 inline bool routeMatchesPath(const GatewayRoute& route,
@@ -66,15 +74,17 @@ inline bool routeMatchesPath(const GatewayRoute& route,
         return false;
     }
 
-    std::string expected_host = normalize_header_value(route.host);
-    std::string actual_host = normalize_header_value(host);
-    if (expected_host != "*" && expected_host != actual_host) {
-        return false;
+    // "*" is the default and means "any host/tenant". Skip the lowercase +
+    // port-stripping copies in that (common) case: normalize_header_value
+    // allocates a fresh string, and it ran per route on every request.
+    if (route.host != "*") {
+        const std::string expected_host = normalize_header_value(route.host);
+        if (expected_host != "*" && normalize_header_value(host) != expected_host) {
+            return false;
+        }
     }
 
-    std::string expected_tenant = route.tenant;
-    std::string actual_tenant = tenant;
-    if (expected_tenant != "*" && expected_tenant != actual_tenant) {
+    if (route.tenant != "*" && route.tenant != tenant) {
         return false;
     }
 

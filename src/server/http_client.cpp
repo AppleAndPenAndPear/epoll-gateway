@@ -92,13 +92,27 @@ std::unordered_set<std::string> connection_tokens(
     std::unordered_set<std::string> tokens;
     const auto it = headers.find("connection");
     if (it == headers.end()) return tokens;
-    std::istringstream stream(it->second);
-    std::string token;
-    while (std::getline(stream, token, ',')) {
-        const size_t begin = token.find_first_not_of(" \t");
-        const size_t end = token.find_last_not_of(" \t");
-        if (begin == std::string::npos) continue;
-        tokens.insert(to_lower(token.substr(begin, end - begin + 1)));
+    // Split on commas by hand, not via istringstream+getline: the stream
+    // machinery (locale/istream construction + per-token getline) profiled hot
+    // on the proxy request path. Mirrors response_connection_tokens() in
+    // http_handler.cpp so the two sides cannot drift.
+    const std::string& value = it->second;
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        size_t comma = value.find(',', pos);
+        if (comma == std::string::npos) comma = value.size();
+        size_t begin = pos;
+        size_t end = comma;
+        while (begin < end && (value[begin] == ' ' || value[begin] == '\t')) ++begin;
+        while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t')) --end;
+        if (begin < end) {
+            std::string token = value.substr(begin, end - begin);
+            for (char& c : token) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            tokens.insert(std::move(token));
+        }
+        pos = comma + 1;
     }
     return tokens;
 }
@@ -106,17 +120,34 @@ std::unordered_set<std::string> connection_tokens(
 // Case-insensitive header lookup within the raw header block of a response.
 //find value of header
 std::string find_header_value(const std::string& headers_part, const std::string& name) {
+    const size_t nlen = name.size();
     size_t line_start = headers_part.find("\r\n") + 2;  // skip the status line which includes method,path and version
     while (line_start < headers_part.size()) {
         const size_t line_end = headers_part.find("\r\n", line_start);
-        const size_t count = (line_end == std::string::npos ? headers_part.size() : line_end) - line_start;
-        const std::string line = headers_part.substr(line_start, count);
-        const size_t colon = line.find(':');
-        if (colon != std::string::npos && to_lower(line.substr(0, colon)) == name) {
-            std::string value = line.substr(colon + 1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
-            return to_lower(value);
+        const size_t field_end = (line_end == std::string::npos ? headers_part.size() : line_end);
+        // Field name is compared in place, case-insensitively, without
+        // materializing a lowercase substring of every header: the per-header
+        // substring + to_lower allocation profiled hot on the proxy path.
+        const size_t colon = headers_part.find(':', line_start);
+        if (colon != std::string::npos && colon < field_end && colon - line_start == nlen) {
+            bool match = true;
+            for (size_t i = 0; i < nlen; ++i) {
+                const char c = static_cast<char>(std::tolower(
+                    static_cast<unsigned char>(headers_part[line_start + i])));
+                if (c != name[i]) { match = false; break; }
+            }
+            if (match) {
+                std::string value = headers_part.substr(colon + 1, field_end - colon - 1);
+                const size_t begin = value.find_first_not_of(" \t");
+                if (begin == std::string::npos) return "";
+                const size_t end = value.find_last_not_of(" \t");
+                value.erase(end + 1);
+                value.erase(0, begin);
+                for (char& c : value) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                return value;
+            }
         }
         if (line_end == std::string::npos) break;
         line_start = line_end + 2;
