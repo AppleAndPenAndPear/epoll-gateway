@@ -471,8 +471,9 @@ loaded pass before quoting.
   ~~re-run it after the fully event-driven upstream change~~ — **done
   2026-10-19**, see the re-baseline section above (both stale rows replaced).
 - ~~**Profile before optimizing** (new, from the re-baseline fork)~~ — **profiled
-  2026-10-19**, see the optimization-sprint section below; the quantitative
-  ≤1.5x stop-rule check is still pending a quiet benchmark window.
+  2026-10-19 and the ≤1.5x stop-rule check is now done (negative, ~2.0x)**; the
+  sprint stopped on the candidates-exhausted prong. See the optimization-sprint
+  section below.
 - **Idle-vs-loaded RSS pass** — the 2026-10-19 RSS sample was taken under
   load and counted one extra pid; re-measure cleanly before quoting either
   number.
@@ -498,21 +499,45 @@ TLS itself (~21% children in `SSL_write`+`SSL_read`) and kernel network time
 (~17% in unsymbolized `[k]` frames) are paid by nginx equally and were left
 alone, as was jemalloc (not installed on the box; the project is zero-dependency).
 
-## Validation status: functional yes, quantitative pending
+## Validation: functional yes; stop-rule check negative, candidates exhausted
 
 - Unit 137/137, integration 155/155 after all changes.
-- **The planned ≤1.5x-of-nginx stop-rule check did not produce a trustworthy
-  number this sprint.** The shared 2-vCPU box was contended by background IDE
-  tooling (steady ~30% CPU before the sprint; transient load spikes 6-10
-  during runs). The *same binary* measured 414-1015 RPS at c8 across windows;
-  interleaved old-vs-new rounds flipped sign with background load. Absolute
-  numbers from this window must not be compared with the 2026-09-29 baseline.
-- What remains valid: the profile attributions (taken at load 3-4, consistent
-  with the earlier 43 ms / Nagle findings), the removal of the per-request
-  double TLS record and double flush — both are structural per-request costs,
-  not statistical artifacts.
-- Re-run `run_matrix.sh` (same methodology) in a quiet window
-  (`/proc/loadavg` 1-min < 1.5 sustained) to get the stop-rule number.
+- **A clean-window re-run produced the stop-rule number, and it did not reach
+  ≤1.5x.** Window conditions: `/proc/loadavg` 0.32, `vmstat` idle 78-91%, IDE
+  helper processes renice'd to 19, and three stray gateway instances removed
+  (they had been left SO_REUSEPORT-bound to 8443 — the documented pollution
+  trap). Matrix, medians of 3 interleaved rounds:
+
+| target | c8 RPS | c50 RPS | c8 P50 |
+|---|---|---|---|
+| direct (1 backend) | 1179 | 1623 | 3.9 ms |
+| nginx (4 backends) | 1491 | 1775 | 4.3 ms |
+| **gateway (optimized)** | **744** | **893** | 9.7 ms |
+
+  `gw:nginx` = **~2.0x at both c8 and c50**, above the ≤1.5x stop rule. Against
+  the pre-optimization baseline (608/604 RPS) the optimization moved the
+  gateway up ~20-45% but barely moved the ratio (~2.5x → ~2.0x).
+
+- **Why this capture is read as real despite residual noise.** direct and nginx
+  still swung ±30-90% across rounds (direct c8 665-1722, a 2.6x spread), but the
+  gateway was stable within ±3% (c8 721-772). A load-independent, stable ceiling
+  at ~745 RPS is a *structural* per-request limit, not CPU contention — so the
+  ~2x gap is taken at face value rather than dismissed as noise. The tested
+  binary was verified to be the optimized one (HEAD `02d8e30`, clean tree,
+  rebuilt after source edits).
+
+- **Candidate exhaustion (the stop rule's second prong).** All profile-driven
+  candidates are implemented; the only remaining one, jemalloc, is blocked by
+  the zero-dependency constraint. Per the pre-agreed rule ("≤1.5x, or candidates
+  exhausted"), the sprint stops here with a **negative/inconclusive** verdict on
+  the quantitative pass.
+
+- **What remains valid regardless of the ratio:** the profile attributions, and
+  the removal of the per-request double TLS record and the per-request double log
+  flush — both are structural per-request costs confirmed in the binary, not
+  statistical artifacts. Closing the remaining ~2x gap most likely needs a box
+  with more cores / less background load to separate gateway-path cost from
+  shared-host noise; that is future work, not part of this bounded sprint.
 
 ## Measurement trap (new): self-induced benchmark noise
 
