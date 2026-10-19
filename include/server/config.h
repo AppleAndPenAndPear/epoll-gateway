@@ -70,6 +70,11 @@ struct CompositeDependency {
 struct CompositeTarget {
     std::string name;                       // composite route identifier
     std::vector<CompositeDependency> dependencies;
+    // Overall wall-clock budget for the whole fan-out. 0 disables it (each
+    // dependency is then bounded only by its own timeout_ms). When set, it caps
+    // both how long the caller waits for every dependency and the effective
+    // timeout handed to each backend call (min(dep.timeout_ms, total_timeout_ms)).
+    int total_timeout_ms = 0;
 };
 
 // Gateway route rule: matches the path and carries security policy and execution target
@@ -182,22 +187,6 @@ struct Config {
         size_t scale_down_threshold = 1;
     } thread_pool;
 
-    // Upstream-forwarding concurrency budget: the number of upstream round
-    // trips that may run concurrently, and how many more may wait in the queue
-    // before submissions are rejected with a deterministic 503. These bound the
-    // threads and memory a burst of proxied/composite requests can consume.
-    // Changes require a restart, because the executor's worker threads are
-    // sized once at startup.
-    //
-    // The default is 64 so a single upstream is not artificially capped: the
-    // executor enforces a per-upstream-group limit equal to this value, so any
-    // sustained concurrency above it is rejected with 503. 4 (the former
-    // default) meant "at most 4 concurrent requests per upstream", which turned
-    // ordinary proxy load into 503s once the event loop stopped serializing
-    // backend calls.
-    size_t upstream_max_inflight = 64;
-    size_t upstream_max_queue = 64;
-
     UpstreamConfig upstream_config;
 
     TlsConfig tls;
@@ -235,8 +224,6 @@ struct Config {
         if (config.backlog <= 0) errors.push_back("backlog: must be > 0");
         if (config.max_connections == 0) errors.push_back("max_connections: must be > 0");
         if (config.max_response_bytes == 0) errors.push_back("max_response_bytes: must be > 0");
-        if (config.upstream_max_inflight == 0)
-            errors.push_back("upstream_max_inflight: must be > 0");
         if (config.keepalive_timeout <= 0) errors.push_back("keepalive_timeout: must be > 0");
         if (config.shutdown_drain_timeout <= 0) errors.push_back("shutdown_drain_timeout: must be > 0");
         if (config.logging.sensitive_headers.empty())
@@ -310,6 +297,9 @@ struct Config {
                 }
                 if (r.composite_target.dependencies.empty()) {
                     errors.push_back(at + ".composite_target.dependencies: at least one dependency is required");
+                }
+                if (r.composite_target.total_timeout_ms < 0) {
+                    errors.push_back(at + ".composite_target.total_timeout_ms: must be >= 0 (0 disables the overall deadline)");
                 }
                 for (size_t dep_i = 0; dep_i < r.composite_target.dependencies.size(); ++dep_i) {
                     const auto& dep = r.composite_target.dependencies[dep_i];
@@ -566,16 +556,6 @@ struct Config {
                 config.max_response_bytes = static_cast<size_t>(v);
         }
         {
-            long long v = static_cast<long long>(config.upstream_max_inflight);
-            if (read_int(j, "upstream_max_inflight", 1, 100000, v, ""))
-                config.upstream_max_inflight = static_cast<size_t>(v);
-        }
-        {
-            long long v = static_cast<long long>(config.upstream_max_queue);
-            if (read_int(j, "upstream_max_queue", 0, 1000000, v, ""))
-                config.upstream_max_queue = static_cast<size_t>(v);
-        }
-        {
             long long v = config.keepalive_timeout;
             if (read_int(j, "keepalive_timeout", 1, 86400, v, ""))
                 config.keepalive_timeout = static_cast<int>(v);
@@ -688,6 +668,10 @@ struct Config {
                     if (item.contains("composite_target")) {
                         const auto& ct = item["composite_target"];
                         read_str(ct, "name", r.composite_target.name, "route.composite_target.");
+                        long long total_timeout_ms = r.composite_target.total_timeout_ms;
+                        if (read_int(ct, "total_timeout_ms", 0, 600000, total_timeout_ms, "route.composite_target.")) {
+                            r.composite_target.total_timeout_ms = static_cast<int>(total_timeout_ms);
+                        }
                         if (ct.contains("dependencies") && !ct["dependencies"].is_array()) {
                             errs.push_back("route.composite_target.dependencies: expected an array");
                         } else if (ct.contains("dependencies") && ct["dependencies"].is_array()) {

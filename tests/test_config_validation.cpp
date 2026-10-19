@@ -296,6 +296,47 @@ TEST(ConfigValidationTest, RejectsBadCompositeRoute) {
     EXPECT_TRUE(found);
 }
 
+TEST(ConfigValidationTest, AcceptsCompositeRouteWithTotalDeadline) {
+    Config config;
+    Upstream user_upstream;
+    user_upstream.servers.push_back(UpstreamServer{"127.0.0.1", 8080});
+    config.upstream_config.upstreams["user-service"] = user_upstream;
+
+    GatewayRoute route;
+    route.name = "profile";
+    route.path = "/profile";
+    route.target_type = "composite";
+    route.composite_target.name = "profile";
+    route.composite_target.dependencies.push_back({"user", "user-service", "/me", "GET", true, 1000});
+    route.composite_target.total_timeout_ms = 1500;
+    config.upstream_config.routes.push_back(route);
+
+    EXPECT_TRUE(Config::validate(config).empty());
+}
+
+TEST(ConfigValidationTest, RejectsNegativeCompositeTotalDeadline) {
+    Config config;
+    Upstream user_upstream;
+    user_upstream.servers.push_back(UpstreamServer{"127.0.0.1", 8080});
+    config.upstream_config.upstreams["user-service"] = user_upstream;
+
+    GatewayRoute route;
+    route.name = "profile";
+    route.path = "/profile";
+    route.target_type = "composite";
+    route.composite_target.name = "profile";
+    route.composite_target.dependencies.push_back({"user", "user-service", "/me", "GET", true, 1000});
+    route.composite_target.total_timeout_ms = -1;
+    config.upstream_config.routes.push_back(route);
+
+    std::vector<std::string> errors = Config::validate(config);
+    bool found = false;
+    for (const auto& e : errors) {
+        if (e.find("total_timeout_ms") != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
 TEST(ConfigValidationTest, RejectsBadPathAndEmptyName) {
     Config config;
     GatewayRoute route;
@@ -432,33 +473,17 @@ TEST(FromFileSchemaTest, RejectsZeroMaxResponseBytesFromFile) {
     EXPECT_EQ(config.max_response_bytes, 64u * 1024 * 1024);  // default kept
 }
 
-TEST(ConfigValidationTest, RejectsZeroUpstreamInflight) {
-    // Zero in-flight slots would reject every composite fan-out task.
-    Config config;
-    config.upstream_max_inflight = 0;
-    std::vector<std::string> errors = Config::validate(config);
-    bool found = false;
-    for (const auto& e : errors) {
-        if (e.find("upstream_max_inflight") != std::string::npos) found = true;
-    }
-    EXPECT_TRUE(found);
-}
-
 TEST(FromFileSchemaTest, ParsesResourceBudgetFields) {
     const std::string path = write_temp_config("budget", R"({
         "port": 6001,
         "max_connections": 2048,
-        "max_response_bytes": 1048576,
-        "upstream_max_inflight": 12,
-        "upstream_max_queue": 96
+        "max_response_bytes": 1048576
     })");
     std::vector<std::string> errors;
     Config config = Config::from_file(path, &errors);
     EXPECT_TRUE(errors.empty()) << errors[0];
     EXPECT_EQ(config.max_connections, 2048u);
     EXPECT_EQ(config.max_response_bytes, 1048576u);
-    EXPECT_EQ(config.upstream_max_inflight, 12u);
-    EXPECT_EQ(config.upstream_max_queue, 96u);
 }
 
 TEST(FromFileSchemaTest, RejectsZeroMaxConnectionsFromFile) {

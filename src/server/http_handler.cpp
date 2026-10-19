@@ -24,7 +24,6 @@
 #include "gateway_version.h"
 #include <atomic>
 #include <cstdint>
-#include <future>
 #include <functional>
 #include <unordered_set>
 using json = nlohmann::json;
@@ -210,159 +209,22 @@ static std::string to_hex(size_t n) {
     return oss.str();
 }
 
-// A ready future for paths that resolve without touching a backend.
-static std::future<json> make_ready_json_future(json value) {
-    std::promise<json> promise;
-    promise.set_value(std::move(value));
-    return promise.get_future();
+// A composite dependency that never reached a backend is resolved inline; the
+// event loop only ever drives dependencies with a live UpstreamExchange.
+static std::int64_t composite_elapsed_ms(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count());
 }
-
-static std::future<json> run_composite_dependency(BoundedAsyncUpstreamExecutor& executor,
-                                    UpstreamManager& manager,
-                                    const UpstreamConfig& upstream_cfg,
-                                    const HttpRequest& req,
-                                    const std::string& client_ip,
-                                    const CompositeDependency& dep,
-                                    size_t max_response_bytes) {
-    const auto started = std::chrono::steady_clock::now();
-    json item = json::object();
-    item["required"] = dep.required;
-    item["upstream"] = dep.upstream_name;
-    item["method"] = dep.method;
-    item["path"] = dep.path;
-    item["trace_id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
-    item["traceparent"] = generate_traceparent(item["trace_id"].get<std::string>(), dep.name.empty() ? dep.upstream_name : dep.name);
-    item["attempts"] = 1;
-    item["timed_out"] = false;
-
-    if (dep.upstream_name.empty()) {
-        item["status"] = "unavailable";
-        item["error"] = dep.required ? "missing_upstream" : "optional_dependency_missing";
-        item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started).count());
-        Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={}",
-                            dep.name.empty() ? "<unnamed>" : dep.name,
-                            "unavailable",
-                            dep.required,
-                            item["traceparent"].get<std::string>(),
-                            item["duration_ms"].get<int64_t>());
-        return make_ready_json_future(std::move(item));
-    }
-
-    const auto config_it = upstream_cfg.upstreams.find(dep.upstream_name);
-    if (config_it == upstream_cfg.upstreams.end() || config_it->second.servers.empty()) {
-        item["status"] = "unavailable";
-        item["error"] = dep.required ? "missing_upstream" : "optional_dependency_missing";
-        item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started).count());
-        Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={}",
-                            dep.name.empty() ? "<unnamed>" : dep.name,
-                            "unavailable",
-                            dep.required,
-                            item["traceparent"].get<std::string>(),
-                            item["duration_ms"].get<int64_t>());
-        return make_ready_json_future(std::move(item));
-    }
-
-    // Run the backend call through the shared bounded executor instead of
-    // spawning a detached std::async thread per dependency. Creating one
-    // unbounded thread per dependency is a resource-exhaustion vector under
-    // load; the executor caps concurrency and applies backpressure via
-    // SubmitStatus instead.
-    auto promise = std::make_shared<std::promise<json>>();
-    auto future = promise->get_future();
-    const SubmitStatus status = executor.submit(dep.upstream_name,
-        [&manager, &req, &client_ip, dep, started, item, promise, max_response_bytes]() mutable {
-            try {
-                const auto& server = manager.pick_server(dep.upstream_name);
-                if (!manager.allow_request(dep.upstream_name, server, dep.timeout_ms)) {
-                    item["status"] = "failed";
-                    item["http_status"] = 503;
-                    item["error"] = "circuit_open";
-                } else {
-                    UpstreamTlsOptions tls;
-                    tls.enable = server.tls;
-                    tls.ca_file = server.tls_ca_file;
-                    tls.server_name = server.tls_server_name;
-                    tls.skip_verify = server.tls_skip_verify;
-
-                    std::unordered_map<std::string, std::string> upstream_headers = req.headers;
-                    inject_forwarded_headers(upstream_headers, client_ip);
-
-                    const BackendResponse be = forward_request(server.host, server.port, dep.method, dep.path,
-                                                               upstream_headers, req.body, dep.timeout_ms,
-                                                               max_response_bytes, tls);
-                    if (be.error != BackendError::None) {
-                        const bool timed_out = be.error == BackendError::ConnectTimeout ||
-                                               be.error == BackendError::WriteTimeout ||
-                                               be.error == BackendError::ReadTimeout;
-                        item["status"] = "failed";
-                        item["http_status"] = timed_out ? 504 : 502;
-                        item["error"] = timed_out ? "upstream_timeout" : "upstream_unavailable";
-                        item["timed_out"] = timed_out;
-                    } else {
-                        const bool ok = be.status_code >= 200 && be.status_code < 300;
-                        item["status"] = ok ? "ok" : "failed";
-                        item["http_status"] = be.status_code;
-                        item["backend"] = dep.upstream_name;
-                        item["error"] = ok ? "" : be.body;
-                        item["timed_out"] = be.status_code == 504;
-                        if (ok) item["body"] = be.body;
-                    }
-                }
-            } catch (const std::exception& e) {
-                item["status"] = "failed";
-                item["error"] = std::string("exception: ") + e.what();
-            } catch (...) {
-                item["status"] = "failed";
-                item["error"] = "exception";
-            }
-            item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started).count());
-            Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} http_status={}",
-                                dep.name.empty() ? "<unnamed>" : dep.name,
-                                item["status"].get<std::string>(),
-                                dep.required,
-                                item["traceparent"].get<std::string>(),
-                                item["duration_ms"].get<int64_t>(),
-                                item.value("http_status", 0));
-            promise->set_value(std::move(item));
-        });
-
-    if (status != SubmitStatus::Accepted) {
-        item["status"] = "rejected";
-        item["error"] = dep.required ? "executor_overloaded" : "optional_dependency_rejected";
-        item["duration_ms"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started).count());
-        Logger::get()->warn("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} reason={}",
-                            dep.name.empty() ? "<unnamed>" : dep.name,
-                            "rejected",
-                            dep.required,
-                            item["traceparent"].get<std::string>(),
-                            item["duration_ms"].get<int64_t>(),
-                            item["error"].get<std::string>());
-        return make_ready_json_future(std::move(item));
-    }
-
-    return future;
-}
-
 
 HttpHandler::HttpHandler(Epoll& epoll, const Config& config, UpstreamManager& upstream_manager, ApiKeyManager& api_key_manager, std::shared_ptr<RateLimiterManager> rate_limiter_manager) : epoll_(epoll), www_root_(config.www_root), config_(config), 
 cache_(config.cache_max_entries, config.cache_max_file_size_mb), 
 upstream_manager_(upstream_manager),
-    upstream_executor_(config.upstream_max_inflight, config.upstream_max_queue),
     api_key_manager_(api_key_manager), rate_limiter_manager_(std::move(rate_limiter_manager)) {
     register_default_routes();
     register_configured_routes();
 }
 
-HttpHandler::~HttpHandler() {
-    // Composite fan-out still uses the bounded executor; join its workers so no
-    // task can outlive the handler. Single-upstream calls are driven by the
-    // event loop itself and hold no threads of their own.
-    upstream_executor_.shutdown();
-}
+HttpHandler::~HttpHandler() = default;
 
 void HttpHandler::reload_config(const Config& config) {
     config_ = config;
@@ -660,8 +522,8 @@ void HttpHandler::handle_read(std::shared_ptr<Socket> sock,const std::string& cl
                         // An upstream route is now being driven by the event loop.
                         // Leave the fd disarmed (EPOLLONESHOT already fired) and
                         // stop parsing further pipelined requests on this connection:
-                        // complete_exchange() frames and sends the response, then the
-                        // write path picks up any buffered follow-up request.
+                        // the child completion path frames and sends the response,
+                        // then the write path picks up any buffered follow-up request.
                         if (client_upstream_.count(sock_ptr)) {
                             return;
                         }
@@ -751,7 +613,7 @@ HttpHandler::ResolvedRoute HttpHandler::resolve_route(const HttpRequest& req) co
     return matched;
 }
 
-void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp) {
+void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp) {
     if (!matched.route) {
         resp.status_code = 404;
         resp.status_message = "Not Found";
@@ -767,53 +629,12 @@ void HttpHandler::dispatch_route(const HttpRequest& req, const ResolvedRoute& ma
     }
 
     if (matched.route->route.target_type == "composite") {
-        const auto& route = matched.route->route;
-        json composite = json::object();
-        bool required_failed = false;
-        std::vector<std::future<json>> futures;
-        futures.reserve(route.composite_target.dependencies.size());
-
-        for (const auto& dep : route.composite_target.dependencies) {
-            // Each dependency is dispatched onto the bounded upstream executor,
-            // which caps concurrency and returns a ready "rejected" item when
-            // saturated. No per-request thread is created here.
-            futures.push_back(run_composite_dependency(upstream_executor_, upstream_manager_,
-                                                       config_.upstream_config, req, client_ip, dep,
-                                                       config_.max_response_bytes));
-        }
-
-        for (size_t i = 0; i < route.composite_target.dependencies.size(); ++i) {
-            json item = futures[i].get();
-            const std::string dep_name = route.composite_target.dependencies[i].name;
-            composite[dep_name] = item;
-            if (route.composite_target.dependencies[i].required &&
-                (item["status"] == "failed" || item["status"] == "rejected" || item["status"] == "unavailable")) {
-                required_failed = true;
-            }
-        }
-
-        if (required_failed) {
-            resp.status_code = 503;
-            resp.status_message = "Service Unavailable";
-            resp.headers["Content-Type"] = "application/json";
-            json payload = json::object();
-            payload["route"] = route.name;
-            payload["status"] = "partial_failure";
-            payload["dependencies"] = composite;
-            resp.body = payload.dump();
-            resp.headers["Content-Length"] = std::to_string(resp.body.size());
-            return;
-        }
-
-        resp.status_code = 200;
-        resp.status_message = "OK";
-        resp.headers["Content-Type"] = "application/json";
-        json payload = json::object();
-        payload["route"] = route.name;
-        payload["status"] = "ok";
-        payload["dependencies"] = composite;
-        resp.body = payload.dump();
-        resp.headers["Content-Length"] = std::to_string(resp.body.size());
+        // Unreachable in practice: send_response() intercepts composite routes
+        // and dispatches them through start_composite_exchange() (each dependency
+        // as its own event-loop driven UpstreamExchange) before calling here.
+        // Kept as a defensive fallback so a direct caller still gets a framed
+        // response instead of an empty one.
+        resp = make_error_response(500, "Internal Server Error", "composite route dispatched synchronously");
         return;
     }
 
@@ -885,13 +706,22 @@ void HttpHandler::send_response(std::shared_ptr<Socket> sock, const HttpRequest&
             // Upstream routes are dispatched through the event loop: the
             // exchange drives the backend socket from this same epoll, so the
             // call consumes no worker thread while it waits. The response is
-            // framed later, when drive_exchange() sees the exchange finish.
+            // framed later, when the exchange finishes.
             start_upstream_exchange(std::move(sock), req, matched);
             return;
         }
-        auto ip_it = client_ip_map_.find(sock_ptr);
-        const std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "";
-        dispatch_route(req, matched, client_ip, resp);
+        if (matched.route->route.target_type == "composite") {
+            // Composite routes are dispatched through the event loop too: every
+            // dependency is driven as its own non-blocking UpstreamExchange, so
+            // the fan-out consumes no worker thread while it waits. The aggregate
+            // is framed later, when the last dependency finishes or the overall
+            // deadline fires.
+            auto ip_it = client_ip_map_.find(sock_ptr);
+            const std::string client_ip = (ip_it != client_ip_map_.end()) ? ip_it->second : "";
+            start_composite_exchange(std::move(sock), req, matched, client_ip);
+            return;
+        }
+        dispatch_route(req, matched, resp);
         resp.headers["X-Trace-Id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
         if (resp.headers.count("Traceparent") == 0) {
             resp.headers["Traceparent"] = req.headers.count("traceparent") ? req.headers.at("traceparent") : generate_traceparent();
@@ -1235,31 +1065,34 @@ void HttpHandler::start_upstream_exchange(std::shared_ptr<Socket> sock, const Ht
     auto st = std::make_unique<ExchangeState>();
     st->client = sock;
     st->req = req;
-    st->server = server;
-    st->upstream_key = upstream_key;
-    st->max_retries = route.upstream_target.max_retries;
-    st->circuit_failure_threshold = route.upstream_target.circuit_failure_threshold;
-    st->circuit_recovery_timeout_ms = circuit_recovery_timeout_ms;
-    st->params.host = server.host;
-    st->params.port = server.port;
-    st->params.method = req.method;
-    st->params.path = req.path;
-    st->params.headers = req.headers;
-    st->params.body = req.body;
-    st->params.timeout_ms = route.upstream_target.timeout_ms;
-    st->params.max_response_bytes = config_.max_response_bytes;
-    st->params.tls.enable = server.tls;
-    st->params.tls.ca_file = server.tls_ca_file;
-    st->params.tls.server_name = server.tls_server_name;
-    st->params.tls.skip_verify = server.tls_skip_verify;
-    if (st->params.headers.count("traceparent") == 0) {
-        st->params.headers["traceparent"] = generate_traceparent();
-    }
-    inject_forwarded_headers(st->params.headers, client_ip);
 
-    const bool idempotent = st->params.method == "GET" || st->params.method == "HEAD" ||
-                            st->params.method == "OPTIONS";
-    st->ex = std::make_unique<UpstreamExchange>(st->params, idempotent);
+    auto child = std::make_unique<ChildExchange>();
+    child->server = server;
+    child->upstream_key = upstream_key;
+    child->max_retries = route.upstream_target.max_retries;
+    child->circuit_failure_threshold = route.upstream_target.circuit_failure_threshold;
+    child->circuit_recovery_timeout_ms = circuit_recovery_timeout_ms;
+    child->params.host = server.host;
+    child->params.port = server.port;
+    child->params.method = req.method;
+    child->params.path = req.path;
+    child->params.headers = req.headers;
+    child->params.body = req.body;
+    child->params.timeout_ms = route.upstream_target.timeout_ms;
+    child->params.max_response_bytes = config_.max_response_bytes;
+    child->params.tls.enable = server.tls;
+    child->params.tls.ca_file = server.tls_ca_file;
+    child->params.tls.server_name = server.tls_server_name;
+    child->params.tls.skip_verify = server.tls_skip_verify;
+    if (child->params.headers.count("traceparent") == 0) {
+        child->params.headers["traceparent"] = generate_traceparent();
+    }
+    inject_forwarded_headers(child->params.headers, client_ip);
+
+    const bool idempotent = child->params.method == "GET" || child->params.method == "HEAD" ||
+                            child->params.method == "OPTIONS";
+    child->ex = std::make_unique<UpstreamExchange>(child->params, idempotent);
+    st->children.push_back(std::move(child));
 
     // Publish the exchange BEFORE driving it: the very first step can finish
     // synchronously (immediate failure) and the completion path looks it up
@@ -1268,45 +1101,227 @@ void HttpHandler::start_upstream_exchange(std::shared_ptr<Socket> sock, const Ht
     drive_exchange(sock_ptr, 0);
 }
 
+void HttpHandler::start_composite_exchange(std::shared_ptr<Socket> sock, const HttpRequest& req,
+                                           const ResolvedRoute& matched, const std::string& client_ip) {
+    Socket* sock_ptr = sock.get();
+
+    // Snapshot the whole dependency list, the route name and the optional overall
+    // deadline while we are still on the event-loop thread: after this returns we
+    // are back on the loop, and a hot reload clears and rebuilds `routes_`, so
+    // `matched.route` must not be read again.
+    const GatewayRoute& route = matched.route->route;
+    auto st = std::make_unique<ExchangeState>();
+    st->client = sock;
+    st->req = req;
+    st->client_ip = client_ip;
+    st->composite = true;
+    st->route_name = route.name;
+    st->started = std::chrono::steady_clock::now();
+    st->total_timeout_ms = route.composite_target.total_timeout_ms;
+    st->has_total_deadline = st->total_timeout_ms > 0;
+    st->total_deadline = st->started + std::chrono::milliseconds(st->total_timeout_ms);
+
+    const int failure_threshold = route.upstream_target.circuit_failure_threshold;
+    const std::size_t max_response_bytes = config_.max_response_bytes;
+    std::vector<std::size_t> live;
+
+    for (const auto& dep : route.composite_target.dependencies) {
+        auto child = std::make_unique<ChildExchange>();
+        child->name = dep.name;
+        child->required = dep.required;
+        child->upstream_key = dep.upstream_name;
+
+        json item = json::object();
+        item["required"] = dep.required;
+        item["upstream"] = dep.upstream_name;
+        item["method"] = dep.method;
+        item["path"] = dep.path;
+        item["trace_id"] = req.trace_id.empty() ? generate_trace_id() : req.trace_id;
+        item["traceparent"] = generate_traceparent(item["trace_id"].get<std::string>(),
+                                                   dep.name.empty() ? dep.upstream_name : dep.name);
+        item["attempts"] = 1;
+        item["timed_out"] = false;
+        child->item = std::move(item);
+
+        const auto config_it = config_.upstream_config.upstreams.find(dep.upstream_name);
+        if (dep.upstream_name.empty() ||
+            config_it == config_.upstream_config.upstreams.end() ||
+            config_it->second.servers.empty()) {
+            child->item["status"] = "unavailable";
+            child->item["error"] = dep.required ? "missing_upstream" : "optional_dependency_missing";
+            child->item["duration_ms"] = composite_elapsed_ms(st->started);
+            child->finished = true;
+            Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={}",
+                                dep.name.empty() ? "<unnamed>" : dep.name, "unavailable", dep.required,
+                                child->item["traceparent"].get<std::string>(),
+                                child->item["duration_ms"].get<std::int64_t>());
+            st->children.push_back(std::move(child));
+            continue;
+        }
+
+        // Copy the picked server: pick_server() returns a reference into the
+        // manager's config, which reload() can replace underneath us.
+        const UpstreamServer server = upstream_manager_.pick_server(dep.upstream_name);
+        child->server = server;
+        child->circuit_failure_threshold = failure_threshold;
+        // Recovery timeout mirrors the former allow_request() call, which used
+        // the dependency's own timeout; kept as-is for behavioural parity.
+        child->circuit_recovery_timeout_ms = dep.timeout_ms;
+        if (!upstream_manager_.allow_request(dep.upstream_name, server, dep.timeout_ms)) {
+            child->item["status"] = "failed";
+            child->item["http_status"] = 503;
+            child->item["error"] = "circuit_open";
+            child->item["duration_ms"] = composite_elapsed_ms(st->started);
+            child->finished = true;
+            Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} http_status={}",
+                                dep.name.empty() ? "<unnamed>" : dep.name, "failed", dep.required,
+                                child->item["traceparent"].get<std::string>(),
+                                child->item["duration_ms"].get<std::int64_t>(), 503);
+            st->children.push_back(std::move(child));
+            continue;
+        }
+
+        // Deadline propagation: the backend call may not outlive the overall
+        // budget, so it gets the smaller of its own timeout and the budget.
+        const int effective_timeout_ms = st->has_total_deadline
+            ? std::min(dep.timeout_ms, st->total_timeout_ms)
+            : dep.timeout_ms;
+        child->params.host = server.host;
+        child->params.port = server.port;
+        child->params.method = dep.method;
+        child->params.path = dep.path;
+        child->params.headers = req.headers;
+        child->params.body = req.body;
+        child->params.timeout_ms = effective_timeout_ms;
+        child->params.max_response_bytes = max_response_bytes;
+        child->params.tls.enable = server.tls;
+        child->params.tls.ca_file = server.tls_ca_file;
+        child->params.tls.server_name = server.tls_server_name;
+        child->params.tls.skip_verify = server.tls_skip_verify;
+        if (child->params.headers.count("traceparent") == 0) {
+            child->params.headers["traceparent"] = child->item["traceparent"].get<std::string>();
+        }
+        inject_forwarded_headers(child->params.headers, client_ip);
+
+        const bool idempotent = dep.method == "GET" || dep.method == "HEAD" || dep.method == "OPTIONS";
+        child->ex = std::make_unique<UpstreamExchange>(child->params, idempotent);
+        live.push_back(st->children.size());
+        st->children.push_back(std::move(child));
+    }
+
+    client_upstream_[sock_ptr] = std::move(st);
+
+    if (live.empty()) {
+        // Every dependency resolved inline (missing upstream or open circuit);
+        // frame the aggregate without ever touching a backend socket.
+        finalize_composite(sock_ptr, client_upstream_[sock_ptr].get());
+        return;
+    }
+
+    // Drive each live child once: the first advance() may complete synchronously
+    // (e.g. an immediate connect failure), and finishing the last child erases
+    // the state, so re-check the map on every step.
+    for (std::size_t idx : live) {
+        auto it = client_upstream_.find(sock_ptr);
+        if (it == client_upstream_.end()) return;
+        drive_child(sock_ptr, it->second.get(), idx, 0);
+    }
+}
+
 void HttpHandler::drive_exchange(Socket* client, uint32_t events) {
     auto it = client_upstream_.find(client);
     if (it == client_upstream_.end()) return;
-    ExchangeState* st = it->second.get();
+    drive_child(client, it->second.get(), 0, events);
+}
 
-    const UpstreamExchange::Want want = st->ex->advance(events);
+void HttpHandler::drive_child(Socket* client, ExchangeState* st, size_t idx, uint32_t events) {
+    ChildExchange& ch = *st->children[idx];
+    if (!ch.ex) return;
+
+    const UpstreamExchange::Want want = ch.ex->advance(events);
 
     // Always unregister before re-registering, never mod(): the exchange may
     // have dropped its previous socket (pooled -> fresh retry) and fd() may now
     // be a recycled fd number whose old registration was auto-removed by
     // close(). A stale mod() would then fail with ENOENT, while del()+add() is
     // correct in every case.
-    if (st->fd >= 0) {
-        epoll_.del(st->fd);
-        upstream_fd_owner_.erase(st->fd);
-        st->fd = -1;
+    if (ch.fd >= 0) {
+        epoll_.del(ch.fd);
+        upstream_fd_owner_.erase(ch.fd);
+        ch.fd = -1;
     }
-    const int upstream_fd = st->ex->fd();
+    const int upstream_fd = ch.ex->fd();
     if (want != UpstreamExchange::Want::Done && upstream_fd >= 0) {
         // EPOLLONESHOT so a level-triggered upstream fd cannot re-fire while we
         // are still processing this event; the fd is disarmed until the next
         // advance() decides which direction it needs.
         const uint32_t event = want == UpstreamExchange::Want::Read ? EPOLLIN : EPOLLOUT;
         epoll_.add(upstream_fd, event | EPOLLONESHOT);
-        upstream_fd_owner_[upstream_fd] = client;
-        st->fd = upstream_fd;
+        upstream_fd_owner_[upstream_fd] = {client, idx};
+        ch.fd = upstream_fd;
     }
 
     if (want == UpstreamExchange::Want::Done) {
-        complete_exchange(client, st);
+        finish_child(client, st, idx);
     }
 }
 
-void HttpHandler::complete_exchange(Socket* client, ExchangeState* st) {
-    UpstreamExchange* ex = st->ex.get();
+void HttpHandler::finish_child(Socket* client, ExchangeState* st, size_t idx) {
+    ChildExchange& ch = *st->children[idx];
+    UpstreamExchange* ex = ch.ex.get();
+    const BackendResponse& be = ex->result();
+
+    // Record the circuit outcome for every backend call, single or composite, so
+    // composite traffic feeds the breaker the same way single-upstream traffic
+    // does.
+    if (ex->succeeded()) {
+        upstream_manager_.record_success(ch.upstream_key, ch.server);
+    } else {
+        upstream_manager_.record_failure(ch.upstream_key, ch.server,
+                                         ch.circuit_failure_threshold, ch.circuit_recovery_timeout_ms);
+        Metrics::instance().record_upstream_error(be.error);
+    }
+
+    if (st->composite) {
+        ch.item["duration_ms"] = composite_elapsed_ms(st->started);
+        if (ex->succeeded()) {
+            const bool ok = be.status_code >= 200 && be.status_code < 300;
+            ch.item["status"] = ok ? "ok" : "failed";
+            ch.item["http_status"] = be.status_code;
+            ch.item["backend"] = ch.upstream_key;
+            ch.item["error"] = ok ? "" : be.body;
+            ch.item["timed_out"] = be.status_code == 504;
+            if (ok) ch.item["body"] = be.body;
+        } else {
+            const bool timed_out = be.error == BackendError::ConnectTimeout ||
+                                   be.error == BackendError::WriteTimeout ||
+                                   be.error == BackendError::ReadTimeout;
+            ch.item["status"] = "failed";
+            ch.item["http_status"] = timed_out ? 504 : 502;
+            ch.item["error"] = timed_out ? "upstream_timeout" : "upstream_unavailable";
+            ch.item["timed_out"] = timed_out;
+        }
+        Logger::get()->info("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} http_status={}",
+                            ch.name.empty() ? "<unnamed>" : ch.name,
+                            ch.item["status"].get<std::string>(), ch.required,
+                            ch.item["traceparent"].get<std::string>(),
+                            ch.item["duration_ms"].get<std::int64_t>(),
+                            ch.item.value("http_status", 0));
+        ch.finished = true;
+        if (ch.fd >= 0) {
+            epoll_.del(ch.fd);
+            upstream_fd_owner_.erase(ch.fd);
+            ch.fd = -1;
+        }
+        ch.ex.reset();
+        for (const auto& c : st->children) {
+            if (!c->finished) return;
+        }
+        finalize_composite(client, st);
+        return;
+    }
 
     if (ex->succeeded()) {
-        upstream_manager_.record_success(st->upstream_key, st->server);
-        const BackendResponse& be = ex->result();
         HttpResponse resp;
         resp.status_code = be.status_code;
         resp.status_message = be.status_code >= 200 && be.status_code < 300 ? "OK" : "Upstream Response";
@@ -1331,7 +1346,7 @@ void HttpHandler::complete_exchange(Socket* client, ExchangeState* st) {
             resp.headers[k] = v;
         }
         resp.headers["Content-Length"] = std::to_string(resp.body.size());
-        // fd() was unregistered by drive_exchange() before we got here, so the
+        // fd() was unregistered by drive_child() before we got here, so the
         // keep-alive socket may now safely go back to the shared pool.
         ex->reuse_to_pool();
         finalize_response(client, st->req, resp, false);
@@ -1339,22 +1354,18 @@ void HttpHandler::complete_exchange(Socket* client, ExchangeState* st) {
         return;
     }
 
-    const BackendError error = ex->result().error;
-    upstream_manager_.record_failure(st->upstream_key, st->server,
-                                     st->circuit_failure_threshold, st->circuit_recovery_timeout_ms);
-    Metrics::instance().record_upstream_error(error);
-
+    const BackendError error = be.error;
     // Route-level retry: a transient failure on an idempotent method may be
     // replayed on a fresh connection up to max_retries times.
     // should_retry_backend_request() additionally caps the total at two tries,
     // mirroring the former retry loop.
-    if (st->attempt_count < st->max_retries &&
-        should_retry_backend_request(st->req.method, error, st->attempt_count)) {
-        ++st->attempt_count;
-        const bool idempotent = st->params.method == "GET" || st->params.method == "HEAD" ||
-                                st->params.method == "OPTIONS";
-        st->ex = std::make_unique<UpstreamExchange>(st->params, idempotent);
-        drive_exchange(client, 0);
+    if (ch.attempt_count < ch.max_retries &&
+        should_retry_backend_request(st->req.method, error, ch.attempt_count)) {
+        ++ch.attempt_count;
+        const bool idempotent = ch.params.method == "GET" || ch.params.method == "HEAD" ||
+                                ch.params.method == "OPTIONS";
+        ch.ex = std::make_unique<UpstreamExchange>(ch.params, idempotent);
+        drive_child(client, st, idx, 0);
         return;
     }
 
@@ -1372,17 +1383,70 @@ void HttpHandler::complete_exchange(Socket* client, ExchangeState* st) {
     client_upstream_.erase(client);
 }
 
+void HttpHandler::force_finish_child(ExchangeState* st, size_t idx) {
+    ChildExchange& ch = *st->children[idx];
+    if (ch.finished) return;
+    // Unregister and release the exchange: the overall deadline fired while this
+    // backend was still in flight. The blocking forward_request this replaces
+    // cannot be interrupted mid-syscall, so the deadline's job is to stop the
+    // event loop waiting for it, not to abort the socket call.
+    if (ch.fd >= 0) {
+        epoll_.del(ch.fd);
+        upstream_fd_owner_.erase(ch.fd);
+        ch.fd = -1;
+    }
+    ch.ex.reset();
+    ch.item["status"] = "failed";
+    ch.item["http_status"] = 504;
+    ch.item["error"] = "upstream_timeout";
+    ch.item["timed_out"] = true;
+    ch.item["duration_ms"] = composite_elapsed_ms(st->started);
+    ch.finished = true;
+    Logger::get()->warn("COMPOSITE dependency={} status={} required={} traceparent={} duration_ms={} reason=total_deadline_exceeded",
+                        ch.name.empty() ? "<unnamed>" : ch.name, "failed", ch.required,
+                        ch.item["traceparent"].get<std::string>(),
+                        ch.item["duration_ms"].get<std::int64_t>());
+}
+
+void HttpHandler::finalize_composite(Socket* client, ExchangeState* st) {
+    json composite = json::object();
+    bool required_failed = false;
+    for (const auto& ch : st->children) {
+        composite[ch->name] = ch->item;
+        const std::string status = ch->item.value("status", "");
+        if (ch->required && (status == "failed" || status == "unavailable")) {
+            required_failed = true;
+        }
+    }
+
+    HttpResponse resp;
+    resp.status_code = required_failed ? 503 : 200;
+    resp.status_message = required_failed ? "Service Unavailable" : "OK";
+    resp.headers["Content-Type"] = "application/json";
+    json payload = json::object();
+    payload["route"] = st->route_name;
+    payload["status"] = required_failed ? "partial_failure" : "ok";
+    payload["dependencies"] = composite;
+    resp.body = payload.dump();
+    resp.headers["Content-Length"] = std::to_string(resp.body.size());
+    // finalize_response() reads st->req, so it must run before the state is
+    // erased from the map (which destroys it).
+    finalize_response(client, st->req, resp, false);
+    client_upstream_.erase(client);
+}
+
 void HttpHandler::abort_upstream_for_client(Socket* client) {
     auto it = client_upstream_.find(client);
     if (it == client_upstream_.end()) return;
     ExchangeState* st = it->second.get();
-    if (st->fd >= 0) {
-        epoll_.del(st->fd);
-        upstream_fd_owner_.erase(st->fd);
-        st->fd = -1;
+    for (const auto& ch : st->children) {
+        if (ch->fd >= 0) {
+            epoll_.del(ch->fd);
+            upstream_fd_owner_.erase(ch->fd);
+        }
     }
-    // Dropping the state destroys the upstream socket (closing it, or removing
-    // it from the pool checkout) and frees the snapshotted request. The client
+    // Dropping the state destroys every upstream socket (closing it, or removing
+    // it from a pool checkout) and frees the snapshotted request. The client
     // socket is still held by `st->client` until this erase completes.
     client_upstream_.erase(it);
 }
@@ -1394,7 +1458,11 @@ bool HttpHandler::is_upstream_fd(int fd) const {
 void HttpHandler::on_upstream_event(int fd, uint32_t events) {
     const auto it = upstream_fd_owner_.find(fd);
     if (it == upstream_fd_owner_.end()) return;
-    drive_exchange(it->second, events);
+    Socket* client = it->second.first;
+    const size_t idx = it->second.second;
+    auto st_it = client_upstream_.find(client);
+    if (st_it == client_upstream_.end()) return;
+    drive_child(client, st_it->second.get(), idx, events);
 }
 
 int HttpHandler::poll_timeout_ms() const {
@@ -1402,11 +1470,19 @@ int HttpHandler::poll_timeout_ms() const {
     using clock = std::chrono::steady_clock;
     const clock::time_point now = clock::now();
     int best = 1000;
-    for (const auto& [client, st] : client_upstream_) {
+    auto consider = [&best, now](const clock::time_point& deadline) {
         const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(st->ex->deadline() - now).count();
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
         const int ms = remaining < 0 ? 0 : static_cast<int>(remaining);
         if (ms < best) best = ms;
+    };
+    for (const auto& [client, st] : client_upstream_) {
+        // The composite's hard overall deadline is a first-class timer, separate
+        // from each child's idempotent-idle deadline.
+        if (st->composite && st->has_total_deadline) consider(st->total_deadline);
+        for (const auto& ch : st->children) {
+            if (ch->ex && !ch->finished) consider(ch->ex->deadline());
+        }
     }
     return best;
 }
@@ -1414,15 +1490,50 @@ int HttpHandler::poll_timeout_ms() const {
 void HttpHandler::check_upstream_timeouts() {
     if (client_upstream_.empty()) return;
     const auto now = std::chrono::steady_clock::now();
-    // Snapshot the expired clients first: driving an exchange can complete (and
+    // Snapshot the affected clients first: driving an exchange can complete (and
     // therefore erase) it, which would invalidate an iterator over the map.
-    std::vector<Socket*> expired;
-    expired.reserve(client_upstream_.size());
+    std::vector<Socket*> due;
+    due.reserve(client_upstream_.size());
     for (const auto& [client, st] : client_upstream_) {
-        if (st->ex->deadline() <= now) expired.push_back(client);
+        bool expired = st->composite && st->has_total_deadline && st->total_deadline <= now;
+        if (!expired) {
+            for (const auto& ch : st->children) {
+                if (ch->ex && !ch->finished && ch->ex->deadline() <= now) { expired = true; break; }
+            }
+        }
+        if (expired) due.push_back(client);
     }
-    for (Socket* client : expired) {
-        if (client_upstream_.count(client) != 0) drive_exchange(client, 0);
+    for (Socket* client : due) {
+        auto it = client_upstream_.find(client);
+        if (it == client_upstream_.end()) continue;
+
+        // Overall deadline: a hard wall clock. Because UpstreamExchange refreshes
+        // a child's idle deadline on progress, a slowly-streaming backend could
+        // otherwise outlive the aggregate budget forever, so abandon every child
+        // still in flight and finalize.
+        ExchangeState* st = it->second.get();
+        if (st->composite && st->has_total_deadline && st->total_deadline <= now) {
+            for (std::size_t i = 0; i < st->children.size(); ++i) {
+                force_finish_child(st, i);
+            }
+            finalize_composite(client, st);
+            continue;
+        }
+
+        // A child hit its own idle deadline: driving it with no events makes
+        // advance() surface the timeout. Each step may finish the last child and
+        // erase the state, so re-check the map.
+        std::size_t n = st->children.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            auto it2 = client_upstream_.find(client);
+            if (it2 == client_upstream_.end()) break;
+            ExchangeState* s = it2->second.get();
+            if (i >= s->children.size()) break;
+            ChildExchange& ch = *s->children[i];
+            if (ch.ex && !ch.finished && ch.ex->deadline() <= now) {
+                drive_child(client, s, i, 0);
+            }
+        }
     }
 }
 
@@ -1430,7 +1541,7 @@ void HttpHandler::rearm_reads(Socket* sock) {
     // While an upstream round trip is in flight, leave the fd disarmed: EPOLLONESHOT
     // has already fired, and re-arming here would let a pipelined second request be
     // parsed and dispatched while the first is still outstanding, breaking
-    // request/response ordering. complete_exchange() re-arms once the response is framed.
+    // request/response ordering. The child completion path re-arms once the response is framed.
     if (client_upstream_.count(sock)) return;
     const int fd = sock->getFd();
     if (!send_queues_[sock].empty()) {
@@ -1754,7 +1865,7 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
                     handle_read(sock, ip);
                     // A pipelined request may have been handed to an upstream
                     // exchange; the fd is intentionally left disarmed until
-                    // complete_exchange() delivers its response.
+                    // the child completion path delivers its response.
                     if (client_upstream_.count(sock_ptr)) {
                         return;
                     }

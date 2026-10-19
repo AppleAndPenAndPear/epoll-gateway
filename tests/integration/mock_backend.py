@@ -127,6 +127,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 b"\r\n"
             )
             return
+        if self.path.endswith("/drip"):
+            # Slowly-streaming chunked response: one chunk every ~100ms for
+            # ~1.5s. Each chunk is I/O progress, so a gateway exchange's idle
+            # deadline keeps refreshing; only a composite route's hard overall
+            # deadline can bound the wait.
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"\r\n"
+            )
+            for _ in range(15):
+                self.wfile.write(b"5\r\nhello\r\n")
+                self.wfile.flush()
+                time.sleep(0.1)
+            self.wfile.write(b"0\r\n\r\n")
+            return
         body = json.dumps({
             "backend": "127.0.0.1:%d" % PORT,
             "path": self.path,

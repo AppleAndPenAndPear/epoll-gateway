@@ -54,6 +54,7 @@ BACKEND_TLS = 5616   # TLS test backend (https upstream)
 PROFILE_USER = 5617  # Composite profile user dependency
 PROFILE_ORDERS = 5618  # Composite profile orders dependency
 PROFILE_RECOMMENDATIONS = 5619  # Composite profile recommendations dependency
+CIRCUIT_PROBE = 5622  # Dedicated backend for the composite circuit-breaker test
 OVERLOAD_PORT = 5620  # Dedicated server with a tiny connection budget for the overload test
 LOAD_PORT = 5621  # Dedicated server for the sustained load/overload test
 
@@ -160,6 +161,48 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_ke
                                  {"name": "recommendations", "upstream_name": "recommendations-service", "path": "/recommendations/42", "method": "GET", "required": True, "timeout_ms": 2000},
                              ]},
          "auth_required": False, "allow_anonymous": True},
+        # A composite whose aggregate deadline is far below the dependency's own
+        # timeout: the backend call is intentionally slow (mock /slow sleeps 1.5s),
+        # so a prompt response proves the total deadline both caps the backend call
+        # and bounds how long the caller waits.
+        {"name": "deadline-page", "method": "GET", "path": "/deadline",
+         "target_type": "composite",
+         "composite_target": {"name": "deadline-page", "total_timeout_ms": 300,
+                             "dependencies": [
+                                 {"name": "slow", "upstream_name": "user-service", "path": "/slow", "method": "GET", "required": True, "timeout_ms": 5000},
+                             ]},
+         "auth_required": False, "allow_anonymous": True},
+        # Composite with NO aggregate deadline against the slow backend: it stays
+        # in flight ~1.5s, giving a window to prove a concurrent static request is
+        # still served immediately (i.e. the worker's event loop is never blocked).
+        {"name": "slow-page", "method": "GET", "path": "/slowpage",
+         "target_type": "composite",
+         "composite_target": {"name": "slow-page",
+                             "dependencies": [
+                                 {"name": "slow", "upstream_name": "user-service", "path": "/slow", "method": "GET", "required": True, "timeout_ms": 5000},
+                             ]},
+         "auth_required": False, "allow_anonymous": True},
+        # Aggregate deadline (400ms) against a backend that streams progress for
+        # ~1.5s: the dependency's idle deadline keeps refreshing on every chunk, so
+        # only a hard, progress-independent overall deadline can cut the wait short.
+        {"name": "drip-page", "method": "GET", "path": "/drippage",
+         "target_type": "composite",
+         "composite_target": {"name": "drip-page", "total_timeout_ms": 400,
+                             "dependencies": [
+                                 {"name": "drip", "upstream_name": "user-service", "path": "/drip", "method": "GET", "required": True, "timeout_ms": 5000},
+                             ]},
+         "auth_required": False, "allow_anonymous": True},
+        # Composite whose sole dependency targets its OWN upstream group so driving
+        # that group's circuit open here cannot poison the shared profile/other
+        # composite routes. A low failure threshold opens the circuit quickly.
+        {"name": "circuit-page", "method": "GET", "path": "/circuit",
+         "target_type": "composite",
+         "upstream_target": {"circuit_failure_threshold": 2, "circuit_recovery_timeout_ms": 500},
+         "composite_target": {"name": "circuit-page",
+                             "dependencies": [
+                                 {"name": "probe", "upstream_name": "composite-probe", "path": "/me", "method": "GET", "required": True, "timeout_ms": 2000},
+                             ]},
+         "auth_required": False, "allow_anonymous": True},
     ]
     if with_reloaded_route:
         routes.append(
@@ -207,6 +250,8 @@ def make_config(with_reloaded_route=False, tls_cert=None, tls_key=None, admin_ke
                                "algorithm": "round_robin"},
             "recommendations-service": {"servers": [{"host": BASE, "port": PROFILE_RECOMMENDATIONS}],
                                        "algorithm": "round_robin"},
+            "composite-probe": {"servers": [{"host": BASE, "port": CIRCUIT_PROBE}],
+                                "algorithm": "round_robin"},
         },
         "upstream_health_check_timeout_ms": 300,
         "logging": {
@@ -602,6 +647,135 @@ def test_profile_composite_route(fail_control_dir):
             os.unlink(reject_path)
         except FileNotFoundError:
             pass
+
+
+def test_composite_total_deadline():
+    print("\n[07c2] Composite total deadline bounds the fan-out")
+    start = time.time()
+    status, _, body = request("/deadline", timeout=10)
+    elapsed = time.time() - start
+    check("deadline route reports partial failure", status == 503, "got %s" % status)
+    payload = {}
+    try:
+        payload = json.loads(body.decode())
+    except (ValueError, UnicodeDecodeError):
+        pass
+    dep = (payload.get("dependencies") or {}).get("slow", {})
+    check("slow dependency marked timed_out", dep.get("timed_out") is True, str(dep))
+    check("timed-out dependency reported as 504", dep.get("http_status") == 504, str(dep))
+    # The dependency's own timeout (5000ms) is far larger than the route's total
+    # deadline (300ms), and the backend itself sleeps 1.5s: responding well before
+    # that proves the aggregate deadline cut the wait short, not the per-dep timeout.
+    check("aggregate deadline cut the wait short", elapsed < 1.2, "elapsed=%.2fs" % elapsed)
+
+
+def test_composite_does_not_block_worker():
+    print("\n[07c3] Composite fan-out does not block the worker event loop")
+    result = {}
+
+    def call():
+        result["r"] = request("/slowpage", timeout=10)
+
+    t = threading.Thread(target=call)
+    t.start()
+    time.sleep(0.3)  # the composite is now mid-flight (backend sleeps ~1.5s)
+    t0 = time.time()
+    st, _, _ = request("/", timeout=5)
+    served = time.time() - t0
+    # The server runs a single worker: a blocking composite fan-out would stall
+    # this static request until the backend answered. A prompt response proves the
+    # event loop keeps serving other connections while a composite is in flight.
+    check("static request served while a composite is in flight",
+          st == 200 and served < 0.5, "status=%s served=%.3fs" % (st, served))
+    t.join(timeout=10)
+    stc = result.get("r", (0, {}, b""))[0]
+    check("slow composite completed after the static request", stc == 200,
+          "got %s" % stc)
+
+
+def test_composite_deadline_independent_of_progress():
+    print("\n[07c3b] Aggregate deadline is independent of child progress")
+    start = time.time()
+    status, _, body = request("/drippage", timeout=10)
+    elapsed = time.time() - start
+    payload = {}
+    try:
+        payload = json.loads(body.decode())
+    except (ValueError, UnicodeDecodeError):
+        pass
+    dep = (payload.get("dependencies") or {}).get("drip", {})
+    check("drip route reports partial failure", status == 503, "got %s" % status)
+    check("streaming dependency marked timed_out", dep.get("timed_out") is True, str(dep))
+    check("streaming dependency reported as 504", dep.get("http_status") == 504, str(dep))
+    # The backend streams progress for ~1.5s, refreshing the dependency's idle
+    # deadline on every chunk, so only a hard progress-independent overall deadline
+    # (400ms) can bound the caller's wait.
+    check("aggregate deadline cut the streaming wait short", elapsed < 0.9,
+          "elapsed=%.2fs" % elapsed)
+
+
+def test_composite_circuit_breaker_records_failures(fail_control_dir):
+    print("\n[07c4] Composite dependencies feed the circuit breaker")
+    reject_path = os.path.join(fail_control_dir, "reject")
+    try:
+        with open(reject_path, "w") as f:
+            f.write("1")
+        # The route's failure threshold is 2, so the first two requests fail
+        # against the backend and are recorded; the third is then refused by the
+        # now-open circuit. Before the fix composite never reported failures, so
+        # the circuit would never open and every request would reach the backend.
+        last = {}
+        for _ in range(3):
+            _, _, body = request("/circuit", timeout=10)
+            try:
+                last = json.loads(body.decode())
+            except (ValueError, UnicodeDecodeError):
+                last = {}
+        dep = (last.get("dependencies") or {}).get("probe", {})
+        check("composite dependency circuit opens after recorded failures",
+              dep.get("error") == "circuit_open", str(dep))
+        check("composite circuit-open dependency reported as 503",
+              dep.get("http_status") == 503, str(dep))
+    finally:
+        try:
+            os.unlink(reject_path)
+        except FileNotFoundError:
+            pass
+
+
+def test_composite_client_disconnect():
+    print("\n[07c5] Client disconnect mid-composite is handled safely")
+
+    def fd_count():
+        try:
+            return len(os.listdir("/proc/%d/fd" % server_proc.pid))
+        except (FileNotFoundError, OSError):
+            return None
+
+    # Warm the slow path once so the fd baseline excludes first-use effects.
+    request("/slowpage", timeout=10)
+    before = fd_count()
+    # Send a slow composite request then close the client socket before the
+    # backend (sleeping ~1.5s) answers: the in-flight exchange must be torn down
+    # without crash or fd leak.
+    for _ in range(5):
+        try:
+            raw = socket.create_connection((BASE, SERVER_PORT), timeout=5)
+            conn = TLS_CTX.wrap_socket(raw)
+            conn.sendall(("GET /slowpage HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
+                          % (BASE, SERVER_PORT)).encode())
+            time.sleep(0.1)
+            conn.close()
+        except OSError:
+            pass
+    time.sleep(2.0)  # let the abandoned backends finish and the sockets close
+    st, _, _ = request("/")
+    check("server responsive after mid-composite client disconnects", st == 200,
+          "got %s" % st)
+    after = fd_count()
+    check("no fd leak after abandoned composites",
+          before is None or after is None or after <= before + 8,
+          "before=%s after=%s" % (before, after))
 
 
 def test_chunked_trailer():
@@ -1325,13 +1499,14 @@ def main():
         start_mock(PROFILE_USER)
         start_mock(PROFILE_ORDERS)
         start_mock(PROFILE_RECOMMENDATIONS)
+        start_mock(CIRCUIT_PROBE)
         # Wait for each mock to actually bind instead of sleeping a fixed time.
         # The server starts accepting right after this, so any proxy test that
         # runs before a backend is listening sees a refused upstream connection
         # and fails with an intermittent 502 (the backend probe connection is
         # counted, but test_connection_reuse snapshots the counter later).
         for port in (BACKEND_A, BACKEND_B, BACKEND_FAIL, BACKEND_LIMIT, BACKEND_TLS,
-                     PROFILE_USER, PROFILE_ORDERS, PROFILE_RECOMMENDATIONS):
+                     PROFILE_USER, PROFILE_ORDERS, PROFILE_RECOMMENDATIONS, CIRCUIT_PROBE):
             if not wait_for_port(port):
                 print("mock backend on port %d never came up" % port)
                 return 1
@@ -1365,6 +1540,11 @@ def main():
         test_connection_reuse(fail_control_dir)
         test_concurrent_proxy_isolation()
         test_profile_composite_route(fail_control_dir)
+        test_composite_total_deadline()
+        test_composite_does_not_block_worker()
+        test_composite_deadline_independent_of_progress()
+        test_composite_client_disconnect()
+        test_composite_circuit_breaker_records_failures(fail_control_dir)
         test_chunked_trailer()
         test_forwarded_headers()
         test_hop_by_hop_stripping()

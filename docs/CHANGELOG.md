@@ -4,6 +4,32 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-18
+
+### Changed
+
+- **Composite routes are now driven by the worker's own epoll, like single-upstream routes — a fan-out no longer blocks the event loop.** Previously the composite path submitted each dependency to the process-level `BoundedAsyncUpstreamExecutor` and blocked the worker's epoll on `std::future::wait_for` for up to `total_timeout_ms`, so one worker could not serve any other connection (health checks, static files, other requests) while a fan-out was in flight. Composite dispatch now reuses the same non-blocking `UpstreamExchange` state machine as the single-upstream path: `ExchangeState` was generalized to hold **N** child exchanges (single-upstream is N=1) with one shared driver, each dependency becomes its own exchange registered on the worker's epoll, and the aggregate is framed when the last child finishes or the overall deadline fires. No thread waits on a fan-out any more.
+  - The overall `total_timeout_ms` is enforced as a **hard wall-clock deadline independent of each child's idle deadline**: `UpstreamExchange` refreshes its idle deadline on every byte of progress, so a slowly-streaming backend would otherwise outlive the aggregate budget forever. The loop checks the composite deadline and abandons every still-in-flight child (`force_finish_child`, synthesized `timed_out`/504 item) before finalizing. Reason: the removed blocking call could not be interrupted mid-syscall, so the deadline's job is to stop the *loop* waiting, which the state machine does at the socket level.
+  - Composite children now report `record_success` / `record_failure` to the circuit breaker (previously composite only *queried* `allow_request` and never reported an outcome), so the breaker now accounts for composite traffic exactly as it does for single-upstream traffic.
+  - **Removed `BoundedAsyncUpstreamExecutor`** (`include/server/upstream_async.h`, `src/server/upstream_async.cpp`) and its configuration keys `upstream_max_inflight` / `upstream_max_queue`: after the composite path moved onto the event loop the executor had no remaining callers. Composite fan-out is no longer bounded by a process-level in-flight cap; it is bounded by the connection/fd budget like every other route ([DEPLOYMENT.md](DEPLOYMENT.md) §11 updated). A per-composite fan-out cap, if wanted, is a separate item.
+  - **Outward JSON contract change**: the `rejected` / `executor_overloaded` dependency statuses are gone (they only existed to surface executor overload), since there is no longer a bounded executor to reject a dependency. The aggregate shape (`route` / `status` / `dependencies.<name>`) and the remaining item fields are unchanged.
+  - Known inconsistency kept as-is for parity: the composite path's `allow_request` / `record_failure` recovery timeout still uses the dependency's own `timeout_ms` (not `circuit_recovery_timeout_ms`); unchanged here, tracked separately.
+
+### Tests
+
+- Unit 137/137 (the six `BoundedAsyncUpstreamExecutorTest` cases and the `upstream_max_inflight` config-validation case were deleted with the executor; the file-schema test dropped the two removed keys), integration 154/154 assertions (2026-10-18). New composite integration cases: a **static request is served while a composite is in flight on the single-worker server** (direct proof the loop is not blocked); a hard aggregate deadline is enforced **against a backend that streams progress** (proving the deadline is independent of the child's refreshed idle deadline); composite dependencies **drive the circuit breaker open** after recorded failures; and a **client disconnect mid-composite** leaves the server responsive with no fd leak.
+
+## 2026-10-17
+
+### Added
+
+- **Aggregate total deadline + cancellation propagation for composite routes.** New `composite_target.total_timeout_ms` (0 = disabled, the previous behaviour) bounds the whole fan-out. It is propagated two ways so it cannot be evaded: each dependency's backend call is given `min(dep.timeout_ms, total_timeout_ms)`, so a slow call cannot outlive the budget, and the caller waits on each dependency's future only up to the shared deadline (a bounded `wait_for` instead of an unbounded `get()`). A dependency that misses the deadline is reported as `timed_out` (504) with `error: upstream_timeout`, so a required miss still aggregates to `partial_failure` (503). Reason this is the *only* form of cancellation available: `forward_request` is a blocking call that cannot be interrupted mid-syscall, so "cancel" here is cooperative — the caller stops waiting and each backend call self-terminates at its (deadline-bounded) effective timeout, releasing its executor slot when it returns. Because a bounded wait can let the caller return before a dependency task finishes, the task now captures the request (headers + body) and client IP **by value** (it previously borrowed the request-scoped objects through references); this is required for correctness, since `requests_[sock_ptr]` can be overwritten or erased once dispatch returns.
+  - ~~Known limit~~ **Resolved on 2026-10-18**: the synchronous wait described here was replaced by a fully non-blocking, event-loop-driven fan-out (see the 2026-10-18 entry). The bounded `wait_for` no longer exists.
+
+### Tests
+
+- Unit 146/146, integration 144/144 assertions (2026-10-17). Two new `ConfigValidationTest` cases cover the new field (accept + reject-negative); `test_composite_total_deadline` proves a dependency whose own timeout is 5 s is cut off by a 300 ms route deadline well before the backend's 1.5 s sleep.
+
 ## 2026-10-17
 
 ### Fixed

@@ -361,6 +361,13 @@ threads per worker process (fixed at startup).
 > executor at all (see the next section), so `upstream_max_inflight` /
 > `upstream_max_queue` now bound **composite** fan-out only. The 64 default is
 > kept; it constrains composite dependency fan-out, not a single upstream.
+>
+> **Superseded again on 2026-10-18**: composite fan-out now runs on the same
+> event-loop-driven `UpstreamExchange` state machine (see the composite entry in
+> [CHANGELOG.md](CHANGELOG.md)), so `BoundedAsyncUpstreamExecutor` and the
+> `upstream_max_inflight` / `upstream_max_queue` keys were **removed**. The
+> "raised 4 -> 64" history above is retained as a record; neither key exists now.
+> Fan-out is bounded by the connection/fd budget, like single-upstream forwarding.
 
 #### Fixed: the upstream socket is registered in the same epoll (full Finding D, 2026-10-14)
 
@@ -378,6 +385,9 @@ backend closed before send is retried once on a fresh connection for idempotent
 methods only, and a request whose bytes reached the backend is never retried. The
 `BoundedAsyncUpstreamExecutor` — and with it `upstream_max_inflight` /
 `upstream_max_queue` — now serves composite dependency fan-out only.
+**Removed on 2026-10-18:** composite fan-out is now driven by the same event-loop
+`UpstreamExchange` state machine, so the executor and both keys were deleted; see
+the composite entry in [CHANGELOG.md](CHANGELOG.md).
 
 **Honest caveat — this box cannot measure the change.** The follow-up is justified
 on structure (one fewer thread per round trip, all per-connection state on the
@@ -402,8 +412,6 @@ defensible before/after needs a quieter, higher-core host.
 # saturates at c50, so the strict harness may flag c50 proxy timeouts
 # (environment, not a gateway error):
 scripts/benchmark/run_benchmark.sh 8
-# fan-out A/B (edit upstream_max_inflight in the run_benchmark.sh heredoc):
-#   4 vs 64 -> ~+17%
 # CPU split of a running gateway while wrk drives it:
 #   sum /proc/<pid>/task/*/stat fields 14/15 before and after the load window
 # thread-creation churn (start the gateway as a child, ptrace_scope=1):

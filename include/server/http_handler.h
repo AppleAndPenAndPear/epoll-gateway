@@ -17,7 +17,6 @@
 #include "rate_limiter.h"
 #include "rate_limiter_manager.h"
 #include "api_key_manager.h"
-#include "upstream_async.h"
 #include "http_client.h"
 
 class HttpHandler {
@@ -38,24 +37,49 @@ private:
         std::string allow_methods;
     };
 
-    // One in-flight single-upstream round trip, owned by the event loop.
-    // Everything the exchange touches is snapshotted by value: `config_` and
-    // `routes_` are reassigned in place on a hot reload, and `matched.route`
-    // points into `routes_`, so neither may be read once the request leaves the
-    // current turn. `client` keeps the client Socket alive even if its
-    // connection entry is torn down (idle timeout) while the backend is busy.
-    struct ExchangeState {
+    // One backend round trip driven by this worker's event loop. A connection
+    // holds one per in-flight backend call: exactly one for a single-upstream
+    // route, one per dependency for a composite route. `fd` is the upstream
+    // socket currently registered in the epoll set, or -1 when unregistered.
+    struct ChildExchange {
         std::unique_ptr<UpstreamExchange> ex;
         UpstreamExchange::Params params;
-        int fd = -1;                        // upstream fd currently in epoll, or -1
-        std::shared_ptr<Socket> client;
-        HttpRequest req;
+        int fd = -1;
         UpstreamServer server;
         std::string upstream_key;
         int max_retries = 0;
         int circuit_failure_threshold = 0;
         int circuit_recovery_timeout_ms = 0;
         int attempt_count = 0;
+        // Composite-only bookkeeping.
+        bool finished = false;
+        bool required = true;
+        std::string name;               // dependency name: aggregate key + log label
+        nlohmann::json item;            // this dependency's entry in the aggregate
+    };
+
+    // All backend round trips outstanding for one client connection. Single and
+    // composite routes share this state and the same driver; composite routes
+    // additionally enforce a hard overall deadline. Everything an exchange
+    // touches is snapshotted by value: `config_` and `routes_` are reassigned in
+    // place on a hot reload, and `matched.route` points into `routes_`, so
+    // neither may be read once the request leaves the current turn. `client`
+    // keeps the client Socket alive even if its connection entry is torn down
+    // (idle timeout) while a backend is busy.
+    struct ExchangeState {
+        std::shared_ptr<Socket> client;
+        HttpRequest req;
+        std::vector<std::unique_ptr<ChildExchange>> children;
+        // Composite aggregate mode. When a total deadline is set it is a hard
+        // wall-clock bound checked by the loop, independent of each child's idle
+        // deadline (which UpstreamExchange refreshes on I/O progress).
+        bool composite = false;
+        std::string route_name;          // aggregate "route" field, snapshotted
+        int total_timeout_ms = 0;
+        bool has_total_deadline = false;
+        std::chrono::steady_clock::time_point total_deadline;
+        std::chrono::steady_clock::time_point started;
+        std::string client_ip;
     };
 
     Epoll& epoll_;
@@ -89,11 +113,26 @@ private:
     // build the snapshotted params, pick a backend, register the upstream fd and
     // return. The backend round trip consumes no thread while it waits.
     void start_upstream_exchange(std::shared_ptr<Socket> sock, const HttpRequest& req, const ResolvedRoute& matched);
-    // Drive one step of an exchange owned by `client` and apply the result:
-    // (re)register its upstream fd, or, on Done, unregister it and frame/send the
-    // upstream response (retrying first when the route allows it).
+    // Hand a composite route to the event loop: fan out every dependency as a
+    // non-blocking upstream exchange owned by this connection, snapshotting the
+    // dependency list and the optional overall deadline. Returns immediately; the
+    // aggregate is framed when all children finish or the overall deadline fires.
+    void start_composite_exchange(std::shared_ptr<Socket> sock, const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip);
+    // Drive one step of child `idx` owned by `client` and apply the result:
+    // (re)register its upstream fd, or, on Done, unregister it and finish it.
+    void drive_child(Socket* client, ExchangeState* st, size_t idx, uint32_t events);
+    // Drive one step of the single child (index 0) of a single-upstream exchange.
     void drive_exchange(Socket* client, uint32_t events);
-    void complete_exchange(Socket* client, ExchangeState* st);
+    // Called when child `idx` finishes: record the circuit outcome, then either
+    // frame the single-upstream response (retrying first when the route allows
+    // it) or fold the result into the composite item.
+    void finish_child(Socket* client, ExchangeState* st, size_t idx);
+    // Composite only: abandon an unfinished child because the overall deadline
+    // fired, synthesizing a timed-out item so the aggregate can still complete.
+    void force_finish_child(ExchangeState* st, size_t idx);
+    // Aggregate the completed composite children and frame the response; called
+    // once every child has finished.
+    void finalize_composite(Socket* client, ExchangeState* st);
     // Drop an in-flight upstream exchange for a connection that is going away:
     // unregister its upstream fd and free the state without sending anything.
     void abort_upstream_for_client(Socket* client);
@@ -102,7 +141,7 @@ private:
     // until the response is delivered, so a pipelined second request cannot run
     // concurrently with the first).
     void rearm_reads(Socket* sock);
-    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, const std::string& client_ip, HttpResponse& resp);
+    void dispatch_route(const HttpRequest& req, const ResolvedRoute& matched, HttpResponse& resp);
     ResolvedRoute resolve_route(const HttpRequest& req) const;
     void register_default_routes();
     void register_configured_routes();
@@ -124,14 +163,14 @@ private:
     Config config_;                      // Runtime config snapshot, updatable via reload
 
     UpstreamManager& upstream_manager_;  // Reference used to select backends
-    BoundedAsyncUpstreamExecutor upstream_executor_;             // Bound task queue for composite fan-out
 
     // ── In-flight upstream round trips (event-loop owned) ──
-    // One entry per client connection with a backend call outstanding, plus a
-    // reverse index so the worker can dispatch an event for an upstream fd
-    // straight to the owning exchange. Both live only on the event-loop thread.
+    // One entry per client connection with backend call(s) outstanding, plus a
+    // reverse index from an upstream fd to (owning client, child index) so the
+    // worker can dispatch that fd's event straight to the right child exchange.
+    // Both live only on the event-loop thread.
     std::unordered_map<Socket*, std::unique_ptr<ExchangeState>> client_upstream_;
-    std::unordered_map<int, Socket*> upstream_fd_owner_;
+    std::unordered_map<int, std::pair<Socket*, size_t>> upstream_fd_owner_;
 
     std::shared_ptr<RateLimiterManager> rate_limiter_manager_;   // Rate limiter shared across workers
     ApiKeyManager& api_key_manager_;                             // API key authentication

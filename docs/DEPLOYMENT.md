@@ -171,8 +171,7 @@ Every resource the gateway consumes is bounded, and each bound has a defined ove
 | Upstream response body | per request | `max_response_bytes` (64 MB) | 502 + `Connection: close` |
 | Response cache (files + gzip variants) | per worker | `cache_max_entries` × `cache_max_file_size_mb` (1024 × 1 MB) | LRU eviction; entries larger than the per-file cap are not cached |
 | Cached open file descriptors | per worker | fixed (256, 10s TTL) | LRU eviction, fd closed |
-| Composite fan-out concurrency (composite routes only) | per process | `upstream_max_inflight` (64) | deterministic 503; requires restart to change |
-| Composite fan-out queue (composite routes only) | per process | `upstream_max_queue` (64) | deterministic 503; requires restart to change |
+| Composite fan-out concurrency (composite routes only) | per connection | fd budget (one upstream connection per dependency) | bounded by `max_connections`; excess connections are shed |
 | Idle upstream connections | per upstream | fixed (16, 60s idle) | FIFO eviction of the oldest idle connection |
 | Idle client keep-alive | per connection | `keepalive_timeout` (60s) | connection closed by the 1-second reaper |
 | Request rate | per key/IP | `rate_limit` / per-key `rate_limit` | 429 |
@@ -182,8 +181,8 @@ Notes:
 
 - **`max_connections` is the fd budget in practice.** Set it to `ulimit -n` minus the fds reserved for upstream connections (up to 16 idle per upstream, plus one per in-flight proxied request), the listen sockets (one per worker) and the admin listener. Raise the process `LimitNOFILE` in the systemd unit before raising this value.
 - **`epoll_connections_active`** (gauge) and **`epoll_connections_rejected_total`** (counter) in `/metrics` let you watch how close a deployment runs to its ceiling and whether shedding is happening.
-- `max_connections` and `rate_limit` apply on reload; `upstream_max_inflight` / `upstream_max_queue` are fixed at startup because the executor's threads are sized once (they bound composite fan-out only).
-- **Single-upstream forwarding is event-loop-driven, not executor-bounded.** A single upstream round trip is a non-blocking state machine registered in the worker's epoll, so one in-flight proxied request costs one upstream connection (and its fd), not a thread. The concurrency ceiling for single-upstream routes is therefore the fd budget (`max_connections`), not `upstream_max_inflight`. The `upstream_max_inflight` / `upstream_max_queue` limits apply to **composite** routes, whose dependency fan-out still runs on the bounded async executor; size them above the expected peak *composite* fan-out, or excess is rejected with 503.
+- `max_connections` and `rate_limit` apply on reload.
+- **Upstream forwarding is event-loop-driven, not executor-bounded — for both single-upstream and composite routes.** A backend round trip (a single upstream, or each dependency of a composite fan-out) is a non-blocking state machine registered in the worker's epoll, so one in-flight upstream call costs one connection (and its fd), not a thread, and a fan-out does not block the worker while it waits. The concurrency ceiling for proxied and composite routes is therefore the fd budget (`max_connections`), not a fan-out cap; there is no longer any `upstream_max_inflight` / `upstream_max_queue` knob (removed 2026-10-18 with the bounded executor). A composite route additionally honours `composite_target.total_timeout_ms`, a hard overall wall-clock budget for the fan-out.
 
 ### Memory model
 
@@ -199,5 +198,5 @@ peak ≈ (max_connections × response_buffer)
 - **`response_buffer`** is the in-flight proxied response held in memory: a full `max_response_bytes` for the connection currently forwarding a proxy response, or ~1 MB (headers + body) for a static-file request. It applies only to connections in the proxy path, not to idle keep-alive connections, so the realistic peak is `concurrent_proxied_requests × max_response_bytes`, lower than `max_connections × max_response_bytes`.
 - **Tightening the two dominant knobs** — `max_connections` and `max_response_bytes` — is how you fit a host. For a 4 GB host serving small API responses, e.g. `max_connections: 2000`, `max_response_bytes: 8388608` (8 MB), `cache_max_entries: 256`.
 - The **caches** are per worker, so multiply by `num_workers`; gzip variants of cached files share the same cache and budget.
-- The **fan-out term** covers **composite** routes only: at most `upstream_max_inflight` dependency requests in flight, each buffering up to `max_response_bytes`. Single-upstream routes are bounded by the connection/fd budget instead (one in-flight upstream connection per proxied request).
+- The **fan-out term** covers **composite** routes only: each dependency request in flight buffers up to `max_response_bytes`, and there is one upstream connection per in-flight dependency. Fan-out (like single-upstream) is bounded by the connection/fd budget, not by a dedicated cap.
 - These are worst-case bounds, not steady-state usage. They exist so a flood or a misbehaving backend fails predictably (a 502, a shed connection) instead of growing until the OOM killer intervenes.

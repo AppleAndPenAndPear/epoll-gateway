@@ -216,10 +216,10 @@ Review after 6 months: if the direction is clear, commit fully; otherwise gracef
 These supersede the earlier P1~P6 framing above and are the active sequence; current state is the source of truth in [PROJECT_STATUS.md](PROJECT_STATUS.md).
 
 - [x] Bounded async upstream boundary (2026-10-08)
-  - `BoundedAsyncUpstreamExecutor` (`upstream_async.{h,cpp}`): worker pool + bounded queue + per-upstream-group concurrency isolation; overloaded or shutting-down submissions return a deterministic 503 instead of blocking an epoll worker
+  - `BoundedAsyncUpstreamExecutor` (`upstream_async.{h,cpp}`): worker pool + bounded queue + per-upstream-group concurrency isolation; overloaded or shutting-down submissions return a deterministic 503 instead of blocking an epoll worker (removed 2026-10-18 — composite fan-out now uses the event-loop `UpstreamExchange` state machine)
   - Route identity resolved once via `resolve_upstream_group_id()` (route bound to `upstream_target.name`, falling back to the route name) so the executor key always matches the real backend pool, not a display label
 - [x] Composite route MVP (2026-10-08)
-  - `composite` target type with named dependencies (required vs optional) validated at config load; dependencies fan out through the bounded executor and aggregate into an explicit `partial_failure` (503) vs `ok` (200) response
+  - `composite` target type with named dependencies (required vs optional) validated at config load; dependencies fan out through the bounded executor and aggregate into an explicit `partial_failure` (503) vs `ok` (200) response (the bounded executor was later replaced by the non-blocking state machine — see the 2026-10-18 entry under the active sequence)
   - End-to-end profile-page scenario (user + orders + recommendations) passes
 - [x] Composition diagnostics and logging policy (2026-10-09)
   - W3C `traceparent` generated/propagated across the upstream hop and echoed back, keeping `X-Trace-Id` compatibility; per-dependency `traceparent`, `duration_ms`, and status in the composite payload
@@ -238,7 +238,7 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - Connection-reuse integration test de-flaked (health-probe connections no longer counted)
 - [x] Resource budgets and overload defence (2026-10-10)
   - Process-wide `max_connections` enforced by a shared `ConnectionBudget`; over-limit connections are accepted and shed immediately so a flood cannot exhaust fds/memory
-  - Composite fan-out limits (`upstream_max_inflight`/`upstream_max_queue`) made configurable instead of hard-coded
+  - Composite fan-out limits (`upstream_max_inflight`/`upstream_max_queue`) made configurable instead of hard-coded (both keys removed 2026-10-18 with the bounded executor)
   - `epoll_connections_active` / `epoll_connections_rejected_total` metrics; full per-resource budget table in [DEPLOYMENT.md](DEPLOYMENT.md) §11
 - [x] Supply-chain gate (2026-10-13)
   - `scripts/supply_chain.sh` wired into CI (`./ci.sh supply-chain`): `cppcheck` SAST (blocking only on `error` severity), an offline CycloneDX 1.5 SBOM of `build/server`'s linked libraries, and an `osv-scanner` SCA pass over that SBOM; a missing tool reports SKIPPED with its install command, never a silent pass
@@ -248,20 +248,34 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - Request counters report 2xx/3xx/4xx/5xx per dimension (failure rate derivable in PromQL) and cause-specific counters (`epoll_route_upstream_errors_total`, `epoll_route_auth_failures_total`, `epoll_route_rate_limit_hits_total`)
 - [x] Fully event-driven single-upstream forwarding (2026-10-14)
   - The single-upstream round trip is now a non-blocking state machine (`UpstreamExchange`) registered in the worker's own epoll, so no executor thread and no per-request thread are involved; concurrency is bounded by connection fds, not thread count
-  - The `eventfd` wake-up path and the single-upstream use of `BoundedAsyncUpstreamExecutor` are removed; the executor (and `upstream_max_inflight`/`upstream_max_queue`) now serve composite fan-out only
+  - The `eventfd` wake-up path and the single-upstream use of `BoundedAsyncUpstreamExecutor` are removed; the executor (and `upstream_max_inflight`/`upstream_max_queue`) then served composite fan-out only (all three removed 2026-10-18 — see below)
   - New `test_concurrent_proxy_isolation` integration case guards the correctness of the loop-driven forwarding (N simultaneous connections each get their own correct response, no cross-talk or loss)
   - The throughput before/after could not be measured on this shared 2-vCPU box (a single-threaded mock saturates near the gateway's own rate); the change is justified on structure, not a measured win
-- Current verification: 144/144 unit, 140 integration assertions (2026-10-17)
+- [x] Fully event-driven composite fan-out (2026-10-18)
+  - Composite routes now use the same non-blocking `UpstreamExchange` state machine as single-upstream routes (`ExchangeState` generalized to N child exchanges, one shared driver), so a fan-out no longer blocks the worker's event loop; the aggregate is framed when the last dependency finishes or the overall deadline fires
+  - `composite_target.total_timeout_ms` is enforced as a hard wall-clock deadline independent of each child's idle deadline (which is refreshed on I/O progress), so a slowly-streaming backend cannot outlive the budget
+  - Composite dependencies now report `record_success`/`record_failure`, so the circuit breaker accounts for composite traffic like single-upstream traffic
+  - `BoundedAsyncUpstreamExecutor` and the `upstream_max_inflight`/`upstream_max_queue` keys removed (no remaining callers); the `rejected`/`executor_overloaded` dependency statuses removed from the outward JSON contract
+- Current verification: 137/137 unit, 154 integration assertions (2026-10-18)
 
 ### Direction decision (2026-10-17)
 
 Reviewed after the engineering milestones above cleared out. Decision: **keep the API gateway as the stable core and add AI-gateway capability as an optional upper layer** (already the recommendation in [COMMERCIAL_READINESS.zh-CN.md](COMMERCIAL_READINESS.zh-CN.md)); do **not** pivot the whole product to an AI gateway. The binding constraint is now the demand side, not the feature surface — every remaining unchecked box in §4 is non-engineering (publish, interview). Order: **validate first (low engineering cost, but it costs calendar time), then invest in the AI layer only if a real signal appears.**
+
+**P0/P1/P2 are not a pre-publish gate.** By the register's own wording P2 is "selected by market signal", and much of P0/P1's remaining work is customer-gated (JWT/OIDC, mTLS, HTTP/2, HA/cluster, distributed quota — each waiting on "访谈确认需求后"). Validation is the *input* that tells us which of those gaps matter, not a reward earned after feature completeness. So the product is already credible enough to publish an architecture article and start interviews, and validation runs **in parallel** with a small, customer-independent "credibility-gap" worklist below, instead of waiting for a feature-complete P0/P1/P2.
 
 ### Next in the active sequence
 
 - **[Now · validation first, low engineering cost] Unblock the demand side before building anything new.**
   - Publish the first architecture article (draft already in [docs/articles/](articles/)) to Juejin/Zhihu/V2EX/HN — the §3 Month-3 item that never started.
   - Interview 5 potential users (backend/ops/embedded teams, plus AI-platform teams) — the §3 Month 4~6 signal item that never happened.
+  - **In parallel (not a gate): close only the customer-independent "credibility-gap" items** — the ones a reader would immediately challenge, all low-engineering and none requiring a customer decision:
+    - [x] Aggregate **total deadline + cancellation propagation** (the P0 open item; correctness-facing) — done 2026-10-17 via `composite_target.total_timeout_ms`, then **fully non-blocking on 2026-10-18**: composite fan-out now runs on the same event-loop `UpstreamExchange` state machine as single-upstream routes, so the worker is never blocked while a fan-out waits, and the total deadline is a hard wall-clock bound independent of each child's progress-refreshed idle deadline.
+    - **Upstream-side latency/failure plus rate-limit/circuit/retry/pool metrics** (the P1 observability residue; the first thing a high-traffic reader asks).
+    - **Capacity/soak numbers**, including an honest Nginx re-baseline (the P1 proof item; pairs with the "Later pipeline" entry below).
+    - **Install/upgrade compatibility matrix + log rotation/retention policy** (P1 ops-reader threshold).
+    - **Document the unsupported protocols** and remove any wording that implies enterprise SSO / HTTP-2 / gRPC support (P0, docs-only).
+    - Everything else waits: full OpenTelemetry, the vulnerability-response process, and every customer-gated item (JWT/OIDC, mTLS, HTTP/2, HA/cluster, distributed quota) needs a signal first; P2 is untouched.
   - Gate for the next step: ≥1 real deployment, or ≥1 concrete paid/customization intent. Zero signal means the feature surface does **not** expand, and the unmet Month 4~6 measure is reported honestly rather than papered over.
 - **[Conditional · only after a concrete AI signal] AI traffic layer — one epic with a dependency order, not three independent features.**
   1. **Model routing + model-level observability** — smallest change; reuses the existing upstream/circuit/metrics machinery and adds a model-name → provider mapping plus model/token/first-token metrics.

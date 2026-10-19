@@ -7,7 +7,6 @@ add_executable(runTests
     test_http_client.cpp
     test_connection_pool.cpp
     test_upstream_manager.cpp
-    test_async_upstream.cpp
     test_config_validation.cpp
     test_connection_budget.cpp
     test_metrics.cpp
@@ -19,7 +18,6 @@ add_executable(runTests
     ${CMAKE_SOURCE_DIR}/src/server/http_client.cpp
     ${CMAKE_SOURCE_DIR}/src/server/connection_pool.cpp
     ${CMAKE_SOURCE_DIR}/src/server/upstream_manager.cpp
-    ${CMAKE_SOURCE_DIR}/src/server/upstream_async.cpp
     ${CMAKE_SOURCE_DIR}/src/server/tls_context.cpp
 )
 

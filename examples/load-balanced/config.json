@@ -67,6 +67,7 @@
             "target_type": "composite",
             "composite_target": {
                 "name": "profile-page",
+                "total_timeout_ms": 3000,
                 "dependencies": [
                     {
                         "name": "user",
