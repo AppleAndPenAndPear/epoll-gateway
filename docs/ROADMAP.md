@@ -17,8 +17,26 @@ The execution plan for taking this project from a personal project to a commerci
 | Envoy | C++ | Single binary but extremely heavy | Million-line codebase; unauditable, hard to embed |
 | Higress | Envoy + Go control plane | K8s ecosystem | Deeply coupled to cloud native; unfriendly to bare metal/edge |
 | Nginx | C | Very light | Not an API gateway — auth/rate limiting/tenancy/metrics all require custom extension |
+| KrakenD | Go | Single binary, stateless | The closest competitor for composite aggregation; a transformation engine, not a general auth/TLS-hardening proxy; GC runtime |
+| Traefik / Caddy | Go | Single binary | Comfortable defaults, but no per-key auth / quota / composite aggregation without plugins; GC runtime |
+| LiteLLM (proxy) | Python | Single process + runtime | The de-facto self-hosted AI/model proxy; Python runtime and provider-focused, not a general gateway |
 
 **Market gap**: originally framed as "Nginx-grade resource footprint with out-of-the-box API gateway semantics". The 2026-09-29 same-conditions comparison against Nginx 1.24 ([BENCHMARKS.md](BENCHMARKS.md)) corrected this: memory is a wash (steady-state RSS 26.0 MB vs 26.4 MB) and throughput is 2.5-2.7x lower — so the gap we actually fill is **deployment and operations surface**: no competitor ships out-of-the-box gateway semantics (auth/tenancy/rate limiting/metrics/hot reload) as a single binary with one JSON config and zero runtime dependencies. APISIX grows toward the ecosystem, Nginx stays a pure proxy — the middle is still where this project sits, but the middle is defined by operational simplicity, not resource footprint.
+
+**Named audiences (2026-10-19)** — the gap above resolves into three concrete buyer groups; interviews and the architecture article must target these, not generic "backend/ops teams":
+1. **On-prem appliance / private-delivery / OEM teams** — cannot require a database, config center or K8s at the customer site; want an auditable C++ entry point they can read end-to-end and (later) embed (Differentiator #3).
+2. **Nginx users who resorted to Lua/OpenResty** — they run Lua for per-key auth, rate limiting and aggregation and would rather not maintain Lua code; this is the simplest one-line pitch we have.
+3. **Mobile / mini-program teams needing a BFF layer** — composite fan-out with per-dependency timeouts, a hard aggregate deadline and `partial_failure` semantics is a complete answer to "one page calls 3~5 backends".
+
+### Head-to-Head (where we win, where we do not compete)
+
+| Rival | Its edge | Our stance |
+|---|---|---|
+| KrakenD | Deepest aggregation (chaining, transformations) | Composite fan-out is table stakes, not our wedge; we win on C++ embeddability plus a general proxy/auth story beside it |
+| Kong / APISIX | Plugin ecosystem, control plane, community | Do not fight the ecosystem; win "teams that don't want a control plane or a database" |
+| Traefik / Caddy | Ease of use, auto-TLS | Win buyers who need explicit, readable hardening (TLS policy, audit log, request-smuggling defenses) |
+| OpenResty / Nginx+Lua | Infinite flexibility | Productize the common Lua uses (key auth + rate limit + aggregation) with zero Lua to maintain |
+| LiteLLM / Higress (AI) | AI ecosystem, vendor backing | Enter only via the self-hosted-inference niche signal (see §4's AI gate); never as a generic model router |
 
 ### Three Verifiable Differentiators (every action maps back to them)
 
@@ -267,16 +285,18 @@ Reviewed after the engineering milestones above cleared out. Decision: **keep th
 ### Next in the active sequence
 
 - **[Now · validation first, low engineering cost] Unblock the demand side before building anything new.**
-  - Publish the first architecture article (draft already in [docs/articles/](articles/)) to Juejin/Zhihu/V2EX/HN — the §3 Month-3 item that never started.
+  - Publish the first architecture article (draft already in [docs/articles/](articles/)) to Juejin/Zhihu/V2EX/HN — the §3 Month-3 item that never started. **The lead demo is the composite/BFF fan-out** (a working, differentiating capability — see §1's named audience 3), not "another epoll server"; headline copy must not claim performance superiority (see the copy-sweep item below). Interviews ask about **switching costs and trust barriers** against the incumbent setup, not feature wishlists — gateways are infrastructure, an article earns interest, not adoption.
   - Interview 5 potential users (backend/ops/embedded teams, plus AI-platform teams) — the §3 Month 4~6 signal item that never happened.
   - **In parallel (not a gate): close only the customer-independent "credibility-gap" items** — the ones a reader would immediately challenge, all low-engineering and none requiring a customer decision:
     - [x] Aggregate **total deadline + cancellation propagation** (the P0 open item; correctness-facing) — done 2026-10-17 via `composite_target.total_timeout_ms`, then **fully non-blocking on 2026-10-18**: composite fan-out now runs on the same event-loop `UpstreamExchange` state machine as single-upstream routes, so the worker is never blocked while a fan-out waits, and the total deadline is a hard wall-clock bound independent of each child's progress-refreshed idle deadline.
     - **Upstream-side latency/failure plus rate-limit/circuit/retry/pool metrics** (the P1 observability residue; the first thing a high-traffic reader asks).
+    - **Copy sweep for performance claims** (docs-only, do first): remove "high-performance" wording from headline copy (README slogan, article drafts) until an honest re-baseline exists — the claim to make is "predictable latency, low footprint, zero dependencies"; the current README headline contradicts [BENCHMARKS.md](BENCHMARKS.md) Finding D and would be the first thing a serious reader challenges.
     - **Capacity/soak numbers**, including an honest Nginx re-baseline (the P1 proof item; pairs with the "Later pipeline" entry below).
+    - **Parser fuzz harness + a one-page vulnerability-response policy** — for infrastructure buyers this is the first trust question about a solo-maintained C++ daemon handling untrusted traffic; far cheaper than OTel and a much stronger signal for the §1 embedded/private-delivery audience.
     - **Install/upgrade compatibility matrix + log rotation/retention policy** (P1 ops-reader threshold).
     - **Document the unsupported protocols** and remove any wording that implies enterprise SSO / HTTP-2 / gRPC support (P0, docs-only).
-    - Everything else waits: full OpenTelemetry, the vulnerability-response process, and every customer-gated item (JWT/OIDC, mTLS, HTTP/2, HA/cluster, distributed quota) needs a signal first; P2 is untouched.
-  - Gate for the next step: ≥1 real deployment, or ≥1 concrete paid/customization intent. Zero signal means the feature surface does **not** expand, and the unmet Month 4~6 measure is reported honestly rather than papered over.
+    - Everything else waits: full OpenTelemetry, the full vulnerability-response *process* (beyond the one-page policy above), and every customer-gated item (JWT/OIDC, mTLS, HTTP/2, HA/cluster, distributed quota) needs a signal first; P2 is untouched.
+  - Gate for the next step: ≥1 real deployment, or ≥1 concrete paid/customization intent. **AI signals are recorded in two classes** (2026-10-19): "self-hosted inference front-end" (teams running vLLM/SGLang wanting a C++ zero-dependency front door with SSE streaming and token quotas) counts toward the AI epic below; "SaaS model routing" does **not** — that market is occupied by LiteLLM/Higress and a solo C++ entrant has no edge there. Zero signal means the feature surface does **not** expand, and the unmet Month 4~6 measure is reported honestly rather than papered over.
 - **[Conditional · only after a concrete AI signal] AI traffic layer — one epic with a dependency order, not three independent features.**
   1. **Model routing + model-level observability** — smallest change; reuses the existing upstream/circuit/metrics machinery and adds a model-name → provider mapping plus model/token/first-token metrics.
   2. **SSE / streaming passthrough** — ⚠ the deepest change: today the response path buffers the whole backend response before re-framing it (`forward_request` / `UpstreamExchange`), so low-latency streaming is genuinely not supported yet; this needs a streaming re-frame with end-to-end backpressure, client-disconnect cancellation, and idle/first-token timing.
