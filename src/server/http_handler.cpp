@@ -3,6 +3,7 @@
 #include <sys/stat.h>       // needed for struct stat
 #include "content_type.h"
 #include <sys/sendfile.h>       // needed for sendfile
+#include <sys/uio.h>           // needed for writev/iovec (plaintext gather send)
 #include <fcntl.h>             // needed for open
 #include <unistd.h>            // needed for close
 #include <sstream>             // needed for ostringstream
@@ -1054,17 +1055,19 @@ void HttpHandler::finalize_response(Socket* sock, const HttpRequest& req, HttpRe
     resp_size_[sock] = total_bytes;
 
     auto& queue = send_queues_[sock];
-    // Coalesce header + small body into a single buffer: one SSL_write (one TLS
-    // record) and one syscall per response instead of one per chunk. Large
-    // bodies keep the two-chunk layout so peak memory stays bounded. HEAD
+    // Queue the header as a moved buffer (no copy). On TLS the body is coalesced
+    // into it first: SSL_write needs contiguous plaintext (OpenSSL has no writev
+    // variant), so one buffer means one SSL_write / one record. On plaintext the
+    // body stays a separate chunk and the send path writev()s both in a single
+    // syscall. Large TLS bodies stay split so peak memory stays bounded. HEAD
     // requests have no body here (cleared above).
     constexpr size_t kMaxCoalesceBytes = 64 * 1024;
     const bool has_body = !is_head && !resp.body.empty();
-    if (has_body && resp.body.size() <= kMaxCoalesceBytes) {
+    if (has_body && sock->get_is_ssl_() && resp.body.size() <= kMaxCoalesceBytes) {
         header_str.append(resp.body);
-        queue.emplace_back(header_str.begin(), header_str.end());
+        queue.emplace_back(std::move(header_str));
     } else {
-        queue.emplace_back(header_str.begin(), header_str.end());
+        queue.emplace_back(std::move(header_str));
         if (has_body) {
             queue.emplace_back(resp.body.begin(), resp.body.end());
         }
@@ -1617,12 +1620,11 @@ void HttpHandler::send_error_response(Socket* sock, int code, const std::string&
     }
 
     std::string header = headers_to_string(resp);
-    auto& queue = send_queues_[sock];
-    // Coalesce header + error body into one send chunk (one TLS record/ syscall);
-    // make_error_response bodies are small inline HTML.
+    // Error bodies are small inline HTML; coalesce and move into the queue (one
+    // chunk, one write) with no extra copy.
     header.append(resp.body);
     const size_t total_resp_bytes = header.size();
-    queue.emplace_back(header.begin(), header.end());
+    send_queues_[sock].emplace_back(std::move(header));
 
     resp_status_[sock] = code;
     resp_size_[sock] = total_resp_bytes;
@@ -1708,35 +1710,70 @@ void HttpHandler::handle_write(std::shared_ptr<Socket> sock){
             auto& queue = send_queues_[sock_ptr];
 
             // ==================== Phase 1: send data from the user-space queue ====================
+            // Drop empty chunks so a gather always has payload to write.
+            while (!queue.empty() && queue.front().empty()) queue.pop_front();
+            const bool ssl_conn = sock_ptr->get_is_ssl_();
             while (!queue.empty()) {
+                if (!ssl_conn) {
+                    // Plaintext: gather the queued chunks into iovecs and issue one
+                    // writev for the whole response (nginx-style gather) instead of
+                    // one send() syscall per chunk.
+                    constexpr int kMaxIov = 64;
+                    struct iovec iov[kMaxIov];
+                    int nio = 0;
+                    for (auto& chunk : queue) {
+                        if (nio == kMaxIov) break;
+                        iov[nio].iov_base = chunk.data();
+                        iov[nio].iov_len  = chunk.size();
+                        ++nio;
+                    }
+                    ssize_t n = ::writev(fd, iov, nio);
+                    if (n > 0) {
+                        size_t left = static_cast<size_t>(n);
+                        while (left > 0 && !queue.empty()) {
+                            auto& front = queue.front();
+                            if (left >= front.size()) {
+                                left -= front.size();
+                                queue.pop_front();
+                            } else {
+                                front.erase(front.begin(), front.begin() + static_cast<ptrdiff_t>(left));
+                                left = 0;
+                            }
+                        }
+                    } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
+                        break;
+                    } else if (n == -1 && errno == EPIPE) {
+                        Logger::get()->debug("Client disconnected (EPIPE) on fd {}", fd);
+                        cleanup(sock);
+                        return;
+                    } else {
+                        throw_system_error("writev");
+                    }
+                    continue;
+                }
+
                 auto& front = queue.front();
-                bool is_ssl = sock_ptr->get_is_ssl_();
-                int n = is_ssl ? sock->sslWrite(front.data(), front.size())
-                               : sock->send(front.data(), front.size(), 0);
+                int n = sock->sslWrite(front.data(), front.size());
                 if (n > 0) {
-                    if (is_ssl) pending_ssl_writes_.erase(sock_ptr);
+                    pending_ssl_writes_.erase(sock_ptr);
                     if (n == front.size()) {
                         queue.pop_front();
                     } else {
                         front.erase(front.begin(), front.begin() + n);
                         // Not fully sent, wait for the next EPOLLOUT
-                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);      // Modify events directly: keep monitoring EPOLLOUT and continue sending the remaining data on the next writable event
+                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
                         break;  // Kernel buffer full
                     }
                 } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    if (is_ssl) {
-                        wait_for_ssl_write(sock_ptr, sock->last_ssl_want());
-                        return;
-                    } else {
-                        epoll_.mod(fd, EPOLLOUT | EPOLLET | EPOLLONESHOT);
-                    }
-                    break;
-                } else if(n == -1 && errno == EPIPE){
+                    wait_for_ssl_write(sock_ptr, sock->last_ssl_want());
+                    return;
+                } else if (n == -1 && errno == EPIPE) {
                     // The client has disconnected; this is normal, just clean up the connection
                     Logger::get()->debug("Client disconnected (EPIPE) on fd {}", fd);
                     cleanup(sock);
                     return;
-                }else {
+                } else {
                     throw_system_error("send");
                 }
             }

@@ -86,8 +86,10 @@ private:
     Epoll& epoll_;
     // Per-connection read buffer (for assembling headers)
     std::unordered_map<Socket*, std::string> read_bufs_;
-    // Per-connection pending response data; deque<vector<char>> optimizes front removal
-    std::unordered_map<Socket*, std::deque<std::vector<char>>> send_queues_;
+    // Per-connection pending response data. std::string (not vector<char>) lets a
+    // fully-built header buffer be moved into the queue instead of copied, and
+    // still exposes data()/size()/erase() for the send path.
+    std::unordered_map<Socket*, std::deque<std::string>> send_queues_;
     // Whether a complete request has been parsed, per connection
     std::unordered_map<Socket*, bool> request_ready_;
     // Parser instances (one per connection)
