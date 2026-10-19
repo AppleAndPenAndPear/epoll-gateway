@@ -418,17 +418,65 @@ scripts/benchmark/run_benchmark.sh 8
 #   strace -c -f -o /tmp/st.txt build/server   # run wrk, then SIGTERM the server
 ```
 
+## Re-baseline after the event-driven rewrite (2026-10-19)
+
+The structural cause in Finding D (event loop blocking per upstream round
+trip) was fully removed on 2026-10-14/10-18, so the 2.5-2.7x gap below was a
+pre-fix number. Same box, same methodology as the 2026-09-29 comparison —
+4 local mock backends (ports 9001-9004, HTTP/1.1 keep-alive, TCP_NODELAY),
+`GET /bench` small JSON, TLS terminated at the gateway, 2 workers each side,
+access logging on both, wrk 4.1.0 `-t2` at c8/c50, 10 s per run, 3 interleaved
+rounds, medians. nginx 1.24.0 (same version as the original comparison) was
+installed from the Ubuntu deb into a user prefix — no `SO_REUSEPORT` stale
+binary this time (`ss -tlnp` verified).
+
+| target | conn | RPS (median) | P50 | P99 |
+|---|---|---|---|---|
+| direct (1 backend) | 8 | 1203 | 5.8ms | 26.6ms |
+| direct (1 backend) | 50 | 1252 | 29.0ms | 1.18s |
+| nginx (4 backends) | 8 | 1335 | 5.2ms | 25.4ms |
+| nginx (4 backends) | 50 | 1453 | 29.4ms | 541ms |
+| **epoll-gateway (4 backends)** | 8 | **655** | 11.6ms | 47.8ms |
+| **epoll-gateway (4 backends)** | 50 | **673** | 75.2ms | 257.8ms |
+
+RSS, sampled under simultaneous c50 load against both gateways (not idle —
+not directly comparable to the idle-RSS table above): nginx master + 2
+workers ≈ 28.3 MB; epoll-gateway main + 2 workers ≈ 44-48 MB (the sample
+counted one extra pid; treat as order-of-magnitude). The gateway's steady
+footprint grows with in-flight connection buffers; worth a dedicated idle-vs-
+loaded pass before quoting.
+
+### Findings
+
+1. **The gap narrowed to ~2.0-2.2x** (c8: 1335/655, c50: 1453/673), from
+   2.5-2.7x before the rewrite. The event-driven fix bought roughly 20-30%
+   relative throughput, but the gateway still sits **below the single-backend
+   direct reference** (655 vs 1203 at c8): the backend is not the bottleneck —
+   the gateway's own request path is.
+2. **Per the positioning decision fork, ≥2x after re-baseline means: profile
+   before touching anything.** Candidates ranked by expected value for the
+   *proxy* path (sendfile does not apply here — this benchmark is proxied):
+   per-request allocations/copies (header re-serialization, body transit
+   through `send_queues_`), synchronous AUDIT/CLF log writes on the hot path,
+   TLS record sizing, allocator choice (jemalloc). Target: converge to ≤1.5x
+   of nginx, then stop — beyond that the operations-surface positioning does
+   not benefit.
+3. **p99 noise caveat**: the gateway's c50 p99 (258ms) beat nginx's (541ms) in
+   these runs, but both bounce heavily on the shared box — not a claimable
+   win.
+
 ## Pending
 
-- Traefik / KrakenD comparison (binary download blocked on this network).
-- Re-run the nginx proxy comparison with the corrected mock fixture
-  (Finding A): the earlier proxy rows are not comparable.
-- Fully event-driven upstream forwarding is **done** (2026-10-14): the upstream
-  socket is registered in the same epoll and the round trip runs as a non-blocking
-  state machine on the loop, with no executor thread (see the section above). The
-  before/after was **not** measurable on this shared 2-vCPU box.
-- Re-run the nginx comparison after the fully event-driven upstream change: the
-  earlier proxy rows predate the mock `TCP_NODELAY` fix, the eventfd wake-up and
-  the epoll-registered upstream socket.
+- ~~Re-run the nginx proxy comparison with the corrected mock fixture~~ and
+  ~~re-run it after the fully event-driven upstream change~~ — **done
+  2026-10-19**, see the re-baseline section above (both stale rows replaced).
+- **Profile before optimizing** (new, from the re-baseline fork): flamegraph
+  the proxy path under c50, then attack the top costs — per-request
+  allocations/copies, hot-path log writes, TLS record sizing, allocator.
+  Stop rule: ≤1.5x of nginx on the same scenario.
+- **Idle-vs-loaded RSS pass** — the 2026-10-19 RSS sample was taken under
+  load and counted one extra pid; re-measure cleanly before quoting either
+  number.
 - Per-request log-write share via `logging.access_log_enabled` (access log can
   be turned off independently of AUDIT); not yet isolated with data.
+- Traefik / KrakenD comparison (binary download blocked on this network).
