@@ -508,15 +508,29 @@ alone, as was jemalloc (not installed on the box; the project is zero-dependency
   (they had been left SO_REUSEPORT-bound to 8443 — the documented pollution
   trap). Matrix, medians of 3 interleaved rounds:
 
-| target | c8 RPS | c50 RPS | c8 P50 |
-|---|---|---|---|
-| direct (1 backend) | 1179 | 1623 | 3.9 ms |
-| nginx (4 backends) | 1491 | 1775 | 4.3 ms |
-| **gateway (optimized)** | **744** | **893** | 9.7 ms |
+| target | conn | RPS | P50 | P99 |
+|---|---|---|---|---|
+| direct (1 backend) | c8 | 1179 | 3.9 ms | 196 ms |
+| direct (1 backend) | c50 | 1623 | 21.7 ms | 215 ms |
+| nginx (4 backends) | c8 | 1491 | 4.3 ms | 28 ms |
+| nginx (4 backends) | c50 | 1775 | 22.5 ms | 584 ms |
+| **gateway (optimized)** | c8 | **744** | 9.7 ms | 50 ms |
+| **gateway (optimized)** | c50 | **893** | 47.8 ms | 267 ms |
 
   `gw:nginx` = **~2.0x at both c8 and c50**, above the ≤1.5x stop rule. Against
   the pre-optimization baseline (608/604 RPS) the optimization moved the
   gateway up ~20-45% but barely moved the ratio (~2.5x → ~2.0x).
+
+- **Tail latency (P50/P99) agrees at c8, is unusable at c50.** At **c8** — the
+  clean regime — the gateway's P99 (50 ms) is ~1.8x nginx's (28 ms), the same
+  direction as the RPS ratio (~2.0x) and the P50 ratio (~2.25x): the gateway is
+  not only slower, its tail is longer too. At **c50** the numbers are dominated
+  by the *shared* Python mock backends, which saturate before either gateway:
+  nginx's own P99 leaps from 28 ms (c8) to 584 ms (c50), i.e. the queue sits
+  behind the backend, not the gateway. The gateway's c50 P99 (267 ms) reading
+  *better* than nginx's here is that artifact and must **not** be quoted as a
+  gateway advantage. Read c8 for gateway tail behaviour; treat c50 tail as
+  backend-bound.
 
 - **Why this capture is read as real despite residual noise.** direct and nginx
   still swung ±30-90% across rounds (direct c8 665-1722, a 2.6x spread), but the
