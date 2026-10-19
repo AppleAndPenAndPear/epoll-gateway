@@ -42,8 +42,10 @@ private:
     // route, one per dependency for a composite route. `fd` is the upstream
     // socket currently registered in the epoll set, or -1 when unregistered.
     struct ChildExchange {
+        // The exchange owns the params it was built with (they are moved in, not
+        // copied, and exposed via ex->params()); keeping a second copy here would
+        // duplicate the per-request header map for no benefit.
         std::unique_ptr<UpstreamExchange> ex;
-        UpstreamExchange::Params params;
         int fd = -1;
         UpstreamServer server;
         std::string upstream_key;

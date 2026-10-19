@@ -499,6 +499,30 @@ TLS itself (~21% children in `SSL_write`+`SSL_read`) and kernel network time
 (~17% in unsymbolized `[k]` frames) are paid by nginx equally and were left
 alone, as was jemalloc (not installed on the box; the project is zero-dependency).
 
+### Follow-up structural changes (continued deliberately past the stop rule)
+
+Four more bounded, profile-or-structure-justified changes were made on the same
+path after the table above. Like the earlier ones they are **structural
+claims, not measured RPS wins** — on this shared box the noise exceeds the
+expected increment:
+
+| change | reason |
+|---|---|
+| send queue holds `std::string` (moved, not copied) + plaintext `writev` | removed a redundant per-response copy of the serialized header (and body); plaintext now flushes header+body in one `writev` instead of one `send` per chunk. TLS keeps its single coalesced buffer because OpenSSL 3.0.13 has **no `SSL_writev`**. |
+| route matching + proxy request-header scan de-allocated | `matchRoute`/`splitPath` used `istringstream`+`vector` per segment *per route per request* and the path match ran twice per route; the request-side `connection_tokens`/`find_header_value` did the same. All now scan in place (profile: the stream symbols and `memchr` left the top list, `tolower` self roughly halved 1.45% → 0.66%). |
+| access/audit logger made synchronous | profiling put the spdlog async thread at ~11% of worker CPU plus ~3% cross-thread handoff, and an interleaved access-log on/off run sized logging at ~16% CPU/request. Now a plain synchronous `spdlog::logger` over the same sinks (nginx's model); all log content and rotation unchanged. |
+| per-dispatch params are moved into the owning `UpstreamExchange` | a fresh **post-logging** profile (below) showed the allocator cost is `unordered_map<string,string>` **header-map** churn, and the proxy path held the params twice (member + by-value ctor copy) — one extra always-on deep copy per dispatch, and *per dependency* on a composite. `ChildExchange::params` removed; the retry path copies once, only on a retry. |
+
+Fresh profile used for the last item (`perf record -F 999 -g -p <worker>`, c50
+TLS proxy load, built from the post-logging tree): allocator family **~6.5%
+flat self** (`malloc` 2.10 / `_int_malloc` 1.89 / `cfree` 1.34 / `_int_free`
+1.12), attributed by the call graph to `unordered_map<string,string>` node
+copy/insert/destroy — i.e. the header maps, not generic allocation. A `std::pmr`
+arena was rejected for this bucket: it cannot help without converting the
+header-map types across the request/response model (large, lifetime-sensitive
+blast radius); the nginx-style flat, pool-allocated header list is logged as
+architectural future work in [ROADMAP.md](ROADMAP.md).
+
 ## Validation: functional yes; stop-rule check negative, candidates exhausted
 
 - Unit 137/137, integration 155/155 after all changes.

@@ -1124,26 +1124,30 @@ void HttpHandler::start_upstream_exchange(std::shared_ptr<Socket> sock, const Ht
     child->max_retries = route.upstream_target.max_retries;
     child->circuit_failure_threshold = route.upstream_target.circuit_failure_threshold;
     child->circuit_recovery_timeout_ms = circuit_recovery_timeout_ms;
-    child->params.host = server.host;
-    child->params.port = server.port;
-    child->params.method = req.method;
-    child->params.path = req.path;
-    child->params.headers = req.headers;
-    child->params.body = req.body;
-    child->params.timeout_ms = route.upstream_target.timeout_ms;
-    child->params.max_response_bytes = config_.max_response_bytes;
-    child->params.tls.enable = server.tls;
-    child->params.tls.ca_file = server.tls_ca_file;
-    child->params.tls.server_name = server.tls_server_name;
-    child->params.tls.skip_verify = server.tls_skip_verify;
-    if (child->params.headers.count("traceparent") == 0) {
-        child->params.headers["traceparent"] = generate_traceparent();
+    // Build the params in a local and move them into the exchange, which owns
+    // them for its whole lifetime. Keeping a second copy in ChildExchange would
+    // deep-copy the (per-request) header map again on every dispatch.
+    UpstreamExchange::Params params;
+    params.host = server.host;
+    params.port = server.port;
+    params.method = req.method;
+    params.path = req.path;
+    params.headers = req.headers;
+    params.body = req.body;
+    params.timeout_ms = route.upstream_target.timeout_ms;
+    params.max_response_bytes = config_.max_response_bytes;
+    params.tls.enable = server.tls;
+    params.tls.ca_file = server.tls_ca_file;
+    params.tls.server_name = server.tls_server_name;
+    params.tls.skip_verify = server.tls_skip_verify;
+    if (params.headers.count("traceparent") == 0) {
+        params.headers["traceparent"] = generate_traceparent();
     }
-    inject_forwarded_headers(child->params.headers, client_ip);
+    inject_forwarded_headers(params.headers, client_ip);
 
-    const bool idempotent = child->params.method == "GET" || child->params.method == "HEAD" ||
-                            child->params.method == "OPTIONS";
-    child->ex = std::make_unique<UpstreamExchange>(child->params, idempotent);
+    const bool idempotent = params.method == "GET" || params.method == "HEAD" ||
+                            params.method == "OPTIONS";
+    child->ex = std::make_unique<UpstreamExchange>(std::move(params), idempotent);
     st->children.push_back(std::move(child));
 
     // Publish the exchange BEFORE driving it: the very first step can finish
@@ -1239,25 +1243,28 @@ void HttpHandler::start_composite_exchange(std::shared_ptr<Socket> sock, const H
         const int effective_timeout_ms = st->has_total_deadline
             ? std::min(dep.timeout_ms, st->total_timeout_ms)
             : dep.timeout_ms;
-        child->params.host = server.host;
-        child->params.port = server.port;
-        child->params.method = dep.method;
-        child->params.path = dep.path;
-        child->params.headers = req.headers;
-        child->params.body = req.body;
-        child->params.timeout_ms = effective_timeout_ms;
-        child->params.max_response_bytes = max_response_bytes;
-        child->params.tls.enable = server.tls;
-        child->params.tls.ca_file = server.tls_ca_file;
-        child->params.tls.server_name = server.tls_server_name;
-        child->params.tls.skip_verify = server.tls_skip_verify;
-        if (child->params.headers.count("traceparent") == 0) {
-            child->params.headers["traceparent"] = child->item["traceparent"].get<std::string>();
+        // Build this dependency's params in a local and move them into its
+        // exchange (see start_upstream_exchange for the rationale).
+        UpstreamExchange::Params params;
+        params.host = server.host;
+        params.port = server.port;
+        params.method = dep.method;
+        params.path = dep.path;
+        params.headers = req.headers;
+        params.body = req.body;
+        params.timeout_ms = effective_timeout_ms;
+        params.max_response_bytes = max_response_bytes;
+        params.tls.enable = server.tls;
+        params.tls.ca_file = server.tls_ca_file;
+        params.tls.server_name = server.tls_server_name;
+        params.tls.skip_verify = server.tls_skip_verify;
+        if (params.headers.count("traceparent") == 0) {
+            params.headers["traceparent"] = child->item["traceparent"].get<std::string>();
         }
-        inject_forwarded_headers(child->params.headers, client_ip);
+        inject_forwarded_headers(params.headers, client_ip);
 
         const bool idempotent = dep.method == "GET" || dep.method == "HEAD" || dep.method == "OPTIONS";
-        child->ex = std::make_unique<UpstreamExchange>(child->params, idempotent);
+        child->ex = std::make_unique<UpstreamExchange>(std::move(params), idempotent);
         live.push_back(st->children.size());
         st->children.push_back(std::move(child));
     }
@@ -1415,9 +1422,13 @@ void HttpHandler::finish_child(Socket* client, ExchangeState* st, size_t idx) {
     if (ch.attempt_count < ch.max_retries &&
         should_retry_backend_request(st->req.method, error, ch.attempt_count)) {
         ++ch.attempt_count;
-        const bool idempotent = ch.params.method == "GET" || ch.params.method == "HEAD" ||
-                                ch.params.method == "OPTIONS";
-        ch.ex = std::make_unique<UpstreamExchange>(ch.params, idempotent);
+        // The exchange owns its params, so a replay copies them out of the
+        // outgoing exchange before it is replaced. This pays one deep copy only
+        // on the rare retry path, not on every request.
+        UpstreamExchange::Params replay = ch.ex->params();
+        const bool idempotent = replay.method == "GET" || replay.method == "HEAD" ||
+                                replay.method == "OPTIONS";
+        ch.ex = std::make_unique<UpstreamExchange>(std::move(replay), idempotent);
         drive_child(client, st, idx, 0);
         return;
     }
