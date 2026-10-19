@@ -4,6 +4,16 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-19
+
+### Changed
+
+- **`composite_target.name` now has a runtime effect: it is surfaced as the `aggregate` field of the composite JSON response** (`{"route", "aggregate", "status", "dependencies"}`). Previously the field was required by validation but never read at runtime — the sample configs happened to set it equal to the route name, which masked that it did nothing. `route` continues to identify the matched route (the same value used by metrics and the audit log); `aggregate` identifies the composition itself, so the two can legitimately differ. The non-empty validation is unchanged and is now meaningful.
+
+### Tests
+
+- One new integration assertion (the `/profile` composite reports `aggregate: "profile-page"`): unit 137/137, integration 155/155 (2026-10-19).
+
 ## 2026-10-18
 
 ### Changed

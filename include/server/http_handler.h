@@ -75,6 +75,7 @@ private:
         // deadline (which UpstreamExchange refreshes on I/O progress).
         bool composite = false;
         std::string route_name;          // aggregate "route" field, snapshotted
+        std::string composite_name;      // composite_target.name: aggregate "aggregate" field, snapshotted
         int total_timeout_ms = 0;
         bool has_total_deadline = false;
         std::chrono::steady_clock::time_point total_deadline;

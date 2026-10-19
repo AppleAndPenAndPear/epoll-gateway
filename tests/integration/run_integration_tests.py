@@ -628,9 +628,13 @@ def test_profile_composite_route(fail_control_dir):
     check("profile user dependency succeeded", payload["dependencies"]["user"]["status"] == "ok", str(payload))
     check("profile orders dependency succeeded", payload["dependencies"]["orders"]["status"] == "ok", str(payload))
     check("profile recommendations dependency succeeded", payload["dependencies"]["recommendations"]["status"] == "ok", str(payload))
-    check("user dependency includes timing and trace context", 
+    check("user dependency includes timing and trace context",
           payload["dependencies"]["user"].get("duration_ms") is not None and payload["dependencies"]["user"].get("traceparent"),
           str(payload["dependencies"]["user"]))
+    # composite_target.name must have a runtime effect: it is surfaced as the
+    # aggregate identifier, separate from the matched route name.
+    check("profile composite reports the aggregate identifier",
+          payload.get("aggregate") == "profile-page", str(payload))
 
     reject_path = os.path.join(fail_control_dir, "reject")
     with open(reject_path, "w") as f:

@@ -256,7 +256,7 @@ These supersede the earlier P1~P6 framing above and are the active sequence; cur
   - `composite_target.total_timeout_ms` is enforced as a hard wall-clock deadline independent of each child's idle deadline (which is refreshed on I/O progress), so a slowly-streaming backend cannot outlive the budget
   - Composite dependencies now report `record_success`/`record_failure`, so the circuit breaker accounts for composite traffic like single-upstream traffic
   - `BoundedAsyncUpstreamExecutor` and the `upstream_max_inflight`/`upstream_max_queue` keys removed (no remaining callers); the `rejected`/`executor_overloaded` dependency statuses removed from the outward JSON contract
-- Current verification: 137/137 unit, 154 integration assertions (2026-10-18)
+- Current verification: 137/137 unit, 155 integration assertions (2026-10-19)
 
 ### Direction decision (2026-10-17)
 

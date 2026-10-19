@@ -1116,6 +1116,7 @@ void HttpHandler::start_composite_exchange(std::shared_ptr<Socket> sock, const H
     st->client_ip = client_ip;
     st->composite = true;
     st->route_name = route.name;
+    st->composite_name = route.composite_target.name;
     st->started = std::chrono::steady_clock::now();
     st->total_timeout_ms = route.composite_target.total_timeout_ms;
     st->has_total_deadline = st->total_timeout_ms > 0;
@@ -1424,7 +1425,11 @@ void HttpHandler::finalize_composite(Socket* client, ExchangeState* st) {
     resp.status_message = required_failed ? "Service Unavailable" : "OK";
     resp.headers["Content-Type"] = "application/json";
     json payload = json::object();
+    // `route` identifies the matched route (same value used by metrics and the
+    // audit log); `aggregate` identifies the composition itself, giving the
+    // otherwise-unused composite_target.name a real runtime effect.
     payload["route"] = st->route_name;
+    payload["aggregate"] = st->composite_name;
     payload["status"] = required_failed ? "partial_failure" : "ok";
     payload["dependencies"] = composite;
     resp.body = payload.dump();

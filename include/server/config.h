@@ -68,7 +68,7 @@ struct CompositeDependency {
 };
 
 struct CompositeTarget {
-    std::string name;                       // composite route identifier
+    std::string name;                       // aggregate identifier; surfaced as the "aggregate" field of the composite response
     std::vector<CompositeDependency> dependencies;
     // Overall wall-clock budget for the whole fan-out. 0 disables it (each
     // dependency is then bounded only by its own timeout_ms). When set, it caps
