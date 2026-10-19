@@ -2,7 +2,6 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include <spdlog/async.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <vector>
@@ -23,14 +22,17 @@ void Logger::init(const string& log_file_path){
             
             vector<spdlog::sink_ptr> sinks {console_sink, file_sink};
 
-            // larger queue and 2 worker threads to reduce contention
-            spdlog::init_thread_pool(32768, 2);
-            
-            // 3. create the async logger on the global thread pool
-            auto logger = std::make_shared<spdlog::async_logger>(
-                "server", sinks.begin(), sinks.end(),
-                spdlog::thread_pool(),
-                spdlog::async_overflow_policy::overrun_oldest);
+            // Synchronous logger. The async logger added a per-message
+            // cross-thread handoff (condvar signal + wake, plus a heap copy of
+            // every formatted line into the queue), two worker threads and a
+            // periodic flusher per worker process; profiling under c50 probe
+            // load attributed ~11% of process CPU to that logging thread for
+            // one access-log line per request. Writing synchronously to the
+            // buffered file sink costs a memcpy into the stdio buffer (the 1 s
+            // periodic flush below bounds actual file I/O), which is how nginx
+            // writes its access lines. The flush policy is unchanged.
+            auto logger = std::make_shared<spdlog::logger>(
+                "server", sinks.begin(), sinks.end());
             
             // production: level set to debug for easier troubleshooting
             logger->set_level(spdlog::level::debug);
