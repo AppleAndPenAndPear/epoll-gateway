@@ -1,6 +1,6 @@
 # 从零用 C++17 写一个 API 网关：线程模型、控制面分离，以及三个真实 Bug
 
-> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md)，测试计数来自 CI 的实际输出（101 个单测 / 77 条集成断言）。
+> 这是一篇架构复盘，不是教程。文章里出现的每个数字、每个 Bug、每段结论都来自同一个真实项目（[epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)）：一个 C++17 写的单二进制 API 网关，不含 etcd/Postgres/Redis 之类的运行时依赖。文中的代码片段与行号指向仓库里的真实文件，压测数据来自 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md)，测试计数来自 CI 的实际输出（137 个单测 / 155 条集成断言）。
 
 想直接上手的话，三条命令就能跑起来（预编译包已捆绑 libspdlog/libfmt，静态链接 C++ 运行时，环境要求 glibc ≥ 2.35 且系统自带 OpenSSL 3，即 Ubuntu 22.04+ / Debian 12+）：
 
@@ -42,7 +42,7 @@ tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
 
 - 没有共享 accept 队列，也就没有多线程争抢 accept 的惊群问题——内核直接把连接散列到某个监听套接字；
 - 连接一旦落到某个 worker，之后所有读写都在这个线程里完成，**同一 fd 任意时刻只被一个线程碰**，不需要给连接加锁；
-- worker 之间需要共享的状态少得可怜：upstream 健康/熔断状态、全局限流器、日志。前两者是进程级 `shared_ptr`（`UpstreamManager`）+ mutex 保护的快照，日志是 spdlog 异步队列。
+- worker 之间需要共享的状态少得可怜：upstream 健康/熔断状态、全局限流器、日志。前两者是进程级 `shared_ptr`（`UpstreamManager`）+ mutex 保护的快照，日志是 spdlog 同步写缓冲文件 sink——早期用异步队列，`perf` 显示其后台线程吃掉约 11% CPU 后改回同步；flush 策略为错误级立即、info 级 1 秒周期。
 
 代价也要写清楚：`num_workers` 必须是配置项而不能靠"自动感知"，因为一个 worker 就是一条线程一个事件循环；跨 worker 的全局配额（比如按 IP 的全局限流总量）需要共享对象而不是线程局部计数。
 
@@ -227,7 +227,7 @@ tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                              # 构建 + 101 单测 + 77 条集成断言
+./ci.sh                              # 构建 + 137 单测 + 155 条集成断言
 scripts/benchmark/run_benchmark.sh   # wrk 压测（15s/场景）
 ```
 

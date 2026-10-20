@@ -1,6 +1,6 @@
 # Writing an API gateway from scratch in C++17: the threading model, control-plane separation, and three real bugs
 
-> A architecture retrospective, not a tutorial. Every number, bug and conclusion below comes from one real project ([epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)): a single-binary API gateway in C++17 with no etcd/Postgres/Redis runtime dependency. Code references point at real files, benchmark numbers come from `docs/BENCHMARKS.md`, and test counts are actual CI output (101 unit tests / 77 integration assertions).
+> An architecture retrospective, not a tutorial. Every number, bug and conclusion below comes from one real project ([epollthread](https://github.com/AppleAndPenAndPear/epoll-gateway)): a single-binary API gateway in C++17 with no etcd/Postgres/Redis runtime dependency. Code references point at real files, benchmark numbers come from `docs/BENCHMARKS.md`, and test counts are actual CI output (137 unit tests / 155 integration assertions).
 
 ## 1. Why write another gateway
 
@@ -30,7 +30,7 @@ Each `TcpWorker` creates its own `SO_REUSEPORT` listen socket and runs its own e
 
 - No shared accept queue, therefore no accept thundering herd — the kernel hashes the connection onto one listen socket.
 - Once a connection lands on a worker, all of its I/O happens on that thread. **No two threads ever touch the same fd**, so connections need no locking.
-- Shared state between workers shrinks to almost nothing: upstream health/circuit state, the global rate limiter, the logger. The first is a process-wide `shared_ptr<UpstreamManager>` with mutex-protected snapshots; the last is spdlog's async queue.
+- Shared state between workers shrinks to almost nothing: upstream health/circuit state, the global rate limiter, the logger. The first is a process-wide `shared_ptr<UpstreamManager>` with mutex-protected snapshots; the last is a synchronous spdlog write into a buffered file sink — an async queue was tried first, but `perf` attributed ~11% of process CPU to its background thread, so it was reverted; flushes are immediate for errors and on a 1-second cycle for info-level.
 
 The costs are worth stating too: `num_workers` has to be explicit config (one worker is one thread with one event loop), and cross-worker quotas (say, a global per-IP rate limit) must live in a shared object rather than per-thread counters.
 
@@ -180,7 +180,7 @@ Current state: **137 unit tests (CTest) + 155 integration assertions**, all thro
 ```bash
 git clone https://github.com/AppleAndPenAndPear/epoll-gateway
 cd epoll-gateway
-./ci.sh                              # build + 101 unit tests + 77 integration assertions
+./ci.sh                              # build + 137 unit tests + 155 integration assertions
 scripts/benchmark/run_benchmark.sh   # wrk benchmark (15 s per scenario)
 ```
 
