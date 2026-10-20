@@ -4,6 +4,22 @@ Notable changes to the project. Format follows [Keep a Changelog](https://keepac
 
 > For a detailed snapshot of the current project state, see [PROJECT_STATUS.md](PROJECT_STATUS.md). This file traces back "what was done, when, and why".
 
+## 2026-10-20
+
+### Performance (4-vCPU re-measure closes the stop rule)
+
+- **The nginx-gap verdict is revised from ~2.0x to ~1.4x on a quiet 4-vCPU box, and the stop rule (≤ 1.5x) is met.** The earlier ~2.0x was a measurement artifact: 2 vCPU forced the gateway, nginx and the Python mock backends to compete for the same cores, and the shared-core backends saturated at ~2000 RPS aggregate, compressing the `gw:nginx` ratio. With 4 vCPU pinned (backends 0-1, gateway 2, load generator 3), interleaved rounds with per-round pairing, and r2-r5 medians, the optimized gateway measures **~1.4x of nginx** at both c8 and c50. The flat-pool header-list lever stays closed. Details and the full matrix: [BENCHMARKS.md](BENCHMARKS.md).
+- **New gated comparison harness: [scripts/run_comparison.sh](../scripts/run_comparison.sh).** Encodes the measurement methodology — pre-run gates (load average, stray processes), 4-vCPU core pinning, per-cell retry, min-max spread columns, and a `direct` stability check — so future re-measures run the same procedure instead of ad-hoc invocations.
+- **mock_backend: `request_queue_size` raised 5 → 128.** Under c50 the stdlib default SYN backlog overflowed, so health probes misjudged live backends as down and tripped the circuit breaker — measurement-configuration, not product, but it invalidates any benchmark run it hits.
+
+### Documentation
+
+- Copy sweep across README/BENCHMARKS/docs: unverifiable performance claims replaced with the measured ~1.4x baseline; stale test counts and the async-logging description corrected in the article drafts before publishing.
+
+### Tests
+
+- Unit 137/137, integration 155/155 (2026-10-20, at the release commit).
+
 ## 2026-10-19
 
 ### Performance (profile-driven hot-path optimization)
