@@ -585,3 +585,52 @@ hundreds of objects) can consume more CPU than the system under test. Signs:
 `vmstat 1` shows 20%+ sys time with no benchmark running; same-binary RPS
 varies >2x between minutes. Run `vmstat 1` alongside any benchmark and treat
 numbers from contended windows as invalid.
+
+## Sync vs async logger A/B (2026-10-20)
+
+Question raised in review: with a synchronous logger, does writing an access /
+AUDIT / error line block the worker event loop, and should the async logger be
+restored? Measured rather than argued.
+
+Fixture: one gateway process / one event loop (`num_workers: 1`), TLS on 8443,
+`GET /bench` round-robin to four local mock backends, audit + access log on
+(`access_log_enabled: true`), `wrk -t2 -c50`. The two binaries differ **only** in
+`src/common/mylogger.cpp`: sync (HEAD, plain `spdlog::logger`) vs the async
+logger (`async_logger` + `init_thread_pool(32768, 2)`), both on the same flush
+policy (`flush_on(err)` + `flush_every(1s)`). A `*.log`-write delay of 3 ms,
+injected with an `LD_PRELOAD` shim, models a slow log volume; the no-shim cell is
+the normal page-cache case. Two interleaved rounds (30 s + 15 s), medians below.
+
+| binary | log sink | RPS | P50 | P99 |
+|---|---|---|---|---|
+| sync (HEAD) | page cache | 1936 | 23.8 ms | 61 ms |
+| async | page cache | 1283 | 38.6 ms | 192 ms |
+| sync (HEAD) | +3 ms/write | 1560 | 32.8 ms | 164 ms |
+| async | +3 ms/write | 1178 | 40.2 ms | 206 ms |
+
+Findings:
+
+1. **Sync wins on every axis, with and without the slow sink** — higher RPS,
+   lower P50, and no worse P99. The async logger's two worker threads plus the
+   per-message cross-thread handoff cost more on a 2-vCPU box than they save.
+2. **The blocking concern is mechanically real but bounded.** Slowing the sink
+   drops sync RPS 1936 → 1560 and lifts P99 61 → 164 ms, i.e. a log write does
+   reach the loop thread. But that cost is smaller than async's own overhead, and
+   it only appears when the sink itself is slow. In the normal case both
+   access/AUDIT (info, buffered by stdio) and error+ (`flush_on(err)`) writes are
+   cheap page-cache `write()`s with no `fsync` — the same path nginx uses; nginx's
+   default `access_log` is likewise unbuffered and relies on cheap write(), not on
+   a logger thread.
+3. **Correctness:** the async logger used `async_overflow_policy::overrun_oldest`,
+   which **silently drops** queued lines when the queue fills. That is
+   unacceptable for AUDIT lines. The sync logger never drops.
+
+**Decision: keep the synchronous logger.** The current configuration already
+mirrors the nginx model (access/AUDIT buffered at info level, error+ flushed
+synchronously, a 1 s periodic flusher). Restoring async is a measured regression
+on this box.
+
+History note: the async logger was the project's **original** design (initial
+commit), not a fix for a slow synchronous logger. The change that actually cut
+per-request logging cost was `flush_on(info)` → `flush_on(err)` + `flush_every(1s)`;
+that is independent of sync vs async.
