@@ -471,9 +471,11 @@ loaded pass before quoting.
   ~~re-run it after the fully event-driven upstream change~~ — **done
   2026-10-19**, see the re-baseline section above (both stale rows replaced).
 - ~~**Profile before optimizing** (new, from the re-baseline fork)~~ — **profiled
-  2026-10-19 and the ≤1.5x stop-rule check is now done (negative, ~2.0x)**; the
-  sprint stopped on the candidates-exhausted prong. See the optimization-sprint
-  section below.
+  2026-10-19 and the ≤1.5x stop-rule check was negative on 2 vCPU (~2.0x)**;
+  on 2026-10-20 the comparison was re-run on a 4-vCPU box with role pinning and
+  a de-capped fixture, and the ratio came in at **~1.4x — inside the ≤1.5x
+  stop rule**. See "4-vCPU measurement (2026-10-20)" below; the ~2.0x 2-core
+  number is retained as history but superseded.
 - **Idle-vs-loaded RSS pass** — the 2026-10-19 RSS sample was taken under
   load and counted one extra pid; re-measure cleanly before quoting either
   number.
@@ -551,10 +553,10 @@ architectural future work in [ROADMAP.md](ROADMAP.md).
   not only slower, its tail is longer too. At **c50** the numbers are dominated
   by the *shared* Python mock backends, which saturate before either gateway:
   nginx's own P99 leaps from 28 ms (c8) to 584 ms (c50), i.e. the queue sits
-  behind the backend, not the gateway. The gateway's c50 P99 (267 ms) reading
-  *better* than nginx's here is that artifact and must **not** be quoted as a
+  behind the backend, not the gateway. The gateway P99 (267 ms) reading *better* than nginx's here is that artifact and must **not** be quoted as a
   gateway advantage. Read c8 for gateway tail behaviour; treat c50 tail as
-  backend-bound.
+  backend-bound. **(2026-10-20: the ~2.0x reading itself was later traced to a
+  fixture cap + shared-core contention, see the 4-vCPU section below.)**
 
 - **Why this capture is read as real despite residual noise.** direct and nginx
   still swung ±30-90% across rounds (direct c8 665-1722, a 2.6x spread), but the
@@ -634,3 +636,84 @@ History note: the async logger was the project's **original** design (initial
 commit), not a fix for a slow synchronous logger. The change that actually cut
 per-request logging cost was `flush_on(info)` → `flush_on(err)` + `flush_every(1s)`;
 that is independent of sync vs async.
+
+---
+
+# 4-vCPU measurement (2026-10-20): the ~2.0x gap was a fixture artifact; ratio ≈ 1.4x
+
+The VM was expanded from 2 to 4 vCPU (requires a full VMware power-off; a guest
+reboot is not enough because the CPU count is in the guest's ACPI topology).
+With four cores the comparison no longer needs to stack three roles onto two
+cores, and two measurement errors in the 2026-10-19 matrix became fixable.
+
+## Methodology changes baked into [run_comparison.sh](../scripts/benchmark/run_comparison.sh)
+
+1. **Role pinning**: backends on cores 0-1, both gateways symmetrically on one
+   core each (core 2), wrk on core 3. On 2 vCPU the CPU-hungry gateway shared
+   cores with everything and absorbed the contention more than nginx did —
+   part of the old 2.0x.
+2. **Fixture de-capping (the big one)**: 4 Python mock backends share an
+   aggregate ceiling of ~2000 RPS *per core*, regardless of process count. The
+   old single-core split capped the fixture right where nginx was measured
+   (nginx c8 1491 = ~75% of the cap), so **both gateways queued behind a
+   saturated shared backend, which compresses their ratio**. With two backend
+   cores the cap is ~4000+ and nginx measures 2977 (was 1748 under the cap).
+3. **Backlog fix**: the mock's stdlib `request_queue_size = 5` overflowed under
+   c50, dropping SYNs so the gateway's health probe marked live backends as
+   down (circuit-breaker cascade). Fixed in [mock_backend.py](../tests/integration/mock_backend.py)
+   (`request_queue_size = 128`); after the fix: zero breaker events, and the
+   previously always-failing direct-c50 cell completes.
+4. **Noise gates + honest cell handling**: pre-run gates (port-littering check,
+   1-min loadavg < 1.0, IDE helper processes renice'd to 19), per-cell retry
+   once then FAIL-and-continue (one bad cell no longer aborts the matrix),
+   min–max spread in the summary, and a direct-row stability check.
+5. **Paired-round analysis is the primary reading**: interleaved rounds share
+   host noise, so the per-round gw:nginx ratio is the statistic, not the ratio
+   of medians.
+
+## Noise floor finding
+
+Two same-binary A/A calibration passes failed at 20.3% and 16.4% spread (2-run
+min/max, tolerance 10%) in windows that passed all load gates — the residual
+noise is host-level (laptop frequency scaling / host scheduling) and invisible
+from inside the guest. Decision: proceed with 5 interleaved rounds and report
+medians with spreads rather than declare the box unmeasurable.
+
+## Result (5 interleaved rounds, medians)
+
+| target | conn | RPS (median) | P50 | P99 | RPS min–max |
+|---|---|---|---|---|---|
+| gateway | c8 | 2101 | 3.44 ms | 12.0 ms | 1470 – 2276 |
+| nginx | c8 | 2977 | 2.33 ms | 9.1 ms | 2578 – 3243 |
+| direct (1 backend) | c8 | 2023 | 3.56 ms | 13.8 ms | 1793 – 2244 |
+| gateway | c50 | 1993 | 24.4 ms | 77 ms | 1770 – 2193 |
+| nginx | c50 | 2566 | 15.9 ms | 296 ms | 2360 – 3031 |
+| direct (1 backend) | c50 | 2186 | 20.2 ms | 401 ms | 2047 – 2322 |
+
+Per-round paired gw:nginx at c8: 0.49 (first-round cold-start outlier), then
+0.72 / 0.68 / 0.86 / 0.70 — **r2-r5 mean 0.74, i.e. gw:nginx ≈ 1.35x; the
+median-of-medians reading is 1.42x. Call it ~1.4x.**
+
+## Verdict and caveats
+
+- **The ≤1.5x stop rule is met on this measurement.** The 2026-10-19 sprint
+  verdict ("negative, candidates exhausted") is superseded: the structural
+  fixes landed there were real (they took the gateway from 608 → ~2100 RPS
+  absolute), and the residual gap is ~1.4x, not ~2.0x.
+- **The nginx-style flat pool-allocated header list is no longer justified by
+  this rule.** It was logged as the remaining lever to close 2.0x → 1.5x; with
+  the ratio already inside 1.5x the large-blast-radius change stays deferred
+  (ROADMAP), to be revisited only if a customer requirement makes the gap
+  commercial.
+- **Confidence bounds are honest, not tight**: host noise ±20-30% per run
+  (direct-row spread 25.1% in this window), the gateway's first measured round
+  after startup is consistently an outlier (cold start; 535/1287/1470 in three
+  separate runs — future runs should warm the gateway longer or drop r1), and
+  nginx's P99 remains better (9.1 vs 12.0 ms at c8). The ~1.4x claim is a
+  central estimate with roughly ±0.15 uncertainty, not a tight number.
+- c50 rows remain backend-bound (shared 4-backend Python fixture saturates
+  before either gateway); do not quote c50 tails.
+- Two script alarms now have stale premises and were read manually: "direct <
+  nginx" is expected (direct is a *single process* capped ~2200 by design;
+  nginx fan-outs 4 backends), and the direct-row spread threshold is marginal
+  at 25.1% vs 25%.

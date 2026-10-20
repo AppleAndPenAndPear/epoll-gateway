@@ -179,6 +179,11 @@ class _NodelayHTTPServer(http.server.ThreadingHTTPServer):
     # the gateway's proxy path measure this fixture, not the gateway. There is
     # no stdlib "disable_nagle_algorithm" attribute, so set TCP_NODELAY on each
     # accepted socket explicitly.
+    # The stdlib default request_queue_size of 5 overflows the listen backlog
+    # under benchmark concurrency (c50): SYNs are dropped, connects time out,
+    # and the gateway's health probe marks a perfectly alive backend as down.
+    request_queue_size = 128
+
     def get_request(self):
         conn, addr = super().get_request()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
