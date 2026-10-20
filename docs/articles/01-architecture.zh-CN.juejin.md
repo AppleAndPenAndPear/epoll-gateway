@@ -5,7 +5,7 @@
 想直接上手的话，三条命令就能跑起来（预编译包已捆绑 libspdlog/libfmt，静态链接 C++ 运行时，环境要求 glibc ≥ 2.35 且系统自带 OpenSSL 3，即 Ubuntu 22.04+ / Debian 12+）：
 
 ```bash
-curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/latest/download/epollthread-0.3.0-x86_64.tar.xz
+curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/download/v0.3.0/epollthread-0.3.0-x86_64.tar.xz
 tar -xJf epollthread-0.3.0-x86_64.tar.xz && cd epollthread-0.3.0-x86_64
 ./scripts/gen_dev_certs.sh && ./start.sh   # 网关监听 https://localhost:5005
 ```
@@ -217,7 +217,7 @@ void drain_request_body(int fd, const ParsedAdminRequest& req) {
 **方式 A——预编译发行包**（x86_64 + aarch64，无需任何工具链）：
 
 ```bash
-curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/latest/download/epollthread-0.3.0-x86_64.tar.xz
+curl -LO https://github.com/AppleAndPenAndPear/epoll-gateway/releases/download/v0.3.0/epollthread-0.3.0-x86_64.tar.xz
 tar -xJf epollthread-0.3.0-x86_64.tar.xz && cd epollthread-0.3.0-x86_64
 ./scripts/gen_dev_certs.sh && ./start.sh
 ```
