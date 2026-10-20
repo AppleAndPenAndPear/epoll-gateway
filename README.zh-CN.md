@@ -2,7 +2,7 @@
 
 # epollthread
 
-基于 C++17 实现的高性能多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合异步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 与 W3C traceparent 请求追踪、事件驱动的上游转发（单上游与 composite 扇出均由 worker 的 epoll 以非阻塞状态机驱动）、composite（扇出）路由与部分失败语义（聚合响应携带 aggregate 标识）、AUDIT/CLF 双通道日志（独立访问日志开关 + 默认敏感字段/查询参数脱敏）、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署；所有资源均有显式上限（`max_connections` 过载卸载、可配置的响应体上限、上游扇出受连接/fd 预算约束）并附容量说明表与内存模型；并包含单元测试（137/137 通过）、集成测试（155 项断言，含持续过载压测）及 AddressSanitizer 支持。
+基于 C++17 实现的多线程 HTTP/HTTPS API 网关与网络服务器，采用 **SO_REUSEPORT + epoll + One Loop Per Thread** 架构，配合同步日志和非阻塞 I/O。项目支持 HTTP/1.1、加固 TLS（最低 1.2、AEAD 套件白名单、证书热加载，客户端侧与上游侧双跳覆盖）、Keep-Alive 与上游连接池、零拷贝文件传输、LRU/FD 缓存、带 schema 校验的配置驱动路由、反向代理与上游健康检查、HTTP 请求走私防护、幂等重试与基础熔断、API Key 鉴权（密钥可从独立文件或环境变量加载）、host/tenant 策略、令牌桶限流、X-Trace-Id 与 W3C traceparent 请求追踪、事件驱动的上游转发（单上游与 composite 扇出均由 worker 的 epoll 以非阻塞状态机驱动）、composite（扇出）路由与部分失败语义（聚合响应携带 aggregate 标识）、AUDIT/CLF 双通道日志（独立访问日志开关 + 默认敏感字段/查询参数脱敏）、`SIGHUP` runtime reload、upstream 超时与错误分类、Prometheus 指标、Docker 部署；所有资源均有显式上限（`max_connections` 过载卸载、可配置的响应体上限、上游扇出受连接/fd 预算约束）并附容量说明表与内存模型；并包含单元测试（137/137 通过）、集成测试（155 项断言，含持续过载压测）及 AddressSanitizer 支持。与 Nginx 1.24 的同条件对比（2026-10-20，4 vCPU 专机实测，逐轮配对分析）吞吐差距约 **~1.4x**，落在预设 ≤1.5x 停止规则内，详见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 
 ## 5 分钟快速体验
 
@@ -83,7 +83,7 @@ upstream——见 [examples/](examples/) 下的可运行场景。
 - **API Key 认证**：提供 API Key 校验与提取工具（支持 `X-API-Key` 请求头与 `Authorization: Bearer` 两种方式），支持 route allow/deny 以及 API Key 的 host/tenant 范围和差异化限流额度。密钥可内联在 `config.json`，也可通过 `api_keys_file` 指向独立文件或由 `GW_API_KEYS` 环境变量注入（优先级 env > file > 内联），让敏感信息与主配置分离。
 - **非阻塞 I/O + 边缘触发**：所有套接字使用非阻塞模式，结合 `EPOLLET` 和 `EPOLLONESHOT`，精细控制事件通知，避免惊群和重复触发。
 - **动态线程池**：可配置最小/最大线程数，依据任务负载自动扩缩容（目前预留接口，用于未来异步业务处理）。
-- **异步日志系统**：基于 `spdlog` 的全局线程池，支持控制台彩色输出与文件滚动存储，可分别控制各级别日志输出，性能开销低。
+- **同步日志系统**：基于 `spdlog` 的同步日志，支持控制台彩色输出与文件滚动存储，可分别控制各级别日志输出；从异步改回同步是性能剖析的结果——异步后台线程与跨线程唤醒在高负载下约占 14% CPU，而同步写入在当前审计/访问日志量下开销可接受。
 - **AUDIT + CLF 双通道日志**：CLF 访问日志记录所有完成请求的 IP、方法、路径、状态码、响应大小与耗时；AUDIT 日志在响应完成时统一记录失败和安全策略事件（含 trace_id、route、Host/Tenant、失败原因和脱敏后的 API Key），避免重复写入。
 - **请求/响应日志**：记录每个请求的方法、路径、状态码、User-Agent、客户端 IP 及响应大小，便于监控与分析。
 - **RAII 资源管理**：`Socket`、`Epoll` 等资源封装为 RAII 类，支持移动语义，杜绝描述符泄漏。
@@ -147,7 +147,7 @@ upstream——见 [examples/](examples/) 下的可运行场景。
 - **Prometheus**：定期从 `server:5005/metrics` 刮取指标数据，存储时序数据。
 - **Grafana**：连接 Prometheus 作为数据源，提供实时可视化仪表盘。
 - **DynamicThreadPool**：可选的共享线程池，用于将耗时任务从 I/O 线程卸载到工作线程（预留扩展）。
-- **Logger**：全局异步日志器，通过 spdlog 全局线程池实现高性能日志记录。
+- **Logger**：全局同步日志器（spdlog），控制台与滚动文件双 sink；此前为异步实现，剖析显示其后台线程与跨线程唤醒在高负载下占约 14% CPU 后改回同步。
 
 ## 项目结构
 
@@ -179,7 +179,7 @@ epollthread/
 │       ├── mysocket.h        # Socket RAII 封装（含 SSL 支持）
 │       ├── poller.h          # 单 fd poll 等待封装
 │       ├── myepoll.h         # Epoll RAII 封装
-│       ├── mylogger.h        # 异步日志封装
+│       ├── mylogger.h        # 日志封装
 │       ├── http_parser.h     # HTTP/1.1 协议解析器（状态机）
 │       ├── file_cache.h      # LRU 内存文件缓存
 │       ├── fd_cache.h        # FD 文件描述符缓存（TTL）
@@ -266,7 +266,7 @@ epollthread/
 ### 依赖库
 | 库 | 用途 | 安装方式 |
 |---|---|---|
-| [spdlog](https://github.com/gabime/spdlog) | 异步日志 | vcpkg / apt |
+| [spdlog](https://github.com/gabime/spdlog) | 日志 | vcpkg / apt |
 | [nlohmann/json](https://github.com/nlohmann/json) | JSON 配置与 API | vcpkg / apt |
 | [OpenSSL](https://www.openssl.org/) | TLS/SSL 加密传输 | 系统自带 / apt |
 | [zlib](https://zlib.net/) | Gzip 压缩 | 系统自带 / apt |
@@ -711,7 +711,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 | C++17 | 核心语言，使用 RAII、移动语义、std::atomic、std::call_once 等 |
 | epoll | Linux I/O 多路复用，边缘触发（ET）+ ONESHOT |
 | SO_REUSEPORT | 多 Worker 负载均衡 |
-| spdlog | 高性能异步日志库 |
+| spdlog | 日志库 |
 | CMake | 跨平台构建系统 |
 | sendfile | 零拷贝文件传输 |
 | nlohmann/json | JSON 解析（单头文件） |
@@ -737,7 +737,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 
 ## 性能指标
 
-在 2 核开发机上使用 wrk 实测；完整报告（环境、方法论、各场景 P50/P99/QPS）见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)，可通过 `scripts/benchmark/run_benchmark.sh` 一键复现。
+在 4 vCPU 专机上使用 wrk 实测（按角色分核：后端两核、网关与压测各一核）；完整报告（环境、方法论、各场景 P50/P99/QPS）见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)，可通过 `scripts/benchmark/run_benchmark.sh`（基线）与 `scripts/benchmark/run_comparison.sh`（Nginx A/B）一键复现。
 
 | 场景（轻载，8 连接） | 修复前 | TCP_NODELAY 修复后 |
 |---|---|---|
@@ -746,6 +746,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 | 反向代理吞吐（8 连接） | 169 QPS | **1000 QPS（约 5.9×）** |
 
 - 这份基线压测的著名发现：缺失 `TCP_NODELAY` 导致每个请求固定 ~43 ms 的 Nagle + 延迟 ACK 停顿。
+- 与 Nginx 1.24 的同条件对比（2026-10-20，4 vCPU 分核 + 逐轮配对）：网关:nginx 吞吐差距 ≈ **1.4x，落在预设 ≤1.5x 停止规则内**——不做"高性能"式宣称，只给实测数字；详见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 - 并发连接数：轻松应对 10,000+ 并发连接（受系统 fd 限制）。
 - 上游连接池为每个代理请求省去一次 TCP 握手——收益随后端 RTT 增长（本机回环无感，跨主机显著）。
 
@@ -754,7 +755,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 - 熔断与健康状态已改为进程级共享（所有 Worker + Admin API 同一份）；但除 `round_robin` 之外的负载均衡算法仍未实现。
 - runtime reload 采用 Worker 周期检查，各 Worker 不保证同一时刻切换配置。
 - 路由匹配为线性遍历，适合当前规模，未引入 Trie/索引。
-- 连接池仅维护进程内空闲连接（无跨进程共享）；异步 upstream 与 `round_robin` 之外的多负载均衡算法尚未实现。
+- 连接池仅维护进程内空闲连接（无跨进程共享）；`round_robin` 之外的多负载均衡算法尚未实现（单上游与 composite 转发均已由事件循环驱动）。
 - 上游 TLS 会校验后端证书（证书链 + 主机名），但尚不携带客户端证书，无法与后端做 mTLS 双向认证；上游健康探测仍在 TCP 层（仅验证可达性，不校验 TLS 层）。
 - Admin API 为独立明文 HTTP 监听（默认回环地址），未提供内建 TLS（可由反向代理终结）。
 - 尚未接入 OpenTelemetry `traceparent`、分布式 Trace 和外部审计存储。
@@ -765,7 +766,7 @@ Debug 构建模式自动启用 AddressSanitizer，可检测：
 2. ~~增加配置字段范围校验、路由冲突检查和 reload 失败审计。~~ ✅ P2（含请求走私防护、TLS 加固、密钥管理）
 3. ~~完善 route/host/tenant 维度的 latency histogram 和失败率指标。~~ ✅（已提供维度级 P95/P99 直方图，并按原因拆分失败计数）
 4. ~~评估跨 Worker 共享熔断状态的实现方式。~~ ✅ P4（UpstreamManager 已改为进程级共享）
-5. ~~连接池~~ ✅ P3（含 wrk 基线压测报告）；异步 upstream 仍待做。
+5. ~~连接池~~ ✅ P3（含 wrk 基线压测报告）；~~异步 upstream~~ ✅（单上游与 composite 扇出均已由事件循环驱动）。
 6. ~~P4：`/healthz` + `/readyz`、管理 API、优雅停机 drain、部署文档。~~ ✅ P4（含 `/version`、systemd unit 与升级指南）
 7. P5：按客户反馈决定商业化功能形态。
 8. CI/CD (GitHub Actions / Gitee CI)。

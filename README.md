@@ -4,7 +4,7 @@
 
 > Self-contained API gateway in C++17 — a single binary with one JSON config, nothing else to install, built on epoll, with auth, rate limiting, circuit breaking and Prometheus metrics built in.
 
-epollthread is a high-performance, multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with asynchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload) on both the client-facing and upstream hops, keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` and W3C `traceparent` request tracing, event-driven upstream forwarding (single-upstream round trips run on the worker's epoll, composite fan-out uses a bounded async executor), composite (fan-out) routes with partial-failure semantics, dual AUDIT/CLF logging with an independent access-log switch and default credential/query redaction, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment, with every resource bounded (`max_connections` load shedding, a configurable response-size cap, configurable upstream fan-out limits) and a documented capacity table plus memory model — plus unit tests (144/144 passing), integration tests (140/140 assertions, including a sustained overload test) and AddressSanitizer support.
+epollthread is a multi-threaded HTTP/HTTPS API gateway and network server built on a **SO_REUSEPORT + epoll + One Loop Per Thread** architecture with synchronous logging and non-blocking I/O. Out of the box it provides HTTP/1.1, hardened TLS (minimum 1.2, AEAD ciphers, cert hot reload) on both the client-facing and upstream hops, keep-alive with upstream connection pooling, zero-copy file serving, LRU/FD caching, config-driven routing with schema validation, reverse proxying with upstream health checks, request-smuggling protection, idempotent retries and circuit breaking, API-key authentication (keys loadable from a file or environment variable), host/tenant policies, token-bucket rate limiting, `X-Trace-Id` and W3C `traceparent` request tracing, event-driven upstream forwarding (single-upstream and composite fan-out both run as non-blocking state machines on the worker's epoll), composite (fan-out) routes with partial-failure semantics, dual AUDIT/CLF logging with an independent access-log switch and default credential/query redaction, `SIGHUP` runtime reload, upstream timeouts with error classification, Prometheus metrics and Docker deployment, with every resource bounded (`max_connections` load shedding, a configurable response-size cap, configurable upstream fan-out limits) and a documented capacity table plus memory model — plus unit tests (137/137 passing), integration tests (155 assertions, including a sustained overload test) and AddressSanitizer support.
 
 ## 5-Minute Quickstart
 
@@ -163,7 +163,7 @@ To proxy to real backends — load balancing with health checks, or verified
 - **Prometheus** — periodically scrapes `server:5005/metrics` and stores the time series.
 - **Grafana** — uses Prometheus as a data source to provide live visualization dashboards.
 - **DynamicThreadPool** — optional shared pool for offloading slow tasks from I/O threads (reserved for extension).
-- **Logger** — global asynchronous logger running on the spdlog global thread pool for high-performance logging.
+- **Logger** — global synchronous spdlog logger (console + rotating file sinks); switched from async to sync after profiling showed the async background thread and cross-thread wake-ups costing ~14% CPU under load, while synchronous writes are acceptable at the current audit/access-log volume.
 
 ## Quick Start
 
@@ -177,7 +177,7 @@ To proxy to real backends — load balancing with health checks, or verified
 
 | Library | Purpose | Install |
 |---|---|---|
-| [spdlog](https://github.com/gabime/spdlog) | Async logging | vcpkg / apt |
+| [spdlog](https://github.com/gabime/spdlog) | Logging | vcpkg / apt |
 | [nlohmann/json](https://github.com/nlohmann/json) | JSON config & API | vcpkg / apt |
 | [OpenSSL](https://www.openssl.org/) | TLS/SSL encrypted transport | system / apt |
 | [zlib](https://zlib.net/) | Gzip compression | system / apt |
@@ -631,7 +631,7 @@ Debug builds enable AddressSanitizer automatically, detecting:
 | C++17 | Core language: RAII, move semantics, std::atomic, std::call_once, etc. |
 | epoll | Linux I/O multiplexing, edge-triggered (ET) + ONESHOT |
 | SO_REUSEPORT | Multi-worker load balancing |
-| spdlog | High-performance async logging |
+| spdlog | Logging |
 | CMake | Cross-platform build system |
 | sendfile | Zero-copy file transfer |
 | nlohmann/json | JSON parsing (header-only) |
@@ -645,7 +645,7 @@ Debug builds enable AddressSanitizer automatically, detecting:
 
 ## Performance
 
-Measured on a 2-core dev box with wrk; the full report (environment, methodology, per-scenario P50/P99/QPS) lives in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and is reproducible via `scripts/benchmark/run_benchmark.sh`.
+Measured with wrk on a dedicated 4-vCPU box (role-pinned: backends on two cores, gateway and load generator one core each); the full report (environment, methodology, per-scenario P50/P99/QPS) lives in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and is reproducible via `scripts/benchmark/run_benchmark.sh` (baseline) and `scripts/benchmark/run_comparison.sh` (Nginx A/B).
 
 | Scenario (light load, 8 connections) | Baseline | After TCP_NODELAY fix |
 |---|---|---|
@@ -654,6 +654,7 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 | Reverse-proxy throughput (8 conn) | 169 QPS | **1000 QPS (~5.9×)** |
 
 - The baseline famously caught a missing `TCP_NODELAY`: every request stalled ~43 ms on the Nagle + delayed-ACK interaction.
+- Same-conditions Nginx 1.24 comparison (2026-10-20, 4 vCPU, paired-round analysis): the gateway:nginx throughput gap is **~1.4x, inside the pre-agreed ≤1.5x stop rule** — no "high-performance" claim, just a measured number; details in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 - Concurrency: handles 10,000+ concurrent connections with ease (subject to the system fd limit).
 - Upstream connection pooling removes one TCP handshake per proxied request — the gain scales with backend RTT (invisible on loopback, significant cross-host).
 
@@ -673,7 +674,7 @@ Measured on a 2-core dev box with wrk; the full report (environment, methodology
 2. ~~Add config field/range validation, route-conflict checks and reload-failure auditing.~~ ✅ P2 (with request-smuggling protection, TLS hardening and secret management)
 3. ~~Complete route/host/tenant latency histograms and failure-rate metrics.~~ ✅ (route/host/tenant histograms with per-dimension P95/P99, plus failure counters broken down by cause)
 4. ~~Evaluate a cross-worker shared circuit-breaker implementation.~~ ✅ P4 (`UpstreamManager` is now process-wide)
-5. ~~Connection pooling~~ ✅ P3 (with the wrk baseline report); async upstream still open.
+5. ~~Connection pooling~~ ✅ P3 (with the wrk baseline report); ~~async upstream~~ ✅ (single-upstream and composite fan-out are both fully event-loop-driven).
 6. ~~P4: `/healthz` + `/readyz`, admin API, graceful-shutdown drain, deployment docs.~~ ✅ P4 (plus `/version`, a systemd unit and an upgrade guide)
 7. P5: commercial features shaped by customer feedback.
 8. Extend CI/CD: GitHub Actions releases and image publishing, plus Gitee CI.
@@ -717,7 +718,7 @@ epollthread/
 │       ├── mysocket.h        # Socket RAII wrapper (with SSL support)
 │       ├── poller.h          # Single-fd poll wait wrapper
 │       ├── myepoll.h         # Epoll RAII wrapper
-│       ├── mylogger.h        # Async logging wrapper
+│       ├── mylogger.h        # Logging wrapper
 │       ├── http_parser.h     # HTTP/1.1 protocol parser (state machine)
 │       ├── file_cache.h      # LRU in-memory file cache
 │       ├── fd_cache.h        # FD cache (TTL-based)

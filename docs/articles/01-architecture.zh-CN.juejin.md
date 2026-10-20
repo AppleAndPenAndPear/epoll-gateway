@@ -22,7 +22,7 @@ tar -xJf epollthread-0.2.1-x86_64.tar.xz && cd epollthread-0.2.1-x86_64
 - **非目标**：通用七层负载均衡（大流量静态分发交给 Nginx/CDN）、服务网格（不做 sidecar）、动态服务发现（upstream 列表在配置里，不在 etcd 里）。
 - **约束**：C++17、Linux、epoll，代码量控制在一个人能读懂的范围内——这一点直接决定了很多后面的取舍。
 
-用数据校准一下预期，免得误会成"比 Nginx 更轻更快"的轮子文。我们在同一台 2 vCPU 机器上和 Nginx 1.24 做过同条件对比——同一张证书、同一条路由、同一组 4 个后端、客户端/网关/后端同机挤 2 个核：**内存基本持平**（稳态 RSS 26.0 MB vs 26.4 MB），**吞吐低 2.5~2.7 倍**（c8 608 vs 1549 RPS，完整表格见 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md) 的对比章节）。所以这个项目的差异化不在性能或内存，而在**部署与运维面**：单二进制、零运行时依赖（不用装 Postgres/etcd/Redis）、一个 JSON 覆盖鉴权/限流/熔断/热加载/优雅停机，外加一份一个人能读完的代码。要极限吞吐，Nginx 仍然是对的答案；要的是"十分钟内在内网/边缘机器上跑起一套带完整上线语义的网关"，这才是本项目想去的位置。
+用数据校准一下预期，免得误会成"比 Nginx 更轻更快"的轮子文。我们在一台 4 vCPU 专机上和 Nginx 1.24 做过同条件对比——同一张证书、同一条路由、同一组 4 个后端，按角色分核（后端占两核、网关与压测各占一核）并做逐轮配对分析：**吞吐差距约 1.4 倍**（gw:nginx 逐轮配对均值 0.74，中位读数 1.42x，落在预设的 ≤1.5x 停止规则内；完整表格见 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md) 的 "4-vCPU measurement (2026-10-20)" 章节）。更早前在 2 核同机环境测得的 2.5~2.7x 差距，事后证实主要是后端夹具饱和与共享核竞争叠加出的测量假象。所以这个项目的差异化不在性能或内存，而在**部署与运维面**：单二进制、零运行时依赖（不用装 Postgres/etcd/Redis）、一个 JSON 覆盖鉴权/限流/熔断/热加载/优雅停机，外加一份一个人能读完的代码。要极限吞吐，Nginx 仍然是对的答案；要的是"十分钟内在内网/边缘机器上跑起一套带完整上线语义的网关"，这才是本项目想去的位置。
 
 ## 2. 线程模型：SO_REUSEPORT + One Loop Per Thread
 
@@ -201,15 +201,15 @@ void drain_request_body(int fd, const ParsedAdminRequest& req) {
 - 优雅停机时用一条正在处理 1.5 秒慢请求的连接，验证它在 drain 窗口内被完整服务；
 - 管理口密钥轮换后旧 key 401 / 新 key 200。
 
-当前状态：**101 个单测（CTest）+ 77 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
+当前状态：**137 个单测（CTest）+ 155 条集成断言**，一条 `./ci.sh` 跑完构建、单测、集成；另支持 AddressSanitizer 构建。
 
 ## 8. 现在还没做的（诚实清单）
 
 - 单机架构，没有分布式配置中心；多实例之间不共享限流配额与熔断状态；
 - 没有插件系统/Lua，扩展方式是改代码或走 upstream 代理；
 - 管理口的监听拓扑（enabled/port/bind）需要重启进程才能改（密钥可热轮换）；
-- 压测数据来自一台 2 vCPU 的机器（客户端、网关、Python mock 挤在同一台机器上），绝对数字意义有限，**比值**才是结论；
-- 与 Nginx 同条件对比的结果如第 1 节所说：内存持平、吞吐低 2.5~2.7 倍。差距的具体来源（每请求的访问/AUDIT 日志写入、代理路径的缓冲拷贝、TLS record 尺寸）还没逐项定位——目前网关已支持每请求访问日志开关（`logging.access_log_enabled`，与 AUDIT 相互独立），因此可以对照 `access_log off` 量化日志写入的占比；其余开销仍需用火焰图逐项定位；
+- 压测数据来自一台 4 vCPU 专机（按角色分核：后端两核、网关与压测各一核），绝对数字意义有限，**比值**才是结论；
+- 与 Nginx 同条件对比的结果如第 1 节所说：吞吐差距 ~1.4x。差距的主要来源已用 `perf` 定位过一轮（每响应双次 `SSL_write`/syscall、每头部分配 + `istringstream`、`ostringstream` 格式化、每请求日志 `fflush`，四项均已修复）；剩余差距的进一步压缩（如 nginx 式 flat pool 头部列表）无规则性依据，已按决策延后——详见 [docs/BENCHMARKS.md](https://github.com/AppleAndPenAndPear/epoll-gateway/blob/master/docs/BENCHMARKS.md) 的 4-vCPU 章节与优化 sprint 记录；
 - 连接池在 loopback 上的吞吐收益在噪声范围内（本地 TCP 建连只有几十微秒），它的价值随后端网络距离放大——每个请求省掉一次 RTT。
 
 ## 9. 复现

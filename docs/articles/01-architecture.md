@@ -10,7 +10,7 @@ The scope, up front, so this doesn't read as "yet another Nginx":
 - **Non-goals**: general-purpose L7 load balancing (front it with Nginx/CDN for bulk static), service mesh (no sidecar), dynamic service discovery (upstreams live in config, not in etcd).
 - **Constraint**: C++17, Linux, epoll, and a codebase one person can read. That constraint drove many of the decisions that follow.
 
-A data-based calibration of expectations, so this doesn't read as a "lighter than Nginx" piece either. We ran a same-conditions comparison against Nginx 1.24 on one 2 vCPU box — same certificate, same route, same four backends, client/gateway/backends sharing the two cores: **memory is a wash** (steady-state RSS 26.0 MB vs 26.4 MB) and **throughput is 2.5-2.7x lower** (608 vs 1549 RPS at c8; full table in the comparison section of [docs/BENCHMARKS.md](../BENCHMARKS.md)). So the differentiation is neither performance nor memory — it is the **deployment and operations surface**: a single binary with zero runtime dependencies (no Postgres/etcd/Redis to install), one JSON file covering auth/rate limiting/circuit breaking/hot reload/graceful shutdown, and a codebase one person can read end to end. If you need maximum throughput, Nginx is still the right answer; if what you want is a gateway with full production semantics running on an edge or internal-network box in ten minutes, that is where this project aims.
+A data-based calibration of expectations, so this doesn't read as a "lighter than Nginx" piece either. We ran a same-conditions comparison against Nginx 1.24 on a dedicated 4-vCPU box — same certificate, same route, same four backends, with role-pinned cores (two for the backends, one each for the gateway and the load generator) and paired-round analysis: **throughput is within ~1.4x of nginx** (per-round paired mean 0.74, median-of-medians reading 1.42x, inside the pre-agreed ≤1.5x stop rule; full table in the "4-vCPU measurement (2026-10-20)" section of [docs/BENCHMARKS.md](../BENCHMARKS.md)). An earlier 2.5-2.7x reading on a shared 2-vCPU box turned out to be largely a measurement artifact of a saturated fixture plus shared-core contention. So the differentiation is neither performance nor memory — it is the **deployment and operations surface**: a single binary with zero runtime dependencies (no Postgres/etcd/Redis to install), one JSON file covering auth/rate limiting/circuit breaking/hot reload/graceful shutdown, and a codebase one person can read end to end. If you need maximum throughput, Nginx is still the right answer; if what you want is a gateway with full production semantics running on an edge or internal-network box in ten minutes, that is where this project aims.
 
 ## 2. Threading model: SO_REUSEPORT + One Loop Per Thread
 
@@ -164,15 +164,15 @@ But none of the three bugs above is unit-testable — they are products of real 
 - graceful shutdown is exercised with a connection mid-way through a 1.5 s request, which must still be served inside the drain window;
 - after admin key rotation, the old key gets 401 and the new key 200.
 
-Current state: **101 unit tests (CTest) + 77 integration assertions**, all through one `./ci.sh` that builds, runs unit tests and then integration; an AddressSanitizer build is also supported.
+Current state: **137 unit tests (CTest) + 155 integration assertions**, all through one `./ci.sh` that builds, runs unit tests and then integration; an AddressSanitizer build is also supported.
 
 ## 8. What is intentionally not done yet
 
 - Single-node architecture; no distributed config, and rate-limit quotas / circuit state are not shared across instances.
 - No plugin system or Lua — extend by changing code or fronting another upstream.
 - The admin listener's topology (enabled/port/bind) needs a process restart (keys rotate hot).
-- Benchmark numbers come from a 2 vCPU box where client, gateway and Python mock share the same machine: absolute values mean little, **ratios** carry the conclusion.
-- The same-conditions Nginx comparison (Section 1) showed memory parity and a 2.5-2.7x throughput gap. The specific sources of that gap — per-request access/AUDIT log writes, buffer copies in the proxy path, TLS record sizing — are not yet isolated. A per-request access-log switch (`logging.access_log_enabled`, independent of AUDIT) now exists, so the log-write share can be measured against `access_log off`; isolating the remaining costs with flame graphs is still open.
+- Benchmark numbers come from a dedicated 4-vCPU box (role-pinned: two cores for the backends, one each for the gateway and the load generator): absolute values mean little, **ratios** carry the conclusion.
+- The same-conditions Nginx comparison (Section 1) showed a ~1.4x throughput gap. The main sources of that gap were profiled with `perf` (double `SSL_write`/syscall per response, per-header allocation + `istringstream`, `ostringstream` formatting, per-request log `fflush` — all four fixed); further compression of the residual gap (e.g. an nginx-style flat pool-allocated header list) has no rule-based justification and is deferred by decision — see the 4-vCPU section and the optimization-sprint record in [docs/BENCHMARKS.md](../BENCHMARKS.md).
 - The connection pool's throughput win on loopback is within noise (a local TCP connect costs tens of microseconds). Its value scales with backend distance — it removes one RTT per request.
 
 ## 9. Reproducing
